@@ -88,16 +88,21 @@ class Sleep(SQLModel, table=True):
         )
 
 
+class Task(StrEnum):
+    WINDOW_METRIC = "WindowMetric"
+    MINUTE_METRIC = "MinuteMetric"
+    DAILY_SUMMARY = "DailySummary"
+
+
 class Progress(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    device_id: int = Field(foreign_key="device.id", unique=True)
+    device_id: int = Field(foreign_key="device.id")
     device: Device = Relationship(back_populates="progress")
-    last_ppi_time: datetime | None = Field(default=None)
-    last_sleep_time: datetime | None = Field(default=None)
-    last_window_time: datetime | None = Field(
+    task: Task
+    end_time: datetime | None = Field(
         default=None, description="Tracks up to where window metrics were computed"
     )
-    processing: bool = Field(default=False)
+    __table_args__ = (UniqueConstraint("device_id", "task", name="uix_device_task"),)
 
 
 class WindowState(StrEnum):
@@ -206,6 +211,7 @@ class DailySummary(SQLModel, table=True):
     )
 
     # --- Baselines (7-Day Rolling) ---
+
     hrv_night_avg: float | None = None
     hrv_night_std: float | None = None
     hrv_morning_avg: float | None = None
@@ -240,6 +246,28 @@ class DailySummary(SQLModel, table=True):
         default=1.0, description="Body state adjustment factor T_d"
     )
 
+    # --- v1.0 UI Breakdown Fields ---
+    load_score: int | None = Field(
+        default=None, description="Load status percentage 0-100"
+    )
+    sleep_quality: int | None = Field(
+        default=None, description="Sleep quality percentage 0-100"
+    )
+    recovery_sleep_percentage: int | None = Field(default=None)
+    recovery_sleep_duration_min: int | None = Field(default=None)
+
+    # --- Training Load & Supercompensation (TSB/ATL/CTL) ---
+    atl: float | None = Field(default=None, description="Short-term load")
+    ctl: float | None = Field(default=None, description="Long-term load")
+    tsb: float | None = Field(default=None, description="Training stress balance")
+
+    # --- Coaching & Recommendations ---
+    boom_go_text: str | None = Field(default=None)
+    supercomp_time: str | None = Field(default=None)
+    training_suggestion: str | None = Field(default=None)
+    training_duration: str | None = Field(default=None)
+    training_target: str | None = Field(default=None)
+
     __table_args__ = (
         UniqueConstraint("device_id", "summary_date", name="uix_device_summary_date"),
     )
@@ -260,7 +288,12 @@ class MinuteMetric(SQLModel, table=True):
     total_energy: int = Field(
         default=100, description="Product-facing energy score (0-100)"
     )
-
+    # --- Additional Load Page Requirements ---
+    heart_rate_zone: int | None = Field(default=0, description="HR Zone 0 to 5")
+    steps: int | None = Field(default=0, description="Steps accumulated this minute")
+    calories: float | None = Field(
+        default=0.0, description="Calories burned this minute"
+    )
     __table_args__ = (
         UniqueConstraint("device_id", "timestamp", name="uix_device_minute_timestamp"),
     )

@@ -9,12 +9,14 @@ from scipy.interpolate import interp1d
 from scipy.signal import windows
 from sqlmodel import Session, col, select
 
+from newboom.boom_compute import process_daily_summary_pipeline, process_minute_metric
 from newboom.database import engine
 from newboom.model import (
     PPI,
     Device,
     Progress,
     RmssdSegment,
+    Task,
     TrendType,
     WindowMetric,
     WindowState,
@@ -324,16 +326,18 @@ def process_window_metrics(device_id: int) -> int:
     with Session(engine) as session:
         # Get or initialize progress tracker for the device
         progress = session.exec(
-            select(Progress).where(Progress.device_id == device_id)
+            select(Progress)
+            .where(Progress.device_id == device_id)
+            .where(Progress.task == Task.WINDOW_METRIC)
         ).first()
         if not progress:
-            progress = Progress(device_id=device_id, processing=True)
+            progress = Progress(device_id=device_id, task=Task.WINDOW_METRIC)
             session.add(progress)
             session.commit()
             session.refresh(progress)
 
         # Determine start time based on last processed window, or default to 7 days ago
-        start_time = progress.last_window_time
+        start_time = progress.end_time
         if not start_time:
             # Look at the earliest available PPI or default to 7 days ago
             earliest_ppi = session.exec(
@@ -376,10 +380,12 @@ def process_window_metrics(device_id: int) -> int:
         # Update progress record with the latest window end time processed
         latest_window_end = max(m.window_end for m in metrics)
         db_progress = session.exec(
-            select(Progress).where(Progress.device_id == device_id)
+            select(Progress)
+            .where(Progress.device_id == device_id)
+            .where(Progress.task == Task.WINDOW_METRIC)
         ).first()
         if db_progress:
-            db_progress.last_window_time = latest_window_end
+            db_progress.end_time = latest_window_end
             session.add(db_progress)
 
         session.commit()
@@ -620,4 +626,14 @@ def process_pipeline(all_devices: list[Device]) -> None:
             if seg_count > 0:
                 print(
                     f"Generated {seg_count} RMSSD macro-segments for device {device.id}"
+                )
+            min_count = process_minute_metric(device.id)
+            if min_count > 0:
+                print(
+                    f"Computed {min_count} minutely metrics and energy states for device {device.id}"
+                )
+            summary_count = process_daily_summary_pipeline(device.id)
+            if summary_count > 0:
+                print(
+                    f"Generated {summary_count} daily summaries for device {device.id}"
                 )
