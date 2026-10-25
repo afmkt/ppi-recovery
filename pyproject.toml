@@ -1,0 +1,23 @@
+[project]
+name = "newboom"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "michael", email = "afmkt1020@proton.me" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.161.1",
+    "numpy>=2.5.4",
+    "python-dotenv>=1.2.4",
+    "sqlmodel>=0.0.48",
+    "uvicorn>=0.54.0",
+]
+
+[project.scripts]
+newboom = "newboom:main"
+
+[build-system]
+requires = ["uv_build>=0.12.2,<0.13.0"]
+build-backend = "uv_build"

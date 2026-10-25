@@ -1,0 +1,55 @@
+.env
+data
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Virtual Environments & Package Managers ---
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.uv/
+
+# --- Environment Variables ---
+.env
+.env.local
+
+# --- Local Databases ---
+*.db
+*.sqlite
+*.sqlite3
+app.db
+
+# --- File Storage / Audit Logs ---
+storage/
+
+# --- IDE & Editor Specific ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+.pytest_cache

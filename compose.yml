@@ -1,0 +1,24 @@
+services:
+  boom_api:
+    image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+    container_name: newboom
+    restart: unless-stopped
+    env_file:
+      - ./.env
+
+    command: "uv run uvicorn newboom.api:app --host 0.0.0.0 --port 8000"
+    volumes:
+      - ./:/app
+    working_dir: /app
+
+    ports:
+      - "8000:8000"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    deploy:
+      resources:
+        limits:
+          memory: 3G

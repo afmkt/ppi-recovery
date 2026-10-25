@@ -1,0 +1,56 @@
+from __future__ import annotations
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from newboom.schema import ApiResponse
+from newboom.upload import router as upload_router
+from newboom.worker import lifespan
+
+# --- FastAPI App Initialization ---
+app = FastAPI(title="Device Ingestion API", version="1.0.0", lifespan=lifespan)
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    res = ApiResponse(ok=False, message=str(exc))
+    return JSONResponse(
+        status_code=500,
+        content=res.model_dump(),
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    # If detail is already a string, use it as the message
+    msg = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+
+    response_data = ApiResponse(ok=False, message=msg)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=response_data.model_dump(),
+    )
+
+
+# Enable CORS for your Vite React frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# Dependency for database sessions
+
+
+@app.on_event("startup")
+def on_startup():
+    from newboom.database import create_db_and_tables
+
+    create_db_and_tables()
+
+
+app.include_router(upload_router, prefix="/upload", tags=["Upload"])
