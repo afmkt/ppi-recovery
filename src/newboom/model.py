@@ -31,6 +31,9 @@ class Device(SQLModel, table=True):
     rmssd_segments: list["RmssdSegment"] = Relationship(back_populates="device")
     daily_summary: list["DailySummary"] = Relationship(back_populates="device")
     minute_metrics: list["MinuteMetric"] = Relationship(back_populates="device")
+    hourly_status: list["HourlyStatus"] = Relationship(
+        back_populates="device"
+    )
 
 
 class ActivityState(IntEnum):
@@ -153,6 +156,10 @@ class WindowMetric(SQLModel, table=True):
 
     # Ribbon state classification ('sympathetic', 'parasympathetic', 'transition', 'invalid')
     state: WindowState | None = Field(default=None)
+    is_sleep: bool | None = Field(
+        default=None,
+        description="True when the window's majority PPI activity state is sleep",
+    )
 
     fresh: bool = Field(default=True, index=True)
     __table_args__ = (
@@ -229,6 +236,14 @@ class DailySummary(SQLModel, table=True):
     non_sport_sleep_hr_avg: float | None = None
     non_sport_sleep_hr_std: float | None = None
     hr_max: float = Field(default=190.0, description="Dynamic maximum heart rate")
+    spo2_night_avg: float | None = Field(
+        default=None,
+        description="Night SpO2 mean from PPI.spo2 (0 = not reported, filtered out)",
+    )
+    spo2_night_min: float | None = Field(
+        default=None,
+        description="Night SpO2 min from PPI.spo2 (0 = not reported, filtered out)",
+    )
 
     # --- Health Status Scores ---
     status_score: int | None = Field(
@@ -240,6 +255,18 @@ class DailySummary(SQLModel, table=True):
     )
     is_temporary_algorithm: bool = Field(
         default=True, description="True if using first-7-days fallback rule"
+    )
+    status_morning: int | None = Field(
+        default=None, description="Frozen morning status score (hourly restart point)"
+    )
+    status_current: int | None = Field(
+        default=None, description="Latest hourly-adjusted status score"
+    )
+    deduction_points: int = Field(
+        default=0, description="Formal status deduction total (-5/-10 tiers)"
+    )
+    bonus_points: int = Field(
+        default=0, description="Formal status bonus total (+5/+10 tiers)"
     )
 
     # --- Energy Store State ---
@@ -257,6 +284,13 @@ class DailySummary(SQLModel, table=True):
     total_tss: float | None = Field(
         default=None,
         description="Day's own accumulated tss; filled at close-the-day finalize",
+    )
+    energy_incomplete: bool = Field(
+        default=False,
+        description="True when the day's F_d could not be finalized from complete data",
+    )
+    last_valid_energy_ts: NaiveDatetime | None = Field(
+        default=None, description="Timestamp of the last valid energy point"
     )
 
     # --- v1.0 UI Breakdown Fields ---
@@ -313,4 +347,51 @@ class MinuteMetric(SQLModel, table=True):
     )
     __table_args__ = (
         UniqueConstraint("device_id", "timestamp", name="uix_device_minute_timestamp"),
+    )
+
+
+class HourlyStatus(SQLModel, table=True):
+    """Per-hour dynamic status snapshot (boom §5 / temporary §6.3).
+
+    Restart from the frozen morning status each hour; no carry-over of the
+    previous hour's penalty. `hour_start` is the local hour bucket.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    device_id: int = Field(foreign_key="device.id", index=True)
+    device: Device = Relationship(back_populates="hourly_status")
+
+    hour_start: NaiveDatetime = Field(
+        index=True, description="Local hour bucket start"
+    )
+    morning_status: int = Field(
+        description="Frozen morning status score (restart point)"
+    )
+    current_status: int = Field(description="Score after this hour's dynamic adjustment")
+
+    # Time-in-zone counts in hours (formal §5). 0 for the temporary path.
+    t1: float = Field(
+        default=0.0, description="Hours HR below the RHR baseline"
+    )
+    t2: float = Field(
+        default=0.0, description="Hours HR above the RHR baseline"
+    )
+    t3: float = Field(
+        default=0.0, description="Hours HR below baseline - std"
+    )
+    t4: float = Field(
+        default=0.0, description="Hours HR above baseline + std"
+    )
+
+    hr_5min_avg: float | None = Field(
+        default=None, description="5-min avg non-exercise/non-sleep HR (temporary path)"
+    )
+    is_sleep_or_exercise: bool = Field(
+        default=False, description="True when the hour ends in sleep or exercise"
+    )
+    is_temporary: bool = Field(
+        default=True, description="True if using first-7-days fallback rule"
+    )
+    __table_args__ = (
+        UniqueConstraint("device_id", "hour_start", name="uix_device_hourly_hour"),
     )

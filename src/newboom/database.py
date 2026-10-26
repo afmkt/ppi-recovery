@@ -35,6 +35,17 @@ _NEW_COLUMNS: dict[str, dict[str, str]] = {
     "dailysummary": {
         "total_load": "FLOAT",
         "total_tss": "FLOAT",
+        "spo2_night_avg": "FLOAT",
+        "spo2_night_min": "FLOAT",
+        "status_morning": "INTEGER",
+        "status_current": "INTEGER",
+        "deduction_points": "INTEGER DEFAULT 0",
+        "bonus_points": "INTEGER DEFAULT 0",
+        "energy_incomplete": "BOOLEAN DEFAULT 0",
+        "last_valid_energy_ts": "DATETIME",
+    },
+    "windowmetric": {
+        "is_sleep": "BOOLEAN",
     },
 }
 

@@ -93,16 +93,22 @@ TREND_SLOPE = 0.03
 # Status score (boom.calculation.md §1-§6)
 #
 # The base-score and sleep-score 4x4 weight grid is implemented below.
-# Still pending (left as placeholders, not fabricated): the formal
-# deduction/bonus items and SpO2-dependent deltas (no night-SpO2 in the data
-# model, and the tier-vs-additive combination rule is unspecified), the
-# per-hour dynamic correction, hrv_morning post-wake detection, and the
-# recovery_* fields.
+# Implemented: formal deduction/bonus (§3-§4), SpO2-dependent deltas, the
+# per-hour dynamic correction (§5, process_hourly_status), and post-wake
+# morning HRV (§6). Only the recovery_* fields remain pending.
 # ---------------------------------------------------------------------------
 STATUS_BASE = 50  # Numerator for both base and sleep score (score = 50 / weight)
 STATUS_SLEEP_DEFAULT = 50  # Temp-mode sleep_score default
 STATUS_LOAD_DEFAULT = 65  # UI load_score default
 STATUS_TEMP_FIRST_DAY = 60  # Temporary status T_1 on the first valid day
+
+# Non-exercise / non-sleep HR classification (boom §5 baseline; gap item 5).
+# "Non-exercise" HR is ambiguous, so the definition is a switchable strategy
+# that can be overridden to try variants:
+#   "threshold" -- waking minute with HR < LOAD_THRESHOLD_FRAC*HRR + HR_rest
+#                  and activity is not sleep (reuses the S1 load signal).
+#   "activity"  -- PPI.activity in {RELAXED, LOW_ACTIVITY} (non-sport, awake).
+NON_SPORT_STRATEGY = "threshold"
 
 # 4x4 status weight grid (identical for the base-score §1 and sleep-score §2
 # lookups). Rows/cols are 1-indexed severity bands 1..4 (0-indexed here);

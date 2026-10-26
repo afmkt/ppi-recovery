@@ -9,11 +9,16 @@ from scipy.interpolate import interp1d
 from scipy.signal import windows
 from sqlmodel import Session, col, select
 
-from newboom.boom_compute import process_daily_summary_pipeline, process_minute_metric
+from newboom.boom_compute import (
+    process_daily_summary_pipeline,
+    process_hourly_status,
+    process_minute_metric,
+)
 from newboom.config import night_key
 from newboom.database import engine
 from newboom.model import (
     PPI,
+    ActivityState,
     Device,
     Progress,
     RmssdSegment,
@@ -102,6 +107,7 @@ class Window:
     window_start_s: float
     window_end_s: float
     ppi_clean_arr: np.ndarray  # Cleaned PPI values (containing NaNs for invalid points)
+    is_sleep: bool | None = None
 
     @property
     def total_points(self) -> int:
@@ -206,6 +212,10 @@ class Window:
             [p.ppi_clean if p.ppi_clean is not None else np.nan for p in ppi_records],
             dtype=float,
         )
+        activity_sleep = np.array(
+            [bool(ActivityState(p.activity).is_sleep) for p in ppi_records],
+            dtype=bool,
+        )
 
         total_duration_s = times_s[-1] - times_s[0]
         if total_duration_s < window_duration_s:
@@ -219,12 +229,16 @@ class Window:
             mask = (times_s >= current_start_s) & (times_s < current_end_s)
 
             win_ppis = ppi_clean_arr[mask]
+            win_sleep = activity_sleep[mask]
+            n_win = int(win_ppis.size)
+            is_sleep = None if n_win == 0 else bool(win_sleep.sum() * 2 > n_win)
 
             windows_list.append(
                 Window(
                     window_start_s=current_start_s,
                     window_end_s=current_end_s,
                     ppi_clean_arr=win_ppis,
+                    is_sleep=is_sleep,
                 )
             )
             current_start_s += step_s
@@ -311,6 +325,7 @@ def window_metrics_for_device(
             lf_hf=lf_hf,
             hf_nu=hf_nu,
             state=None,  # Assigned next during rolling smoothing
+            is_sleep=win.is_sleep,
         )
         window_metrics.append(metric)
 
@@ -374,6 +389,7 @@ def process_window_metrics(device_id: int) -> int:
                 existing.lf_hf = metric.lf_hf
                 existing.hf_nu = metric.hf_nu
                 existing.state = metric.state
+                existing.is_sleep = metric.is_sleep
                 session.add(existing)
             else:
                 session.add(metric)
@@ -637,4 +653,9 @@ def process_pipeline(all_devices: list[Device]) -> None:
             if summary_count > 0:
                 print(
                     f"Generated {summary_count} daily summaries for device {device.id}"
+                )
+            hourly_count = process_hourly_status(device.id)
+            if hourly_count > 0:
+                print(
+                    f"Updated hourly dynamic status for device {device.id}"
                 )
