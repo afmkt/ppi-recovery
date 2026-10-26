@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from newboom.boom import router as boom_router
 from newboom.schema import ApiResponse
 from newboom.upload import router as upload_router
 from newboom.worker import lifespan
@@ -54,6 +55,7 @@ def on_startup():
 
 
 app.include_router(upload_router, prefix="/upload", tags=["Upload"])
+app.include_router(boom_router)
 
 
 def main() -> None:
