@@ -54,3 +54,20 @@ def on_startup():
 
 
 app.include_router(upload_router, prefix="/upload", tags=["Upload"])
+
+
+def main() -> None:
+    """Console-script entry point: launch the FastAPI app with uvicorn.
+
+    The application object lives on this module so the installed console
+    script (``newboom``) and the top-level ``main.py`` route through here.
+    Host and port come from the ``HOST`` / ``PORT`` environment variables
+    (defaults ``0.0.0.0`` : ``8000``).
+    """
+    import os
+
+    import uvicorn
+
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run(app, host=host, port=port)

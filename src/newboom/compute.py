@@ -10,6 +10,7 @@ from scipy.signal import windows
 from sqlmodel import Session, col, select
 
 from newboom.boom_compute import process_daily_summary_pipeline, process_minute_metric
+from newboom.config import night_key
 from newboom.database import engine
 from newboom.model import (
     PPI,
@@ -65,7 +66,7 @@ def clean_ppi_series(ppi_list: list[float]) -> list[float | None]:
     return cleaned_list
 
 
-def all_devides() -> list[Device]:
+def all_devices() -> list[Device]:
     with Session(engine) as session:
         return list(session.exec(select(Device)).all())
 
@@ -281,12 +282,12 @@ def window_metrics_for_device(
         return []
 
     anchor_time = ppi_records[0].time
-    night_date = start_time.date()
     window_metrics = []
 
     for win in windows:
         window_start_dt = anchor_time + timedelta(seconds=win.window_start_s)
         window_end_dt = anchor_time + timedelta(seconds=win.window_end_s)
+        night_date = night_key(window_start_dt)
 
         rmssd_ms, ln_rmssd = None, None
         lf, hf, lf_hf, hf_nu = None, None, None, None

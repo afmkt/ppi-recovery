@@ -1,7 +1,6 @@
-from __future__ import annotations
-
 from datetime import date, datetime
 from enum import IntEnum, StrEnum
+from typing import Optional
 
 import numpy as np
 from sqlmodel import (
@@ -10,22 +9,28 @@ from sqlmodel import (
     SQLModel,
     UniqueConstraint,
 )
+from sqlmodel.main import NaiveDatetime
+
+from newboom.config import night_key
 
 
 class Device(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     name: str = Field(index=True)
     mac: str = Field(index=True, unique=True)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    ppi: list[PPI] = Relationship(back_populates="device")
-    sleep: list[Sleep] = Relationship(back_populates="device")
-    window_metrics: list[WindowMetric] = Relationship(back_populates="device")
-    progress: Progress | None = Relationship(
+    created_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
+    tz: str | None = Field(default=None, description="Device local UTC offset, e.g. '08:00'")
+    is_female: bool = Field(default=False, description="Selects the female tss load formula")
+    age: int | None = Field(default=None, description="User age; HR_max = 220 - age when set")
+    ppi: list["PPI"] = Relationship(back_populates="device")
+    sleep: list["Sleep"] = Relationship(back_populates="device")
+    window_metrics: list["WindowMetric"] = Relationship(back_populates="device")
+    progress: Optional["Progress"] = Relationship(
         back_populates="device", sa_relationship_kwargs={"uselist": False}
     )
-    rmssd_segments: list[RmssdSegment] = Relationship(back_populates="device")
-    daily_summary: list[DailySummary] = Relationship(back_populates="device")
-    minute_metrics: list[MinuteMetric] = Relationship(back_populates="device")
+    rmssd_segments: list["RmssdSegment"] = Relationship(back_populates="device")
+    daily_summary: list["DailySummary"] = Relationship(back_populates="device")
+    minute_metrics: list["MinuteMetric"] = Relationship(back_populates="device")
 
 
 class ActivityState(IntEnum):
@@ -49,7 +54,7 @@ class ActivityState(IntEnum):
 
 class PPI(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    time: datetime = Field(index=True)
+    time: NaiveDatetime = Field(index=True)
     hr: int = Field()
     spo2: int = Field()
     ppi: int = Field()
@@ -64,7 +69,7 @@ class PPI(SQLModel, table=True):
 class Sleep(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     timezone: str = Field()
-    time: datetime = Field(index=True)
+    time: NaiveDatetime = Field(index=True)
     sleep_onset_time: int = Field()
     awake_time: int = Field()
     light_sleep_period: int = Field()
@@ -78,7 +83,7 @@ class Sleep(SQLModel, table=True):
 
     @property
     def night_date(self) -> date:
-        return self.time.date()
+        return night_key(self.time)
 
     @property
     def duration_hours(self) -> int:
@@ -99,7 +104,7 @@ class Progress(SQLModel, table=True):
     device_id: int = Field(foreign_key="device.id")
     device: Device = Relationship(back_populates="progress")
     task: Task
-    end_time: datetime | None = Field(
+    end_time: NaiveDatetime | None = Field(
         default=None, description="Tracks up to where window metrics were computed"
     )
     __table_args__ = (UniqueConstraint("device_id", "task", name="uix_device_task"),)
@@ -112,7 +117,7 @@ class WindowState(StrEnum):
     INVALID = "invalid"
 
     @staticmethod
-    def from_float(value: float) -> WindowState:
+    def from_float(value: float) -> "WindowState":
         if not np.isfinite(value):
             return WindowState.INVALID
         if value >= 2.5:
@@ -129,8 +134,8 @@ class WindowMetric(SQLModel, table=True):
     night_date: date = Field(
         index=True, description="The calendar date or night session identifier"
     )
-    window_start: datetime = Field(index=True)
-    window_end: datetime = Field()
+    window_start: NaiveDatetime = Field(index=True)
+    window_end: NaiveDatetime = Field()
     window_mid_h: float = Field(description="Hours from start of night")
 
     # Quality control
@@ -161,7 +166,7 @@ class TrendType(StrEnum):
     STABLE = "stable"
 
     @staticmethod
-    def from_float(delta: float, slope: float) -> TrendType:
+    def from_float(delta: float, slope: float) -> "TrendType":
         if delta > 0.05 and slope > 0.03:
             return TrendType.RISING
         if delta < -0.05 and slope < -0.03:
@@ -204,7 +209,7 @@ class RmssdSegment(SQLModel, table=True):
 class DailySummary(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     device_id: int = Field(foreign_key="device.id", index=True)
-    device: Device = Relationship(back_populates="daily_summaries")
+    device: Device = Relationship(back_populates="daily_summary")
 
     summary_date: date = Field(
         index=True, description="Calendar date for this daily summary"
@@ -245,6 +250,14 @@ class DailySummary(SQLModel, table=True):
     body_state_modifier_t: float = Field(
         default=1.0, description="Body state adjustment factor T_d"
     )
+    total_load: float | None = Field(
+        default=None,
+        description="Day's own accumulated total load (S1 + tss); filled at close-the-day finalize",
+    )
+    total_tss: float | None = Field(
+        default=None,
+        description="Day's own accumulated tss; filled at close-the-day finalize",
+    )
 
     # --- v1.0 UI Breakdown Fields ---
     load_score: int | None = Field(
@@ -278,13 +291,17 @@ class MinuteMetric(SQLModel, table=True):
     device_id: int = Field(foreign_key="device.id", index=True)
     device: Device = Relationship(back_populates="minute_metrics")
 
-    timestamp: datetime = Field(index=True, description="Exact minute timestamp")
+    timestamp: NaiveDatetime = Field(index=True, description="Exact minute timestamp")
     night_date: date = Field(index=True, description="Associated night session date")
 
     heart_rate: float = Field(description="1-minute average heart rate")
     s1_load: float = Field(default=0.0, description="Cumulative non-movement load S1")
     tss_load: float = Field(default=0.0, description="Cumulative workout load tss")
     total_load: float = Field(default=0.0, description="S1 + tss")
+    load_delta: float = Field(
+        default=0.0, description="This minute's total load increment (S1 + tss)"
+    )
+    tss_delta: float = Field(default=0.0, description="This minute's tss increment")
     total_energy: int = Field(
         default=100, description="Product-facing energy score (0-100)"
     )

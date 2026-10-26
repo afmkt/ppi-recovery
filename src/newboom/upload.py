@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
@@ -14,34 +13,9 @@ from newboom.schema import ApiResponse
 from newboom.storage import list_uploaded_files, load_data_from_file, save_data_to_file
 
 
-def convert_to_utc(local_time_str: str, timezone_str: str) -> datetime:
-    local_time = datetime.strptime(local_time_str, "%Y-%m-%d %H:%M:%S")
-    local_tz = ZoneInfo(timezone_str)
-    local_time = local_time.replace(tzinfo=local_tz)
-    utc_time = local_time.astimezone(ZoneInfo("UTC"))
-    return utc_time
-
-
-def convert_to_utc_by_delta(time_offset: str, local_time_str: str) -> datetime:
-    """
-    Convert local time to UTC based on a time offset string like "08:00" or "-05:30".
-    """
-    sign = -1 if time_offset.startswith("-") else 1
-    clean_tz = time_offset.lstrip("+-")
-    hours, minutes = map(int, clean_tz.split(":"))
-    device_tz = timezone(timedelta(hours=hours, minutes=minutes) * sign)
-    naive_dt = datetime.strptime(local_time_str, "%Y-%m-%d %H:%M:%S")
-    local_dt = naive_dt.replace(tzinfo=device_tz)
-    utc_dt = local_dt.astimezone(UTC)
-
-    return utc_dt
-
-
-def midnight_days_ago_utc(days: int) -> datetime:
-    """
-    Get the datetime for midnight a specified number of days ago in UTC.
-    """
-    now = datetime.now(UTC)
+def midnight_days_ago(days: int) -> datetime:
+    """Naive local midnight a specified number of days ago (matches local storage)."""
+    now = datetime.now()
     days_ago = now - timedelta(days=days)
     return days_ago.replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -101,7 +75,7 @@ async def get_ppi(
 
     query = select(PPI)
     if not start:
-        start = midnight_days_ago_utc(7)
+        start = midnight_days_ago(7)
     if start:
         query = query.where(PPI.time >= start)
     if end:
@@ -123,7 +97,12 @@ async def upload_ppi(
     # Check if the device exists, if not, create it
     device = session.exec(select(Device).where(Device.mac == ppi_data.address)).first()
     if not device:
-        device = Device(name=ppi_data.device, mac=ppi_data.address)
+        device = Device(name=ppi_data.device, mac=ppi_data.address, tz=ppi_data.timezone)
+        session.add(device)
+        session.commit()
+        session.refresh(device)
+    elif device.tz != ppi_data.timezone:
+        device.tz = ppi_data.timezone
         session.add(device)
         session.commit()
         session.refresh(device)
@@ -133,11 +112,11 @@ async def upload_ppi(
 
     # Insert PPI data
     for row in ppi_data.datas:
-        utc_time = convert_to_utc_by_delta(ppi_data.timezone, row.time)
+        local_time = datetime.strptime(row.time, "%Y-%m-%d %H:%M:%S")
         stmt = (
             insert(PPI)
             .values(
-                time=utc_time,
+                time=local_time,
                 hr=row.hr,
                 spo2=row.spo2,
                 ppi=row.ppi,
@@ -223,7 +202,7 @@ async def get_sleep(
 
     query = select(Sleep)
     if not start:
-        start = midnight_days_ago_utc(7)
+        start = midnight_days_ago(7)
     if start:
         query = query.where(Sleep.time >= start)
     if end:
@@ -247,7 +226,12 @@ async def upload_sleep(
         select(Device).where(Device.mac == sleep_data.address)
     ).first()
     if not device:
-        device = Device(name=sleep_data.device, mac=sleep_data.address)
+        device = Device(name=sleep_data.device, mac=sleep_data.address, tz=sleep_data.timezone)
+        session.add(device)
+        session.commit()
+        session.refresh(device)
+    elif device.tz != sleep_data.timezone:
+        device.tz = sleep_data.timezone
         session.add(device)
         session.commit()
         session.refresh(device)
@@ -257,11 +241,11 @@ async def upload_sleep(
 
     # Insert Sleep data
     for row in sleep_data.datas:
-        utc_time = convert_to_utc_by_delta(sleep_data.timezone, row.time)
+        local_time = datetime.strptime(row.time, "%Y-%m-%d %H:%M:%S")
         stmt = (
             insert(Sleep)
             .values(
-                time=utc_time,
+                time=local_time,
                 timezone=sleep_data.timezone,
                 sleep_onset_time=row.sleepOnsetTime,
                 awake_time=row.awakeTime,
