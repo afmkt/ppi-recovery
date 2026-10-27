@@ -54,7 +54,7 @@ def on_startup():
     create_db_and_tables()
 
 
-app.include_router(upload_router, prefix="/upload", tags=["Upload"])
+app.include_router(upload_router, prefix="/api/upload", tags=["Upload"])
 app.include_router(boom_router)
 
 
