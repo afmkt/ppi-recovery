@@ -148,7 +148,9 @@ class WindowMetric(SQLModel, table=True):
     rmssd_ms: float | None = Field(default=None)
     ln_rmssd: float | None = Field(default=None)
 
-    # Frequency-domain HRV
+    # Frequency-domain HRV. Only lf_hf drives the ribbon WindowState classification
+    # in the algorithm; lf/hf/hf_nu are retained for the (out-of-scope) UI /
+    # autonomic-structure layer, matching the recovery reference (F-13).
     lf: float | None = Field(default=None)
     hf: float | None = Field(default=None)
     lf_hf: float | None = Field(default=None)
@@ -273,7 +275,10 @@ class DailySummary(SQLModel, table=True):
     energy_start_e: float = Field(
         default=1.0, description="Morning starting energy E_d (0 to 1)"
     )
-    energy_end_f: float = Field(default=1.0, description="Day-end remaining energy F_d")
+    energy_end_f: float | None = Field(
+        default=None,
+        description="Day-end remaining energy F_d; None when the day is incomplete",
+    )
     body_state_modifier_t: float = Field(
         default=1.0, description="Body state adjustment factor T_d"
     )
@@ -307,6 +312,16 @@ class DailySummary(SQLModel, table=True):
     atl: float | None = Field(default=None, description="Short-term load")
     ctl: float | None = Field(default=None, description="Long-term load")
     tsb: float | None = Field(default=None, description="Training stress balance")
+    # --- Autonomic state balance (recovery reference recovery_v06.py) ---
+    sympathetic_pct: float | None = Field(
+        default=None, description="% of non-invalid night windows classified sympathetic"
+    )
+    parasympathetic_pct: float | None = Field(
+        default=None, description="% of non-invalid night windows classified parasympathetic"
+    )
+    transition_pct: float | None = Field(
+        default=None, description="% of non-invalid night windows classified transition"
+    )
 
     # --- Coaching & Recommendations ---
     boom_go_text: str | None = Field(default=None)

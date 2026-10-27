@@ -44,13 +44,14 @@ from newboom.model import (
     PPI,
     ActivityState,
     DailySummary,
-    HourlyStatus,
     Device,
+    HourlyStatus,
     MinuteMetric,
     Progress,
     Sleep,
     Task,
     WindowMetric,
+    WindowState,
 )
 
 # --- HELPER FUNCTIONS ---
@@ -86,13 +87,53 @@ def _hr_params(
     return DEFAULT_HR_REST, hr_max
 
 
+def _update_hr_max(
+    session: Session, device_id: int, target_date: date, hr_max: float
+) -> float:
+    """Spec §7: raise HR_max when a sustained (≥5 s) HR exceeds the stored value.
+
+    Scans the day's PPI for runs of ≥5 consecutive samples above the current
+    HR_max and returns the peak HR in such a sustained run, else unchanged. The
+    raised value is stored on the daily summary and chains to later days.
+    """
+    day_start = datetime.combine(target_date, datetime.min.time())
+    day_end = day_start + timedelta(days=1)
+    ppis = session.exec(
+        select(PPI)
+        .where(PPI.device_id == device_id)
+        .where(col(PPI.time) >= day_start)
+        .where(col(PPI.time) < day_end)
+        .order_by(col(PPI.time).asc())
+    ).all()
+    if not ppis:
+        return hr_max
+    best = hr_max
+    run_len = 0
+    run_max = 0.0
+    for p in ppis:
+        hr = float(p.hr) if p.hr else 0.0
+        if hr > hr_max:
+            run_len += 1
+            run_max = max(run_max, hr)
+            if run_len >= 5:
+                best = max(best, run_max)
+        else:
+            run_len = 0
+            run_max = 0.0
+    return best
+
+
 def _extract_sleep_metrics(
     sleep_record: Sleep | None,
     night_windows: list[WindowMetric],
     morning_hr: list[tuple[datetime, float]] | None = None,
 ) -> dict[str, Any]:
     """Calculates nightly HRV, morning HRV, sleep durations, and bedtime from raw night records."""
-    valid_rmssds = [w.rmssd_ms for w in night_windows if w.rmssd_ms is not None]
+    # Spec §基准值: hrv_night is the RMSSD mean *during sleep*, so restrict the
+    # average to sleep windows (is_sleep True); non-sleep / no-data windows excluded.
+    valid_rmssds = [
+        w.rmssd_ms for w in night_windows if w.is_sleep and w.rmssd_ms is not None
+    ]
     hrv_night_val = float(np.mean(valid_rmssds)) if valid_rmssds else None
 
     # Morning HRV: spec §6 — RMSSD of the post-wake phase, measured from the
@@ -137,9 +178,7 @@ def _windowed_mean(
     points: list[tuple[datetime, float]], start_dt: datetime, span_s: float
 ) -> float | None:
     """Mean of the values within [start_dt, start_dt + span_s); None if empty."""
-    vals = [
-        v for t, v in points if 0.0 <= (t - start_dt).total_seconds() < span_s
-    ]
+    vals = [v for t, v in points if 0.0 <= (t - start_dt).total_seconds() < span_s]
     return float(np.mean(vals)) if vals else None
 
 
@@ -368,11 +407,7 @@ def _temporary_status(
 
     status_score = int(
         np.clip(
-            prev_score
-            + delta_sleep
-            + delta_rhr
-            + delta_hrv
-            + delta_spo2,
+            prev_score + delta_sleep + delta_rhr + delta_hrv + delta_spo2,
             30,
             90,
         )
@@ -391,6 +426,9 @@ def _deduction_bonus(
     summed into `deduction_points` (negative) and `bonus_points` (positive); a
     metric whose baseline or value is missing is skipped. Returns
     (deduction_points, bonus_points, adjustment).
+    F-05 decision: additive reading of §3/§4 — the spec lists no cap, so each
+    failing factor's tier is summed (can reach -40/+30); the caller clamps to
+    0-100 (F-10).
     """
 
     def metric_delta(
@@ -477,18 +515,22 @@ def _calculate_status_score(
     # Formal algorithm: sleep score from duration band x bedtime-lateness band (§2).
     # Recommended bedtime = 7-day avg bedtime - 1h; lateness = actual - recommended.
     if baselines["bed_time_avg"] is not None:
-        lateness_min = (metrics["bed_time_h"] - (baselines["bed_time_avg"] - 1.0)) * 60.0
+        lateness_min = (
+            metrics["bed_time_h"] - (baselines["bed_time_avg"] - 1.0)
+        ) * 60.0
     else:
         lateness_min = 0.0
     sleep_row = _duration_band(metrics["sleep_duration_h"])
     sleep_col = _lateness_band(lateness_min)
     sleep_score = round(STATUS_BASE / STATUS_WEIGHT_MATRIX[sleep_row][sleep_col])
 
-    # Formal deduction/bonus (boom §3-§4): worst-tier-per-metric, then summed.
-    deduction_points, bonus_points, adjustment = _deduction_bonus(
-        metrics, baselines
-    )
-    status_score = base_score + sleep_score + adjustment
+    # Formal deduction/bonus (boom §3-§4): worst-tier-per-metric, summed across
+    # the three metrics + SpO2. This is the additive reading of §3/§4 — each
+    # failing factor contributes its own tier and the spec lists no cap — so the
+    # sum can reach -40/+30. F-10 clamps the final score to the UI range below.
+    deduction_points, bonus_points, adjustment = _deduction_bonus(metrics, baselines)
+    # F-10: the spec UI range is 0-100 but the formal sum is unbounded; clamp.
+    status_score = int(np.clip(base_score + sleep_score + adjustment, 0, 100))
     return (
         status_score,
         base_score,
@@ -524,12 +566,14 @@ def _compute_energy_parameters(
     past_f = [s.energy_end_f for s in past_summaries if s.energy_end_f is not None]
     if past_f:
         prev_f = past_f[0]
-        if len(past_f) >= 2:
+        # Spec §8: the low-recovery branch (τ=TAU_LOW) applies only once 7 prior
+        # valid F exist; with fewer, recover at the base rate (τ=TAU_BASE).
+        tau = TAU_BASE
+        if len(past_f) >= 7:
             f_avg = float(np.mean(past_f))
             f_std = float(np.std(past_f))
-            tau = TAU_LOW if prev_f < (f_avg - f_std) else TAU_BASE
-        else:
-            tau = TAU_BASE
+            if prev_f < (f_avg - f_std):
+                tau = TAU_LOW
         start_e = float(np.clip(1.0 - (1.0 - prev_f) * np.exp(-1.0 / tau), 0.0, 1.0))
 
     return t_d, start_e
@@ -604,6 +648,35 @@ def _nonsport_hr_mean(
     return float(np.mean(readings))
 
 
+def _autonomic_summary(night_windows: list[WindowMetric]) -> dict[str, float | None]:
+    """Per-night autonomic state balance (recovery reference ``state_episodes``):
+    the fraction of non-invalid windows in each ribbon state (sympathetic /
+    parasympathetic / transition). Values are None when the night has no
+    non-invalid windows. Full per-episode detail (start/end/duration) is a larger
+    extension left for the UI layer."""
+    counts = {
+        WindowState.SYMPATHETIC: 0,
+        WindowState.PARASYMPATHETIC: 0,
+        WindowState.TRANSITION: 0,
+    }
+    for w in night_windows:
+        st = w.state
+        if st in counts:
+            counts[st] += 1
+    total = sum(counts.values())
+    if total == 0:
+        return {
+            "sympathetic_pct": None,
+            "parasympathetic_pct": None,
+            "transition_pct": None,
+        }
+    return {
+        "sympathetic_pct": counts[WindowState.SYMPATHETIC] / total * 100.0,
+        "parasympathetic_pct": counts[WindowState.PARASYMPATHETIC] / total * 100.0,
+        "transition_pct": counts[WindowState.TRANSITION] / total * 100.0,
+    }
+
+
 # --- MAIN ORCHESTRATOR FUNCTION ---
 
 
@@ -629,9 +702,10 @@ def process_daily_summary(device_id: int, target_date: date) -> DailySummary | N
         morning_hr = _morning_hr_series(session, device_id, target_date)
 
         # 2. Extract sleep/HRV metrics & fetch past summaries
-        metrics = _extract_sleep_metrics(
-            sleep_record, list(night_windows), morning_hr
-        )
+        metrics = _extract_sleep_metrics(sleep_record, list(night_windows), morning_hr)
+
+        # 2b. Per-night autonomic state balance (recovery reference).
+        autonomic = _autonomic_summary(night_windows)
 
         past_summaries = list(
             session.exec(
@@ -644,6 +718,8 @@ def process_daily_summary(device_id: int, target_date: date) -> DailySummary | N
         )
         device = session.exec(select(Device).where(Device.id == device_id)).first()
         _, hr_max = _hr_params(device, past_summaries)
+        # Spec §7: raise HR_max for this day if a sustained (≥5 s) HR exceeds it.
+        hr_max = _update_hr_max(session, device_id, target_date, hr_max)
         spo2_night_avg, spo2_night_min = _aggregate_night_spo2(
             session, device_id, target_date
         )
@@ -692,11 +768,15 @@ def process_daily_summary(device_id: int, target_date: date) -> DailySummary | N
             existing.hrv_morning_std = baselines["hrv_morning_std"]
             existing.bed_time_avg = bed_time_avg_to_save
             existing.rest_heart_rate_avg = metrics["rest_hr_val"]
+            existing.rest_heart_rate_std = baselines["rhr_std"]
             existing.hr_max = hr_max
             existing.spo2_night_avg = spo2_night_avg
             existing.spo2_night_min = spo2_night_min
             existing.non_sport_sleep_hr_avg = nonsport_hr
             existing.non_sport_sleep_hr_std = baselines["nonsport_hr_std"]
+            existing.sympathetic_pct = autonomic["sympathetic_pct"]
+            existing.parasympathetic_pct = autonomic["parasympathetic_pct"]
+            existing.transition_pct = autonomic["transition_pct"]
             existing.status_score = status_score
             existing.deduction_points = deduction_points
             existing.bonus_points = bonus_points
@@ -727,11 +807,15 @@ def process_daily_summary(device_id: int, target_date: date) -> DailySummary | N
                 hrv_morning_std=baselines["hrv_morning_std"],
                 bed_time_avg=bed_time_avg_to_save,
                 rest_heart_rate_avg=metrics["rest_hr_val"],
+                rest_heart_rate_std=baselines["rhr_std"],
                 hr_max=hr_max,
                 spo2_night_avg=spo2_night_avg,
                 spo2_night_min=spo2_night_min,
                 non_sport_sleep_hr_avg=nonsport_hr,
                 non_sport_sleep_hr_std=baselines["nonsport_hr_std"],
+                sympathetic_pct=autonomic["sympathetic_pct"],
+                parasympathetic_pct=autonomic["parasympathetic_pct"],
+                transition_pct=autonomic["transition_pct"],
                 status_score=status_score,
                 deduction_points=deduction_points,
                 bonus_points=bonus_points,
@@ -759,7 +843,43 @@ def process_daily_summary(device_id: int, target_date: date) -> DailySummary | N
         return summary
 
 
-def compute_minute_metrics(
+def _minute_load_increment(
+    is_female: bool, hr_rest: float, hr_max: float, hr_avg: float
+) -> tuple[float, float]:
+    """Per-minute S1/tss increment (spec §7), one call per 1-min average HR.
+
+    S1 (non-exercise) and tss (exercise) are mutually exclusive at the 45%-HRR
+    threshold; tss carries the spec's /60 factor. Returns (delta_s1, delta_tss).
+    """
+    hrr = hr_max - hr_rest
+    if hrr <= 0 or hr_avg <= hr_rest:
+        return 0.0, 0.0
+    ratio = (hr_avg - hr_rest) / (LOAD_THRESHOLD_FRAC * hrr)
+    if ratio <= 0:
+        return 0.0, 0.0
+    threshold_hr = LOAD_THRESHOLD_FRAC * hrr + hr_rest
+    if hr_avg < threshold_hr:
+        return S1_COEF * ratio * math.exp(ratio), 0.0
+    if is_female:
+        delta_tss = TSS_FEMALE_COEF * ratio * math.exp(TSS_FEMALE_EXP * ratio) / TSS_DIV
+    else:
+        delta_tss = TSS_MALE_COEF * ratio * math.exp(TSS_MALE_EXP * ratio) / TSS_DIV
+    return 0.0, delta_tss
+
+
+def _hr_zone(heart_rate: float, hr_rest: float, hr_max: float) -> int:
+    """HR zone 0..len(ZONE_FRACTIONS)+1 from the HRR fraction (spec loadZones)."""
+    hrr = hr_max - hr_rest
+    if hrr <= 0:
+        return 0
+    fraction = (heart_rate - hr_rest) / hrr
+    for threshold, zone in zip(ZONE_FRACTIONS, range(1, len(ZONE_FRACTIONS) + 1)):
+        if fraction < threshold:
+            return zone
+    return len(ZONE_FRACTIONS) + 1
+
+
+def _build_minute_metric(
     device_id: int,
     target_date: date,
     timestamp: datetime,
@@ -769,90 +889,45 @@ def compute_minute_metrics(
     hr_max: float,
     e_d: float,
     t_d: float,
-) -> MinuteMetric:
-    """Computes the per-minute load increment, cumulative load, and remaining energy.
-
-    Persists per-minute deltas (load_delta, tss_delta) so a day's total load is
-    SUM(load_delta). Steps/calories are not modelled and stay zero.
-    """
-    with Session(engine) as session:
-        last_minute = session.exec(
-            select(MinuteMetric)
-            .where(MinuteMetric.device_id == device_id)
-            .where(MinuteMetric.night_date == target_date)
-            .order_by(col(MinuteMetric.timestamp).desc())
-        ).first()
-
-        prev_s1 = last_minute.s1_load if last_minute else 0.0
-        prev_tss = last_minute.tss_load if last_minute else 0.0
-
-        # Heart Rate Zone classification (0 to 5 based on reserve percentages)
-        hrr = hr_max - hr_rest
-        hr_zone = 0
-        if hrr > 0:
-            fraction = (heart_rate - hr_rest) / hrr
-            for threshold, zone in zip(
-                ZONE_FRACTIONS, range(1, len(ZONE_FRACTIONS) + 1)
-            ):
-                if fraction < threshold:
-                    hr_zone = zone
-                    break
-            else:
-                hr_zone = len(ZONE_FRACTIONS) + 1
-
-        # Calculate minute load increment
-        threshold_hr = LOAD_THRESHOLD_FRAC * hrr + hr_rest
-        delta_s1 = 0.0
-        delta_tss = 0.0
-        if hrr > 0:
-            ratio = (heart_rate - hr_rest) / (LOAD_THRESHOLD_FRAC * hrr)
-            if heart_rate < threshold_hr and ratio > 0:
-                delta_s1 = S1_COEF * ratio * math.exp(ratio)
-            elif heart_rate >= threshold_hr and ratio > 0:
-                if is_female:
-                    delta_tss = (
-                        TSS_FEMALE_COEF * ratio * math.exp(TSS_FEMALE_EXP * ratio)
-                    ) / TSS_DIV
-                else:
-                    delta_tss = (
-                        TSS_MALE_COEF * ratio * math.exp(TSS_MALE_EXP * ratio)
-                    ) / TSS_DIV
-
-        current_s1 = prev_s1 + delta_s1
-        current_tss = prev_tss + delta_tss
-        total_load = current_s1 + current_tss
-
-        f_dt = max(
-            ENERGY_FLOOR, min(ENERGY_CEIL, e_d - 0.5 * t_d * _sigmoid(total_load))
-        )
-        total_energy = round(100 * max(0.0, min(1.0, f_dt)))
-
-        minute_metric = MinuteMetric(
-            device_id=device_id,
-            timestamp=timestamp,
-            night_date=target_date,
-            heart_rate=heart_rate,
-            s1_load=current_s1,
-            tss_load=current_tss,
-            total_load=total_load,
-            total_energy=total_energy,
-            heart_rate_zone=hr_zone,
-            steps=0,
-            calories=0.0,
-            load_delta=delta_s1 + delta_tss,
-            tss_delta=delta_tss,
-        )
-
-        session.add(minute_metric)
-        session.commit()
-        session.refresh(minute_metric)
-        return minute_metric
+    prev_s1: float,
+    prev_tss: float,
+) -> tuple[MinuteMetric, float, float]:
+    """Builds one MinuteMetric for a 1-min bin and returns it with the new
+    cumulative S1/tss. F_(d,t) uses the fixed morning E_d/T_d with the cumulative
+    total load (spec §8), so the same load is never deducted twice."""
+    delta_s1, delta_tss = _minute_load_increment(is_female, hr_rest, hr_max, heart_rate)
+    current_s1 = prev_s1 + delta_s1
+    current_tss = prev_tss + delta_tss
+    total_load = current_s1 + current_tss
+    f_dt = max(ENERGY_FLOOR, min(ENERGY_CEIL, e_d - 0.5 * t_d * _sigmoid(total_load)))
+    total_energy = round(100 * max(0.0, min(1.0, f_dt)))
+    metric = MinuteMetric(
+        device_id=device_id,
+        timestamp=timestamp,
+        night_date=target_date,
+        heart_rate=heart_rate,
+        s1_load=current_s1,
+        tss_load=current_tss,
+        total_load=total_load,
+        total_energy=total_energy,
+        heart_rate_zone=_hr_zone(heart_rate, hr_rest, hr_max),
+        steps=0,
+        calories=0.0,
+        load_delta=delta_s1 + delta_tss,
+        tss_delta=delta_tss,
+    )
+    return metric, current_s1, current_tss
 
 
 def process_minute_metric(device_id: int) -> int:
-    """
-    Processes un-evaluated PPI records into per-minute load/energy metrics.
-    Night boundaries use the device's NIGHT_START_HOUR via night_key.
+    """Bins un-evaluated PPI into 1-minute average-HR buckets and persists one
+    MinuteMetric per bucket (spec §7: load accumulates per minute, not per second).
+
+    Buckets are built from PPI already ordered by time, so iterating the bucket
+    dict in insertion order is chronological. The cumulative S1/tss is carried
+    forward per night_date, seeded from that night's last stored MinuteMetric, and
+    the whole batch is written in a single commit (replaces the per-PPI commit).
+    Returns the number of buckets written.
     """
     with Session(engine) as session:
         device = session.exec(select(Device).where(Device.id == device_id)).first()
@@ -891,18 +966,62 @@ def process_minute_metric(device_id: int) -> int:
         if not unprocessed_ppi:
             return 0
 
-        processed_count = 0
-        latest_time = start_time
+        # 1. Bin PPI into 1-minute average-HR buckets keyed by (night_date, minute).
+        #    Insertion order follows the time-ordered PPI, so it is chronological.
+        buckets: dict[tuple[date, datetime], list[float]] = {}
+        for p in unprocessed_ppi:
+            if not p.hr:  # 0 / missing HR contributes no load
+                continue
+            night = night_key(p.time, NIGHT_START_HOUR)
+            minute_start = p.time.replace(second=0, microsecond=0)
+            buckets.setdefault((night, minute_start), []).append(float(p.hr))
 
-        for ppi in unprocessed_ppi:
-            target_date = night_key(ppi.time, NIGHT_START_HOUR)
+        if not buckets:
+            progress.end_time = unprocessed_ppi[-1].time
+            session.add(progress)
+            session.commit()
+            return 0
 
-            # Day reference values from its summary (defaults if not yet computed).
-            summary = session.exec(
-                select(DailySummary)
-                .where(DailySummary.device_id == device_id)
-                .where(DailySummary.summary_date == target_date)
-            ).first()
+        involved_nights = {night for (night, _) in buckets}
+
+        # 2. Day reference values (e_d, t_d, hr_rest, hr_max) per involved night.
+        summaries = session.exec(
+            select(DailySummary)
+            .where(DailySummary.device_id == device_id)
+            .where(col(DailySummary.summary_date).in_(list(involved_nights)))
+        ).all()
+        summary_by_date = {s.summary_date: s for s in summaries}
+
+        # 3. Existing MinuteMetrics per night: seed the cumulative S1/tss from the
+        #    last stored bucket and map by timestamp for upsert.
+        existing_by_ts: dict[tuple[date, datetime], MinuteMetric] = {}
+        last_by_night: dict[date, MinuteMetric] = {}
+        for night in involved_nights:
+            rows = session.exec(
+                select(MinuteMetric)
+                .where(MinuteMetric.device_id == device_id)
+                .where(MinuteMetric.night_date == night)
+                .order_by(col(MinuteMetric.timestamp).asc())
+            ).all()
+            for r in rows:
+                existing_by_ts[(r.night_date, r.timestamp)] = r
+                last_by_night[night] = r
+
+        # 4. Walk buckets in (chronological) insertion order; accumulate per night.
+        cur_night: date | None = None
+        cur_s1 = 0.0
+        cur_tss = 0.0
+        for night, minute_start in buckets:
+            if night != cur_night:
+                last = last_by_night.get(night)
+                cur_s1 = last.s1_load if last else 0.0
+                cur_tss = last.tss_load if last else 0.0
+                cur_night = night
+
+            hrs = buckets[(night, minute_start)]
+            avg_hr = sum(hrs) / len(hrs)
+
+            summary = summary_by_date.get(night)
             if summary:
                 hr_rest = summary.rest_heart_rate_avg or DEFAULT_HR_REST
                 hr_max = summary.hr_max or DEFAULT_HR_MAX
@@ -921,26 +1040,40 @@ def process_minute_metric(device_id: int) -> int:
                 e_d = FIRST_ENERGY
                 t_d = 1.0
 
-            compute_minute_metrics(
-                device_id=device_id,
-                target_date=target_date,
-                timestamp=ppi.time,
-                heart_rate=float(ppi.hr),
-                is_female=is_female,
-                hr_rest=hr_rest,
-                hr_max=hr_max,
-                e_d=e_d,
-                t_d=t_d,
+            metric, cur_s1, cur_tss = _build_minute_metric(
+                device_id,
+                night,
+                minute_start,
+                avg_hr,
+                is_female,
+                hr_rest,
+                hr_max,
+                e_d,
+                t_d,
+                cur_s1,
+                cur_tss,
             )
-            latest_time = ppi.time
-            processed_count += 1
 
-        # Update progress tracking
-        progress.end_time = latest_time
+            existing = existing_by_ts.get((night, minute_start))
+            if existing is not None:
+                existing.heart_rate = metric.heart_rate
+                existing.s1_load = metric.s1_load
+                existing.tss_load = metric.tss_load
+                existing.total_load = metric.total_load
+                existing.total_energy = metric.total_energy
+                existing.heart_rate_zone = metric.heart_rate_zone
+                existing.load_delta = metric.load_delta
+                existing.tss_delta = metric.tss_delta
+                session.add(existing)
+            else:
+                session.add(metric)
+
+        # Single commit for the whole batch (replaces the per-PPI commit).
+        progress.end_time = unprocessed_ppi[-1].time
         session.add(progress)
         session.commit()
 
-        return processed_count
+        return len(buckets)
 
 
 def _is_nonsport_sample(
@@ -992,6 +1125,25 @@ def _hr5min_non_sport(
     if not readings:
         return None
     return float(np.mean(readings))
+
+
+def _active_morning_time(
+    session: Session, device_id: int, hour_end: datetime
+) -> datetime:
+    """Morning start of the active waking period (spec §5: "from the moment the
+    morning status was obtained"). Proxied as the end of the most recent
+    is_sleep window before ``hour_end`` (the last wake); falls back to local
+    midnight when no preceding sleep window exists."""
+    wake = session.exec(
+        select(WindowMetric.window_end)
+        .where(WindowMetric.device_id == device_id)
+        .where(WindowMetric.is_sleep.is_(True))
+        .where(col(WindowMetric.window_end) <= hour_end)
+        .order_by(col(WindowMetric.window_end).desc())
+    ).first()
+    if wake is None:
+        return datetime.combine(hour_end.date(), datetime.min.time())
+    return wake
 
 
 def _zone_hours(
@@ -1096,8 +1248,13 @@ def process_hourly_status(device_id: int) -> int:
         hr_5min = None
         is_sleep_or_exercise = False
         if not is_temporary:
-            # Formal §5: time-in-zone since the active-day morning.
-            window_start = datetime.combine(latest.date(), datetime.min.time())
+            # Formal §5: time-in-zone from the active-day morning (wake) to now.
+            window_start = _active_morning_time(session, device_id, hour_end)
+            # Spec §5 baseline is the non-sport/non-sleep HR (§基准值
+            # non_SportSleepHR), not the resting HR; fall back to RHR when the
+            # non-sport baseline is unavailable.
+            ns_avg = baselines["nonsport_hr_avg"]
+            baseline = ns_avg if ns_avg is not None else baselines["rhr_avg"]
             t1, t2, t3, t4 = _zone_hours(
                 session,
                 device_id,
@@ -1105,8 +1262,8 @@ def process_hourly_status(device_id: int) -> int:
                 hour_end,
                 hr_max,
                 rhr_today,
-                baselines["rhr_avg"],
-                baselines["rhr_std"] or 0.0,
+                baseline,
+                baselines["nonsport_hr_std"] or 0.0,
                 strategy,
             )
             is_sleep_or_exercise = t1 + t2 + t3 + t4 == 0.0
@@ -1126,11 +1283,15 @@ def process_hourly_status(device_id: int) -> int:
             else:
                 adjustment = 0
 
-        # §6.3 clamps the temporary hourly status to [30, 90]; the formal §5
-        # status (line 79 of the spec) is unclipped, matching the unclipped
-        # daily formal status_score it starts from.
+        # §6.3 clamps the temporary hourly status to [30, 90]. The formal §5
+        # status is clamped to the UI range [0, 100] (F-10), matching the
+        # clamped daily formal status_score it starts from.
         raw_status = int(morning_status + adjustment)
-        current_status = int(np.clip(raw_status, 30, 90)) if is_temporary else raw_status
+        current_status = (
+            int(np.clip(raw_status, 30, 90))
+            if is_temporary
+            else int(np.clip(raw_status, 0, 100))
+        )
 
         existing = session.exec(
             select(HourlyStatus)
@@ -1241,8 +1402,15 @@ def process_daily_summary_pipeline(device_id: int) -> int:
 
 
 def _finalize_one_day(device_id: int, target_date: date) -> None:
-    """Closes a single day: total load/TS from per-minute deltas, the energy F_d,
-    and the ATL/CTL/TSB chain. Idempotent (skips days already closed)."""
+    """Closes a single day: total load/tss from per-minute deltas, the energy F_d,
+    and the ATL/CTL/TSB chain. Idempotent (skips days already closed).
+
+    Spec §8 data-missing rule: a day with no load data is *incomplete* — it is
+    flagged via energy_incomplete and its energy_end_f / total_load / total_tss are
+    left None so the day is excluded from the 7-day F rolling and the next-day E
+    recovery recursion, with no 0-substitution. It is re-attempted on later runs
+    until a valid F_d can be produced ("continue after the next valid day").
+    """
     with Session(engine) as session:
         summary = session.exec(
             select(DailySummary)
@@ -1256,7 +1424,21 @@ def _finalize_one_day(device_id: int, target_date: date) -> None:
             select(MinuteMetric)
             .where(MinuteMetric.device_id == device_id)
             .where(MinuteMetric.night_date == target_date)
+            .order_by(col(MinuteMetric.timestamp).asc())
         ).all()
+
+        # Incomplete day: no load data → flag it and leave F_d / total_load / total_tss
+        # unset so the day is excluded from the F rolling and the recovery recursion.
+        if not minutes:
+            summary.energy_incomplete = True
+            summary.energy_end_f = None
+            summary.total_load = None
+            summary.total_tss = None
+            summary.last_valid_energy_ts = None
+            session.add(summary)
+            session.commit()
+            return
+
         total_load = sum((m.load_delta for m in minutes), 0.0)
         total_tss = sum((m.tss_delta for m in minutes), 0.0)
 
@@ -1293,6 +1475,8 @@ def _finalize_one_day(device_id: int, target_date: date) -> None:
         summary.atl = atl
         summary.ctl = ctl
         summary.tsb = atl - ctl
+        summary.energy_incomplete = False
+        summary.last_valid_energy_ts = minutes[-1].timestamp
         session.add(summary)
         session.commit()
 

@@ -24,7 +24,7 @@ class BodyMetricsData(BaseModel):
 async def get_body_metrics(
     address: str,
     metric: str = Query(
-        ..., description="指标类型：heartRate/restingHeartRate/bloodOxygen/hrv"
+        ..., description="指标类型:heartRate/restingHeartRate/bloodOxygen/hrv"
     ),
     startDate: str = Query(..., description="开始日期 YYYY-MM-DD"),
     endDate: str = Query(..., description="结束日期 YYYY-MM-DD"),

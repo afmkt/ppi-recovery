@@ -43,6 +43,9 @@ _NEW_COLUMNS: dict[str, dict[str, str]] = {
         "bonus_points": "INTEGER DEFAULT 0",
         "energy_incomplete": "BOOLEAN DEFAULT 0",
         "last_valid_energy_ts": "DATETIME",
+        "sympathetic_pct": "FLOAT",
+        "parasympathetic_pct": "FLOAT",
+        "transition_pct": "FLOAT",
     },
     "windowmetric": {
         "is_sleep": "BOOLEAN",

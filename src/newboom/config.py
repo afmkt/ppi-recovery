@@ -7,14 +7,16 @@ from datetime import date, datetime, timedelta
 #
 # A "night" is a bucket keyed to one local date so that a single night whose
 # windows straddle midnight maps to exactly one row instead of two. The default
-# (0) keys every window to its own calendar date (current behavior). Set a
-# non-zero local hour to fold the early-morning tail of a night back onto the
-# date the night started in.
+# (8) folds the early-morning tail (00:00–07:59) of a night back onto the date
+# the night started in, so a 23:00–07:30 sleep is one row keyed to its start
+# date rather than split across two. Tunable: set it to the population's latest
+# typical wake hour +1. Reprocess existing data after changing it:
+# WindowMetric.night_date / Sleep.night_date / DailySummary.summary_date re-key.
 #
 # Per-device timezone offset (e.g. "08:00") lives on Device.tz; it is not a
 # global because different devices may report local time in different zones.
 # ---------------------------------------------------------------------------
-NIGHT_START_HOUR = 0
+NIGHT_START_HOUR = 8
 
 
 def night_key(dt: datetime, night_start_hour: int = NIGHT_START_HOUR) -> date:
@@ -23,7 +25,8 @@ def night_key(dt: datetime, night_start_hour: int = NIGHT_START_HOUR) -> date:
     Windows in the early morning (``hour < night_start_hour``) belong to the
     night that started the previous evening and are keyed to that previous
     date; all other windows key to their own calendar date. With the default
-    ``night_start_hour == 0`` the key equals the window's calendar date.
+    (``8``) the 00:00–07:59 tail folds to the previous date; ``0`` disables the
+    fold and keys every window to its own calendar date.
     """
     if dt.hour < night_start_hour:
         return dt.date() - timedelta(days=1)

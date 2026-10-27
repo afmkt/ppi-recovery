@@ -53,10 +53,11 @@ def clean_ppi_series(ppi_list: list[float]) -> list[float | None]:
         # Define local window of +/- 5 elements (11 points total)
         start_idx = max(0, i - 5)
         end_idx = min(n, i + 6)
-        local_slice = arr[start_idx:end_idx]
-
-        # Compute local median
-        m_i = np.median(local_slice)
+        # F-16: median over in-range points only — out-of-range samples are
+        # invalid by the valid_range definition and must not skew the local
+        # median. Point i is in range, so the in-range subset is non-empty.
+        in_range = arr[start_idx:end_idx][valid_range_mask[start_idx:end_idx]]
+        m_i = np.median(in_range)
 
         # Local valid check: abs(ppi_i - m_i) <= max(250, 0.25 * m_i)
         if abs(arr[i] - m_i) <= max(250.0, 0.25 * m_i):
@@ -656,6 +657,4 @@ def process_pipeline(all_devices: list[Device]) -> None:
                 )
             hourly_count = process_hourly_status(device.id)
             if hourly_count > 0:
-                print(
-                    f"Updated hourly dynamic status for device {device.id}"
-                )
+                print(f"Updated hourly dynamic status for device {device.id}")
