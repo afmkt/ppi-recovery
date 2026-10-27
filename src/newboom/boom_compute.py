@@ -273,7 +273,8 @@ def _morning_hr_series(
 
 
 def _compute_rolling_baselines(past_summaries: list[DailySummary]) -> dict[str, Any]:
-    """Computes 7-day rolling means and standard deviations from historical summaries."""
+    """Computes 7-day rolling means and standard deviations from the per-day
+    raw metric values stored on prior summaries (P0-1)."""
 
     def rolling_stats(values: list[float | None]) -> tuple[float | None, float | None]:
         clean_vals = [v for v in values if v is not None]
@@ -284,15 +285,15 @@ def _compute_rolling_baselines(past_summaries: list[DailySummary]) -> dict[str, 
         ) > 1 else 0.0
 
     hrv_night_avg, hrv_night_std = rolling_stats(
-        [s.hrv_night_avg for s in past_summaries]
+        [s.hrv_night_val for s in past_summaries]
     )
     hrv_morning_avg, hrv_morning_std = rolling_stats(
-        [s.hrv_morning_avg for s in past_summaries]
+        [s.hrv_morning_val for s in past_summaries]
     )
-    rhr_avg, rhr_std = rolling_stats([s.rest_heart_rate_avg for s in past_summaries])
-    bed_time_avg, _ = rolling_stats([s.bed_time_avg for s in past_summaries])
+    rhr_avg, rhr_std = rolling_stats([s.rest_heart_rate_val for s in past_summaries])
+    bed_time_avg, _ = rolling_stats([s.bed_time_val for s in past_summaries])
     nonsport_hr_avg, nonsport_hr_std = rolling_stats(
-        [s.non_sport_sleep_hr_avg for s in past_summaries]
+        [s.non_sport_sleep_hr_val for s in past_summaries]
     )
 
     return {
@@ -378,8 +379,8 @@ def _temporary_status(
 
     # Δ_RHR vs the previous valid day: down >=5bpm +3; up >=5bpm -3; else 0.
     delta_rhr = 0
-    if metrics["rest_hr_val"] and prev.rest_heart_rate_avg:
-        diff_rhr = metrics["rest_hr_val"] - prev.rest_heart_rate_avg
+    if metrics["rest_hr_val"] and prev.rest_heart_rate_val:
+        diff_rhr = metrics["rest_hr_val"] - prev.rest_heart_rate_val
         if diff_rhr <= -5:
             delta_rhr = 3
         elif diff_rhr >= 5:
@@ -388,7 +389,7 @@ def _temporary_status(
     # Δ_HRV vs the previous valid day: up >=10% +3; down >=10% -3; else 0.
     delta_hrv = 0
     cur_hrv = metrics["hrv_night_val"]
-    prev_hrv = prev.hrv_night_avg
+    prev_hrv = prev.hrv_night_val
     if cur_hrv and prev_hrv:
         change = (cur_hrv - prev_hrv) / prev_hrv
         if change >= 0.10:
@@ -683,11 +684,18 @@ def _autonomic_summary(night_windows: list[WindowMetric]) -> dict[str, float | N
 def process_daily_summary(device_id: int, target_date: date) -> DailySummary | None:
     """Computes and stores the DailySummary for a specific device and calendar date."""
     with Session(engine) as session:
-        # 1. Fetch Sleep and Window Metric records
+        # 1. Fetch Sleep and Window Metric records. Sleep.night_date is a
+        # property (night_key of its timestamp), not a column, so the night is
+        # matched by the time window [target 08:00, +1 day).
+        night_start_dt = datetime(
+            target_date.year, target_date.month, target_date.day, NIGHT_START_HOUR
+        )
+        night_end_dt = night_start_dt + timedelta(days=1)
         sleep_record = session.exec(
             select(Sleep)
             .where(Sleep.device_id == device_id)
-            .where(Sleep.night_date == target_date)
+            .where(col(Sleep.time) >= night_start_dt)
+            .where(col(Sleep.time) < night_end_dt)
         ).first()
 
         night_windows = session.exec(
@@ -705,7 +713,7 @@ def process_daily_summary(device_id: int, target_date: date) -> DailySummary | N
         metrics = _extract_sleep_metrics(sleep_record, list(night_windows), morning_hr)
 
         # 2b. Per-night autonomic state balance (recovery reference).
-        autonomic = _autonomic_summary(night_windows)
+        autonomic = _autonomic_summary(list(night_windows))
 
         past_summaries = list(
             session.exec(
@@ -745,14 +753,7 @@ def process_daily_summary(device_id: int, target_date: date) -> DailySummary | N
         ) = _calculate_status_score(metrics, baselines, past_summaries)
         t_d, start_e = _compute_energy_parameters(metrics, baselines, past_summaries)
 
-        # Determine bed_time_avg to save as baseline
-        bed_time_avg_to_save = (
-            baselines["bed_time_avg"]
-            if baselines["bed_time_avg"] is not None
-            else metrics["bed_time_h"]
-        )
-
-        coaching_text = "前几天连续训练负荷较大，HRV较低但储能情况良好，预计明天HRV上升达到超量恢复黄金窗口。建议降低训练量，注意恢复调整。"
+        coaching_text = "前几天连续训练负荷较大, HRV较低但储能情况良好, 预计明天HRV上升达到超量恢复黄金窗口。建议降低训练, 注意恢复调整。"
 
         # 4. Upsert DailySummary
         existing = session.exec(
@@ -762,18 +763,25 @@ def process_daily_summary(device_id: int, target_date: date) -> DailySummary | N
         ).first()
 
         if existing:
-            existing.hrv_night_avg = metrics["hrv_night_val"]
+            existing.hrv_night_avg = baselines["hrv_night_avg"]
             existing.hrv_night_std = baselines["hrv_night_std"]
-            existing.hrv_morning_avg = metrics["hrv_morning_val"]
+            existing.hrv_morning_avg = baselines["hrv_morning_avg"]
             existing.hrv_morning_std = baselines["hrv_morning_std"]
-            existing.bed_time_avg = bed_time_avg_to_save
-            existing.rest_heart_rate_avg = metrics["rest_hr_val"]
+            existing.bed_time_avg = baselines["bed_time_avg"]
+            existing.rest_heart_rate_avg = baselines["rhr_avg"]
             existing.rest_heart_rate_std = baselines["rhr_std"]
             existing.hr_max = hr_max
             existing.spo2_night_avg = spo2_night_avg
             existing.spo2_night_min = spo2_night_min
-            existing.non_sport_sleep_hr_avg = nonsport_hr
+            existing.non_sport_sleep_hr_avg = baselines["nonsport_hr_avg"]
             existing.non_sport_sleep_hr_std = baselines["nonsport_hr_std"]
+            # Per-day raw values (P0-1): today's measurement, kept separate from
+            # the 7-day rolling baselines stored in the *_avg/*_std fields.
+            existing.hrv_night_val = metrics["hrv_night_val"]
+            existing.hrv_morning_val = metrics["hrv_morning_val"]
+            existing.rest_heart_rate_val = metrics["rest_hr_val"]
+            existing.non_sport_sleep_hr_val = nonsport_hr
+            existing.bed_time_val = metrics["bed_time_h"]
             existing.sympathetic_pct = autonomic["sympathetic_pct"]
             existing.parasympathetic_pct = autonomic["parasympathetic_pct"]
             existing.transition_pct = autonomic["transition_pct"]
@@ -789,7 +797,7 @@ def process_daily_summary(device_id: int, target_date: date) -> DailySummary | N
             existing.boom_go_text = coaching_text
             existing.supercomp_time = "次日 10:00 – 14:00"
             existing.training_suggestion = "中高强度训练（阈值 / 间歇）"
-            existing.training_duration = "60–90分钟"
+            existing.training_duration = "60-90分钟"
             existing.training_target = "提升能力上限（耐力/阈值）"
             existing.is_temporary_algorithm = is_temporary
             existing.status_morning = status_score
@@ -801,18 +809,24 @@ def process_daily_summary(device_id: int, target_date: date) -> DailySummary | N
             summary = DailySummary(
                 device_id=device_id,
                 summary_date=target_date,
-                hrv_night_avg=metrics["hrv_night_val"],
+                hrv_night_avg=baselines["hrv_night_avg"],
                 hrv_night_std=baselines["hrv_night_std"],
-                hrv_morning_avg=metrics["hrv_morning_val"],
+                hrv_morning_avg=baselines["hrv_morning_avg"],
                 hrv_morning_std=baselines["hrv_morning_std"],
-                bed_time_avg=bed_time_avg_to_save,
-                rest_heart_rate_avg=metrics["rest_hr_val"],
+                bed_time_avg=baselines["bed_time_avg"],
+                rest_heart_rate_avg=baselines["rhr_avg"],
                 rest_heart_rate_std=baselines["rhr_std"],
                 hr_max=hr_max,
                 spo2_night_avg=spo2_night_avg,
                 spo2_night_min=spo2_night_min,
-                non_sport_sleep_hr_avg=nonsport_hr,
+                non_sport_sleep_hr_avg=baselines["nonsport_hr_avg"],
                 non_sport_sleep_hr_std=baselines["nonsport_hr_std"],
+                # Per-day raw values (P0-1), separate from the 7-day baselines.
+                hrv_night_val=metrics["hrv_night_val"],
+                hrv_morning_val=metrics["hrv_morning_val"],
+                rest_heart_rate_val=metrics["rest_hr_val"],
+                non_sport_sleep_hr_val=nonsport_hr,
+                bed_time_val=metrics["bed_time_h"],
                 sympathetic_pct=autonomic["sympathetic_pct"],
                 parasympathetic_pct=autonomic["parasympathetic_pct"],
                 transition_pct=autonomic["transition_pct"],
@@ -919,6 +933,35 @@ def _build_minute_metric(
     return metric, current_s1, current_tss
 
 
+def _resolve_hr_rest(
+    night: date,
+    summary: DailySummary | None,
+    latest_summary: DailySummary | None,
+    sleep_by_night: dict[date, float],
+) -> float:
+    """RHR baseline for the load math (spec §7: "取过去7天静息心率基线").
+
+    P0-2 fallback chain, in order:
+      1. the night's own 7-day rolling baseline (stored on ``rest_heart_rate_avg``
+         after P0-1),
+      2. the most recent closed day's rolling baseline (the current in-progress
+         night has no summary yet),
+      3. that night's sleep-derived resting HR,
+      4. the fixed default (60).
+    """
+    if summary is not None and summary.rest_heart_rate_avg is not None:
+        return float(summary.rest_heart_rate_avg)
+    if (
+        latest_summary is not None
+        and latest_summary.rest_heart_rate_avg is not None
+    ):
+        return float(latest_summary.rest_heart_rate_avg)
+    sleep_hr = sleep_by_night.get(night)
+    if sleep_hr is not None and sleep_hr > 0:
+        return float(sleep_hr)
+    return DEFAULT_HR_REST
+
+
 def process_minute_metric(device_id: int) -> int:
     """Bins un-evaluated PPI into 1-minute average-HR buckets and persists one
     MinuteMetric per bucket (spec §7: load accumulates per minute, not per second).
@@ -992,6 +1035,27 @@ def process_minute_metric(device_id: int) -> int:
         ).all()
         summary_by_date = {s.summary_date: s for s in summaries}
 
+        # 2b. RHR baseline fallback chain (P0-2): the current in-progress night
+        # has no summary yet, so fall back to the most recent closed day's
+        # rolling baseline, then that night's sleep-derived rest HR, then 60.
+        latest_summary = session.exec(
+            select(DailySummary)
+            .where(DailySummary.device_id == device_id)
+            .where(col(DailySummary.rest_heart_rate_avg).isnot(None))
+            .order_by(col(DailySummary.summary_date).desc())
+            .limit(1)
+        ).first()
+        sleep_by_night: dict[date, float] = {}
+        for s in session.exec(
+            select(Sleep)
+            .where(Sleep.device_id == device_id)
+            .order_by(col(Sleep.time).asc())
+        ).all():
+            if s.heart_rate_rest:
+                sleep_by_night[night_key(s.time, NIGHT_START_HOUR)] = float(
+                    s.heart_rate_rest
+                )
+
         # 3. Existing MinuteMetrics per night: seed the cumulative S1/tss from the
         #    last stored bucket and map by timestamp for upsert.
         existing_by_ts: dict[tuple[date, datetime], MinuteMetric] = {}
@@ -1022,8 +1086,8 @@ def process_minute_metric(device_id: int) -> int:
             avg_hr = sum(hrs) / len(hrs)
 
             summary = summary_by_date.get(night)
+            hr_rest = _resolve_hr_rest(night, summary, latest_summary, sleep_by_night)
             if summary:
-                hr_rest = summary.rest_heart_rate_avg or DEFAULT_HR_REST
                 hr_max = summary.hr_max or DEFAULT_HR_MAX
                 e_d = (
                     summary.energy_start_e
@@ -1036,7 +1100,7 @@ def process_minute_metric(device_id: int) -> int:
                     else 1.0
                 )
             else:
-                hr_rest, hr_max = _hr_params(device, [])
+                _, hr_max = _hr_params(device, [])
                 e_d = FIRST_ENERGY
                 t_d = 1.0
 
@@ -1137,7 +1201,7 @@ def _active_morning_time(
     wake = session.exec(
         select(WindowMetric.window_end)
         .where(WindowMetric.device_id == device_id)
-        .where(WindowMetric.is_sleep.is_(True))
+        .where(col(WindowMetric.is_sleep).is_(True))
         .where(col(WindowMetric.window_end) <= hour_end)
         .order_by(col(WindowMetric.window_end).desc())
     ).first()

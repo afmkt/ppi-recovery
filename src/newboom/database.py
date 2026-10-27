@@ -46,6 +46,13 @@ _NEW_COLUMNS: dict[str, dict[str, str]] = {
         "sympathetic_pct": "FLOAT",
         "parasympathetic_pct": "FLOAT",
         "transition_pct": "FLOAT",
+        # P0-1: per-day raw metric values, kept separate from the 7-day
+        # rolling baselines stored in the *_avg/*_std fields.
+        "hrv_night_val": "FLOAT",
+        "hrv_morning_val": "FLOAT",
+        "rest_heart_rate_val": "FLOAT",
+        "non_sport_sleep_hr_val": "FLOAT",
+        "bed_time_val": "FLOAT",
     },
     "windowmetric": {
         "is_sleep": "BOOLEAN",

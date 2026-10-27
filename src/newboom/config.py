@@ -122,3 +122,12 @@ STATUS_WEIGHT_MATRIX: tuple[tuple[float, ...], ...] = (
     (2.0, 2.5, 3.0, 3.5),
     (2.5, 3.0, 3.5, 4.0),
 )
+
+
+# ---------------------------------------------------------------------------
+# PPI cleaning (boom.calculation.md §4)
+# ---------------------------------------------------------------------------
+# Left-context overlap for the local-median PPI cleaner. The ±5-sample median
+# has no context across the ≤5000-sample batch boundary, so each batch is
+# prefixed with this many already-cleaned PPI; ≥5 fully covers the window (P1-4).
+CLEAN_CONTEXT = 6

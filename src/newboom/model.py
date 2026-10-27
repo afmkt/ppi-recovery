@@ -34,6 +34,9 @@ class Device(SQLModel, table=True):
     hourly_status: list["HourlyStatus"] = Relationship(
         back_populates="device"
     )
+    autonomic_episodes: list["AutonomicEpisode"] = Relationship(
+        back_populates="device",
+    )
 
 
 class ActivityState(IntEnum):
@@ -215,6 +218,41 @@ class RmssdSegment(SQLModel, table=True):
     segment_sse: float = Field(description="Sum of squared errors")
 
 
+class AutonomicEpisode(SQLModel, table=True):
+    """Per-night autonomic ribbon episode (recovery reference ``state_episodes``).
+
+    A contiguous run of windows sharing one classified :class:`WindowState` that
+    is broken by a state change or a time gap (> 1.8× the median 1-min window
+    step), mirroring ``docs/recovery_v06.py``. This is the granular episode
+    structure the per-night balance percentages on :class:`DailySummary`
+    cannot express (P1-1).
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    device_id: int = Field(foreign_key="device.id", index=True)
+    device: Device = Relationship(back_populates="autonomic_episodes")
+
+    night_date: date = Field(index=True, description="Night session date")
+    episode_id: int = Field(description="Sequence number within the night (1..n)")
+
+    state: WindowState = Field(
+        description="sympathetic / parasympathetic / transition"
+    )
+    start_h: float = Field(description="Episode start, hours from night start")
+    end_h: float = Field(description="Episode end, hours from night start")
+    window_count: int = Field(description="Number of windows in the episode")
+    duration_min: float = Field(description="Episode duration in minutes")
+    lf_hf_median: float | None = Field(
+        default=None, description="Median LF/HF over the episode windows"
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "device_id", "night_date", "episode_id", name="uix_device_night_episode"
+        ),
+    )
+
+
 class DailySummary(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     device_id: int = Field(foreign_key="device.id", index=True)
@@ -237,6 +275,15 @@ class DailySummary(SQLModel, table=True):
     rest_heart_rate_std: float | None = None
     non_sport_sleep_hr_avg: float | None = None
     non_sport_sleep_hr_std: float | None = None
+    # Per-day raw metric values (today's measurement), kept separate from the
+    # 7-day rolling baselines above. Spec §基准值 defines the *_avg/*_std
+    # fields as the 7-day rolling statistics; the per-day value feeds the
+    # rolling window and the §6 day-over-day deltas (P0-1).
+    hrv_night_val: float | None = Field(default=None, description="Today's sleep-period RMSSD mean")
+    hrv_morning_val: float | None = Field(default=None, description="Today's post-wake morning RMSSD mean")
+    rest_heart_rate_val: float | None = Field(default=None, description="Today's sleep-derived resting HR")
+    non_sport_sleep_hr_val: float | None = Field(default=None, description="Today's non-exercise/non-sleep HR mean")
+    bed_time_val: float | None = Field(default=None, description="Tonight's bedtime in hours from midnight")
     hr_max: float = Field(default=190.0, description="Dynamic maximum heart rate")
     spo2_night_avg: float | None = Field(
         default=None,
