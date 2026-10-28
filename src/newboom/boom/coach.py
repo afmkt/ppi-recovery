@@ -15,13 +15,13 @@ router = APIRouter(prefix="/coach", tags=["BOOM_COACH"])
 
 # --- shared message shape ---
 class CoachMessage(BaseModel):
-    messageId: str = Field("", description="消息唯一标识")
-    role: str = Field("ai", description="角色：user/ai")
-    type: str = Field("text", description="消息类型：text/voice")
-    content: str = Field("", description="文本内容")
-    audioUrl: str | None = Field(None, description="语音URL（仅语音消息）")
-    transcript: str | None = Field(None, description="语音转文本（仅语音消息）")
-    createTime: str = Field("", description="创建时间")
+    messageId: str = Field(default="", description="消息唯一标识")
+    role: str = Field(default="ai", description="角色：user/ai")
+    type: str = Field(default="text", description="消息类型：text/voice")
+    content: str = Field(default="", description="文本内容")
+    audioUrl: str | None = Field(default=None, description="语音URL（仅语音消息）")
+    transcript: str | None = Field(default=None, description="语音转文本（仅语音消息）")
+    createTime: str = Field(default="", description="创建时间")
 
 
 class ConversationSummary(BaseModel):
@@ -29,48 +29,50 @@ class ConversationSummary(BaseModel):
     title: str = Field(..., description="对话标题（AI自动生成）")
     createTime: str = Field(..., description="创建时间")
     updateTime: str = Field(..., description="最后更新时间")
-    messageCount: int = Field(0, description="消息数量")
+    messageCount: int = Field(default=0, description="消息数量")
 
 
 class NewConversation(BaseModel):
-    conversationId: str = Field("", description="对话唯一标识")
-    title: str = Field("新对话", description="对话标题（默认 新对话）")
-    createTime: str = Field("", description="创建时间")
+    conversationId: str = Field(default="", description="对话唯一标识")
+    title: str = Field(default="新对话", description="对话标题（默认 新对话）")
+    createTime: str = Field(default="", description="创建时间")
 
 
 class SendResult(BaseModel):
-    conversationId: str = Field("", description="对话唯一标识")
-    messageId: str = Field("", description="用户消息ID")
+    conversationId: str = Field(default="", description="对话唯一标识")
+    messageId: str = Field(default="", description="用户消息ID")
     aiResponse: CoachMessage = Field(
         default_factory=lambda d: CoachMessage(**d), description="AI回复"
     )
 
 
 class WelcomeData(BaseModel):
-    title: str = Field("", description="欢迎标题")
-    message: str = Field("", description="欢迎语/开场白")
+    title: str = Field(default="", description="欢迎标题")
+    message: str = Field(default="", description="欢迎语/开场白")
 
 
 class VoiceUploadData(BaseModel):
-    audioUrl: str = Field("", description="语音文件URL")
-    duration: int = Field(0, description="语音时长（秒）")
-    transcript: str = Field("", description="语音转文本结果")
+    audioUrl: str = Field(default="", description="语音文件URL")
+    duration: int = Field(default=0, description="语音时长（秒）")
+    transcript: str = Field(default="", description="语音转文本结果")
 
 
 class StreamEvent(BaseModel):
-    """SSE 事件：``event: message`` 携带 content/done=false；``event: done`` 携带 done=true."""
+    """SSE 事件：``event: message`` 携带 content/done=false;``event: done`` 携带 done=true."""
 
     messageId: str = Field(..., description="消息唯一标识")
-    content: str | None = Field(None, description="增量内容（event: message）")
-    done: bool = Field(False, description="是否完成（event: done 时 true）")
+    content: str | None = Field(default=None, description="增量内容(event: message)")
+    done: bool = Field(default=False, description="是否完成(event: done 时 true)")
 
 
 # --- request bodies ---
 class SendMessageRequest(BaseModel):
     content: str = Field(..., description="消息内容")
-    type: str = Field(..., description="消息类型：text/voice")
-    conversationId: str | None = Field(None, description="对话ID，不传则创建新对话")
-    audioUrl: str | None = Field(None, description="语音URL（仅语音消息）")
+    type: str = Field(..., description="消息类型:text/voice")
+    conversationId: str | None = Field(
+        default=None, description="对话ID,不传则创建新对话"
+    )
+    audioUrl: str | None = Field(default=None, description="语音URL(仅语音消息）")
 
 
 class InterruptRequest(BaseModel):
@@ -79,7 +81,7 @@ class InterruptRequest(BaseModel):
 
 class FeedbackRequest(BaseModel):
     messageId: str = Field(..., description="消息唯一标识")
-    feedback: str = Field(..., description="反馈类型：like/dislike")
+    feedback: str = Field(..., description="反馈类型:like/dislike")
 
 
 @router.get("/conversations", response_model=BoomResponse[list[ConversationSummary]])

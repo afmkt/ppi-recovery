@@ -18,10 +18,10 @@ router = APIRouter(tags=["状态"])
 
 
 class StatusData(BaseModel):
-    totalStatus: int = Field(0, description="综合状态值 0-100")
-    statusProgress: int = Field(0, description="状态进度百分比 0-100")
-    hrv: int = Field(0, description="心率变异性 ms（夜间rmssd均值）")
-    restingHeartRate: int = Field(0, description="静息心率 bpm")
+    totalStatus: int = Field(default=0, description="综合状态值 0-100")
+    statusProgress: int = Field(default=0, description="状态进度百分比 0-100")
+    hrv: int = Field(default=0, description="心率变异性 ms(夜间rmssd均值)")
+    restingHeartRate: int = Field(default=0, description="静息心率 bpm")
     hrvData: list[TimePoint] = Field(
         default_factory=list, description="当日HRV变化数据"
     )
@@ -31,9 +31,7 @@ def _parse_date(value: str) -> date:
     return _dt.strptime(value, "%Y-%m-%d").date()
 
 
-def _hrv_data_for_day(
-    session: Session, device_id: int, day: date
-) -> list[TimePoint]:
+def _hrv_data_for_day(session: Session, device_id: int, day: date) -> list[TimePoint]:
     """That night's 5-min RMSSD windows as intraday HH:mm points.
 
     ``WindowMetric`` is computed at a 300 s window / 60 s step
@@ -58,9 +56,7 @@ def _hrv_data_for_day(
     ]
 
 
-@router.get(
-    "/devices/{address}/status", response_model=BoomResponse[StatusData]
-)
+@router.get("/devices/{address}/status", response_model=BoomResponse[StatusData])
 async def get_status(
     address: str,
     date: str | None = Query(None, description="查询日期 YYYY-MM-DD，不传默认当天"),
@@ -103,17 +99,15 @@ async def get_status(
         if summary.status_current is not None
         else (summary.status_score or 0)
     )
-    hrv = (
-        round(summary.hrv_night_val)
-        if summary.hrv_night_val is not None
-        else 0
-    )
+    hrv = round(summary.hrv_night_val) if summary.hrv_night_val is not None else 0
     rhr = (
         round(summary.rest_heart_rate_val)
         if summary.rest_heart_rate_val is not None
         else 0
     )
-    hrv_data = _hrv_data_for_day(session, device.id, summary.summary_date)
+    hrv_data = _hrv_data_for_day(
+        session, device.id if device.id is not None else 0, summary.summary_date
+    )
     return BoomResponse(
         code=0,
         data=StatusData(
@@ -168,10 +162,7 @@ def _hourly_readiness(
         day = r.hour_start.date()
         value = r.current_status or 0
         best[day] = max(best.get(day, value), value)
-    return [
-        DatePoint(date=day.isoformat(), value=best[day])
-        for day in sorted(best)
-    ]
+    return [DatePoint(date=day.isoformat(), value=best[day]) for day in sorted(best)]
 
 
 @router.get(
@@ -202,7 +193,11 @@ async def get_readiness(
         start, end = end, start
 
     if READINESS_GRANULARITY == "daily":
-        points = _daily_readiness(session, device.id, start, end)
+        points = _daily_readiness(
+            session, device.id if device.id is not None else 0, start, end
+        )
     else:
-        points = _hourly_readiness(session, device.id, start, end)
+        points = _hourly_readiness(
+            session, device.id if device.id is not None else 0, start, end
+        )
     return BoomResponse(code=0, data=points)
