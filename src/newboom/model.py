@@ -37,6 +37,9 @@ class Device(SQLModel, table=True):
     autonomic_episodes: list["AutonomicEpisode"] = Relationship(
         back_populates="device",
     )
+    questionnaire_answers: list["QuestionnaireAnswer"] = Relationship(
+        back_populates="device"
+    )
 
 
 class ActivityState(IntEnum):
@@ -457,3 +460,25 @@ class HourlyStatus(SQLModel, table=True):
     __table_args__ = (
         UniqueConstraint("device_id", "hour_start", name="uix_device_hourly_hour"),
     )
+
+
+class QuestionnaireAnswer(SQLModel, table=True):
+    """§9.2 问卷提交: one row per submitted question/answer pair, tied to the
+    submitting device (``device_id`` -> ``Device.mac``) and the submit time.
+
+    ``user_type`` / ``question`` / ``selected`` mirror the §9.2 request body
+    (``userType`` and each ``answers[]`` pair); ``created_at`` is the submit
+    timestamp. A device that has not yet paired is created on submit — the
+    request carries only the device ``mac`` (in the path), no name.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    device_id: int = Field(foreign_key="device.id", index=True)
+    device: Device = Relationship(back_populates="questionnaire_answers")
+
+    user_type: str = Field(
+        description="User type value: beginner/serious/professional"
+    )
+    question: str = Field(description="Submitted question text")
+    selected: str = Field(description="Selected option value")
+    created_at: NaiveDatetime = Field(default_factory=datetime.utcnow)

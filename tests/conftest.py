@@ -22,6 +22,7 @@ from newboom.model import (  # noqa: E402
     MinuteMetric,
     PPI,
     Progress,
+    QuestionnaireAnswer,
     RmssdSegment,
     Sleep,
     WindowMetric,
@@ -41,6 +42,7 @@ _TABLES = [
     MinuteMetric,
     DailySummary,
     HourlyStatus,
+    QuestionnaireAnswer,
     Progress,
 ]
 
