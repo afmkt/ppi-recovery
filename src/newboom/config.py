@@ -113,6 +113,13 @@ STATUS_TEMP_FIRST_DAY = 60  # Temporary status T_1 on the first valid day
 #   "activity"  -- PPI.activity in {RELAXED, LOW_ACTIVITY} (non-sport, awake).
 NON_SPORT_STRATEGY = "threshold"
 
+# Readiness chart source (boom §2.2 "取每天最高的状态值"). Per-day value:
+#   "hourly" (default) -- the day's max intraday hourly status
+#                        (HourlyStatus.current_status).
+#   "daily"            -- the frozen daily status (DailySummary.status_score).
+# No fallback: a day with no data from the selected source is omitted.
+READINESS_GRANULARITY = "hourly"
+
 # 4x4 status weight grid (identical for the base-score §1 and sleep-score §2
 # lookups). Rows/cols are 1-indexed severity bands 1..4 (0-indexed here);
 # lower band = better = lower weight = higher score (50 / weight).
