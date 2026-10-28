@@ -31,12 +31,12 @@ class Answer(BaseModel):
 
 
 class QuestionnaireSubmitRequest(BaseModel):
-    userType: str = Field(..., description="用户类型值：beginner/serious/professional")
+    userType: str = Field(..., description="用户类型值:beginner/serious/professional")
     answers: list[Answer] = Field(..., description="用户答案列表")
 
 
 class QuestionnaireSubmitResponse(BaseModel):
-    code: int = Field(0, description="响应代码，0=成功")
+    code: int = Field(0, description="响应代码,0=成功")
     message: str = Field("", description="响应信息")
 
 
