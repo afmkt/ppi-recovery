@@ -106,7 +106,7 @@ async def get_status(
         else 0
     )
     hrv_data = _hrv_data_for_day(
-        session, device.id if device.id is not None else 0, summary.summary_date
+        session, device.id if device.id is not None else -1, summary.summary_date
     )
     return BoomResponse(
         code=0,
@@ -194,10 +194,10 @@ async def get_readiness(
 
     if READINESS_GRANULARITY == "daily":
         points = _daily_readiness(
-            session, device.id if device.id is not None else 0, start, end
+            session, device.id if device.id is not None else -1, start, end
         )
     else:
         points = _hourly_readiness(
-            session, device.id if device.id is not None else 0, start, end
+            session, device.id if device.id is not None else -1, start, end
         )
     return BoomResponse(code=0, data=points)

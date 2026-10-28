@@ -296,7 +296,7 @@ async def get_sleep_status(
 
     # --- per-night sleep durations (trailing 7-day window) ---
     recs = _night_sleep_records(
-        session, device.id if device.id is not None else 0, window_start, day
+        session, device.id if device.id is not None else -1, window_start, day
     )
     durations = [_sleep_duration_hours(r) for r in recs.values()]
     target_rec = recs.get(day)
@@ -377,7 +377,7 @@ async def get_sleep_metric(
     return BoomResponse(
         code=0,
         data=_sleep_metric_points(
-            session, device.id if device.id is not None else 0, night, metric
+            session, device.id if device.id is not None else -1, night, metric
         ),
     )
 
@@ -407,7 +407,7 @@ async def get_sleep_trend(
     return BoomResponse(
         code=0,
         data=_sleep_trend(
-            session, device.id if device.id is not None else 0, start, end
+            session, device.id if device.id is not None else -1, start, end
         ),
     )
 
@@ -437,7 +437,7 @@ async def get_sleep_mode(
         start, end = end, start
 
     recs = _night_sleep_records(
-        session, device.id if device.id is not None else 0, start, end
+        session, device.id if device.id is not None else -1, start, end
     )
     bedtimes: list[TimeOfDayPoint] = []
     wake_times: list[TimeOfDayPoint] = []
