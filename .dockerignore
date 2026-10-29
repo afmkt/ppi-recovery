@@ -1,0 +1,20 @@
+# VCS / caches — never build these in.
+.git/
+.venv/
+.uv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Data + secrets — never build these in.
+data/
+*.db
+*.sqlite
+*.sqlite3
+.env
+.env.*
+
+# Not needed at runtime.
+docs/
+tests/
