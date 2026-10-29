@@ -67,3 +67,21 @@ def list_uploaded_files(
             if datetime.strptime(f.split("-")[1], "%Y-%m-%d").date() <= end
         ]
     return files
+
+
+def save_audio(device: str, filename: str, data: bytes) -> str:
+    """Persist an uploaded voice file under ``STORAGE_PATH``; return its path.
+
+    Mirrors :func:`save_data_to_file`'s ``device-timestamp-hash`` naming so a
+    re-upload of identical audio does not clobber the previous file. The
+    returned path is a filesystem location, not a fetchable URL — the app
+    serves no static files, so §11.9's ``audioUrl`` is PENDING a static mount
+    / object store.
+    """
+    digest = hashlib.sha256(data).hexdigest()[:12]
+    path = (
+        STORAGE_PATH
+        / f"{device}-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}-{digest}-{filename}"
+    )
+    path.write_bytes(data)
+    return str(path)

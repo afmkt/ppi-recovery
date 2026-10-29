@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 from datetime import date, datetime
 from enum import IntEnum, StrEnum
-from typing import Optional
 
 import numpy as np
 from sqlmodel import (
@@ -19,27 +20,32 @@ class Device(SQLModel, table=True):
     name: str = Field(index=True)
     mac: str = Field(index=True, unique=True)
     created_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
-    tz: str | None = Field(default=None, description="Device local UTC offset, e.g. '08:00'")
-    is_female: bool = Field(default=False, description="Selects the female tss load formula")
-    age: int | None = Field(default=None, description="User age; HR_max = 220 - age when set")
-    ppi: list["PPI"] = Relationship(back_populates="device")
-    sleep: list["Sleep"] = Relationship(back_populates="device")
-    window_metrics: list["WindowMetric"] = Relationship(back_populates="device")
-    progress: Optional["Progress"] = Relationship(
+    tz: str | None = Field(
+        default=None, description="Device local UTC offset, e.g. '08:00'"
+    )
+    is_female: bool = Field(
+        default=False, description="Selects the female tss load formula"
+    )
+    age: int | None = Field(
+        default=None, description="User age; HR_max = 220 - age when set"
+    )
+    ppi: list[PPI] = Relationship(back_populates="device")
+    sleep: list[Sleep] = Relationship(back_populates="device")
+    window_metrics: list[WindowMetric] = Relationship(back_populates="device")
+    progress: Progress | None = Relationship(
         back_populates="device", sa_relationship_kwargs={"uselist": False}
     )
-    rmssd_segments: list["RmssdSegment"] = Relationship(back_populates="device")
-    daily_summary: list["DailySummary"] = Relationship(back_populates="device")
-    minute_metrics: list["MinuteMetric"] = Relationship(back_populates="device")
-    hourly_status: list["HourlyStatus"] = Relationship(
-        back_populates="device"
-    )
-    autonomic_episodes: list["AutonomicEpisode"] = Relationship(
+    rmssd_segments: list[RmssdSegment] = Relationship(back_populates="device")
+    daily_summary: list[DailySummary] = Relationship(back_populates="device")
+    minute_metrics: list[MinuteMetric] = Relationship(back_populates="device")
+    hourly_status: list[HourlyStatus] = Relationship(back_populates="device")
+    autonomic_episodes: list[AutonomicEpisode] = Relationship(
         back_populates="device",
     )
-    questionnaire_answers: list["QuestionnaireAnswer"] = Relationship(
+    questionnaire_answers: list[QuestionnaireAnswer] = Relationship(
         back_populates="device"
     )
+    coach_conversations: list[Conversation] = Relationship(back_populates="device")
 
 
 class ActivityState(IntEnum):
@@ -238,9 +244,7 @@ class AutonomicEpisode(SQLModel, table=True):
     night_date: date = Field(index=True, description="Night session date")
     episode_id: int = Field(description="Sequence number within the night (1..n)")
 
-    state: WindowState = Field(
-        description="sympathetic / parasympathetic / transition"
-    )
+    state: WindowState = Field(description="sympathetic / parasympathetic / transition")
     start_h: float = Field(description="Episode start, hours from night start")
     end_h: float = Field(description="Episode end, hours from night start")
     window_count: int = Field(description="Number of windows in the episode")
@@ -282,11 +286,21 @@ class DailySummary(SQLModel, table=True):
     # 7-day rolling baselines above. Spec §基准值 defines the *_avg/*_std
     # fields as the 7-day rolling statistics; the per-day value feeds the
     # rolling window and the §6 day-over-day deltas (P0-1).
-    hrv_night_val: float | None = Field(default=None, description="Today's sleep-period RMSSD mean")
-    hrv_morning_val: float | None = Field(default=None, description="Today's post-wake morning RMSSD mean")
-    rest_heart_rate_val: float | None = Field(default=None, description="Today's sleep-derived resting HR")
-    non_sport_sleep_hr_val: float | None = Field(default=None, description="Today's non-exercise/non-sleep HR mean")
-    bed_time_val: float | None = Field(default=None, description="Tonight's bedtime in hours from midnight")
+    hrv_night_val: float | None = Field(
+        default=None, description="Today's sleep-period RMSSD mean"
+    )
+    hrv_morning_val: float | None = Field(
+        default=None, description="Today's post-wake morning RMSSD mean"
+    )
+    rest_heart_rate_val: float | None = Field(
+        default=None, description="Today's sleep-derived resting HR"
+    )
+    non_sport_sleep_hr_val: float | None = Field(
+        default=None, description="Today's non-exercise/non-sleep HR mean"
+    )
+    bed_time_val: float | None = Field(
+        default=None, description="Tonight's bedtime in hours from midnight"
+    )
     hr_max: float = Field(default=190.0, description="Dynamic maximum heart rate")
     spo2_night_avg: float | None = Field(
         default=None,
@@ -364,10 +378,12 @@ class DailySummary(SQLModel, table=True):
     tsb: float | None = Field(default=None, description="Training stress balance")
     # --- Autonomic state balance (recovery reference recovery_v06.py) ---
     sympathetic_pct: float | None = Field(
-        default=None, description="% of non-invalid night windows classified sympathetic"
+        default=None,
+        description="% of non-invalid night windows classified sympathetic",
     )
     parasympathetic_pct: float | None = Field(
-        default=None, description="% of non-invalid night windows classified parasympathetic"
+        default=None,
+        description="% of non-invalid night windows classified parasympathetic",
     )
     transition_pct: float | None = Field(
         default=None, description="% of non-invalid night windows classified transition"
@@ -426,27 +442,19 @@ class HourlyStatus(SQLModel, table=True):
     device_id: int = Field(foreign_key="device.id", index=True)
     device: Device = Relationship(back_populates="hourly_status")
 
-    hour_start: NaiveDatetime = Field(
-        index=True, description="Local hour bucket start"
-    )
+    hour_start: NaiveDatetime = Field(index=True, description="Local hour bucket start")
     morning_status: int = Field(
         description="Frozen morning status score (restart point)"
     )
-    current_status: int = Field(description="Score after this hour's dynamic adjustment")
+    current_status: int = Field(
+        description="Score after this hour's dynamic adjustment"
+    )
 
     # Time-in-zone counts in hours (formal §5). 0 for the temporary path.
-    t1: float = Field(
-        default=0.0, description="Hours HR below the RHR baseline"
-    )
-    t2: float = Field(
-        default=0.0, description="Hours HR above the RHR baseline"
-    )
-    t3: float = Field(
-        default=0.0, description="Hours HR below baseline - std"
-    )
-    t4: float = Field(
-        default=0.0, description="Hours HR above baseline + std"
-    )
+    t1: float = Field(default=0.0, description="Hours HR below the RHR baseline")
+    t2: float = Field(default=0.0, description="Hours HR above the RHR baseline")
+    t3: float = Field(default=0.0, description="Hours HR below baseline - std")
+    t4: float = Field(default=0.0, description="Hours HR above baseline + std")
 
     hr_5min_avg: float | None = Field(
         default=None, description="5-min avg non-exercise/non-sleep HR (temporary path)"
@@ -476,9 +484,51 @@ class QuestionnaireAnswer(SQLModel, table=True):
     device_id: int = Field(foreign_key="device.id", index=True)
     device: Device = Relationship(back_populates="questionnaire_answers")
 
-    user_type: str = Field(
-        description="User type value: beginner/serious/professional"
-    )
+    user_type: str = Field(description="User type value: beginner/serious/professional")
     question: str = Field(description="Submitted question text")
     selected: str = Field(description="Selected option value")
+    created_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
+
+
+class Conversation(SQLModel, table=True):
+    """§11 BOOM_COACH conversation — one device's chat thread.
+
+    ``id`` is the public conversation id the client uses (§11.1–§11.10);
+    ``device_id`` scopes the thread to a device (the coach is device-scoped,
+    so each device sees only its own history). ``title`` defaults to the
+    spec's "新对话" and is meant to be AI-renamed after the first exchange.
+    ``messages`` is the ordered list of turns in the thread.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    device_id: int = Field(foreign_key="device.id", index=True)
+    device: Device = Relationship(back_populates="coach_conversations")
+    title: str = Field(default="新对话", unique=True, description="对话标题")
+    created_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
+    updated_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
+    messages: list[Message] = Relationship(back_populates="conversation")
+
+
+class Message(SQLModel, table=True):
+    """§11 BOOM_COACH message — one user or AI turn within a conversation.
+
+    Linked to its conversation by ``conversation_id`` (the conversation's
+    public ``id`` that the client uses — §11.2/§11.6/§11.7 reference the
+    conversation by this id) as a foreign key to ``conversation.id`` via the
+    ``conversation`` relationship. ``role`` is ``user`` / ``ai``; ``type`` is
+    ``text`` / ``voice``; ``audio_url`` / ``transcript`` are the voice-message
+    fields (§11.9); ``feedback`` is the §11.11 like/dislike.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    conversation_id: int = Field(
+        foreign_key="conversation.id", index=True, description="Conversation id"
+    )
+    conversation: Conversation = Relationship(back_populates="messages")
+    role: str = Field(description="user / ai")
+    type: str = Field(default="text", description="text / voice")
+    content: str = Field(default="")
+    audio_url: str | None = Field(default=None, description="语音URL(仅语音消息)")
+    transcript: str | None = Field(default=None, description="语音转文本(仅语音消息)")
+    feedback: str | None = Field(default=None, description="like / dislike (§11.11)")
     created_at: NaiveDatetime = Field(default_factory=datetime.utcnow)

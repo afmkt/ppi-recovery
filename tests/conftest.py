@@ -16,9 +16,11 @@ from sqlalchemy import text  # noqa: E402
 from newboom.database import create_db_and_tables, engine  # noqa: E402
 from newboom.model import (  # noqa: E402
     AutonomicEpisode,
+    Conversation,
     DailySummary,
     Device,
     HourlyStatus,
+    Message,
     MinuteMetric,
     PPI,
     Progress,
@@ -44,6 +46,8 @@ _TABLES = [
     HourlyStatus,
     QuestionnaireAnswer,
     Progress,
+    Conversation,
+    Message,
 ]
 
 
