@@ -1,7 +1,6 @@
-from __future__ import annotations
-
 from datetime import date, datetime
 from enum import IntEnum, StrEnum
+from typing import Optional
 
 import numpy as np
 from sqlalchemy.orm import Mapped
@@ -30,23 +29,23 @@ class Device(SQLModel, table=True):
     age: int | None = Field(
         default=None, description="User age; HR_max = 220 - age when set"
     )
-    ppi: Mapped[list[PPI]] = Relationship(back_populates="device")
-    sleep: Mapped[list[Sleep]] = Relationship(back_populates="device")
-    window_metrics: Mapped[list[WindowMetric]] = Relationship(back_populates="device")
-    progress: Mapped[None | Progress] = Relationship(
+    ppi: Mapped[list["PPI"]] = Relationship(back_populates="device")
+    sleep: Mapped[list["Sleep"]] = Relationship(back_populates="device")
+    window_metrics: Mapped[list["WindowMetric"]] = Relationship(back_populates="device")
+    progress: Mapped[Optional["Progress"]] = Relationship(
         back_populates="device", sa_relationship_kwargs={"uselist": False}
     )
-    rmssd_segments: Mapped[list[RmssdSegment]] = Relationship(back_populates="device")
-    daily_summary: Mapped[list[DailySummary]] = Relationship(back_populates="device")
-    minute_metrics: Mapped[list[MinuteMetric]] = Relationship(back_populates="device")
-    hourly_status: Mapped[list[HourlyStatus]] = Relationship(back_populates="device")
-    autonomic_episodes: Mapped[list[AutonomicEpisode]] = Relationship(
+    rmssd_segments: Mapped[list["RmssdSegment"]] = Relationship(back_populates="device")
+    daily_summary: Mapped[list["DailySummary"]] = Relationship(back_populates="device")
+    minute_metrics: Mapped[list["MinuteMetric"]] = Relationship(back_populates="device")
+    hourly_status: Mapped[list["HourlyStatus"]] = Relationship(back_populates="device")
+    autonomic_episodes: Mapped[list["AutonomicEpisode"]] = Relationship(
         back_populates="device",
     )
-    questionnaire_answers: Mapped[list[QuestionnaireAnswer]] = Relationship(
+    questionnaire_answers: Mapped[list["QuestionnaireAnswer"]] = Relationship(
         back_populates="device"
     )
-    coach_conversations: Mapped[list[Conversation]] = Relationship(
+    coach_conversations: Mapped[list["Conversation"]] = Relationship(
         back_populates="device"
     )
 
@@ -509,7 +508,7 @@ class Conversation(SQLModel, table=True):
     title: str = Field(default="新对话", unique=True, description="对话标题")
     created_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
     updated_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
-    messages: Mapped[list[Message]] = Relationship(back_populates="conversation")
+    messages: Mapped[list["Message"]] = Relationship(back_populates="conversation")
 
 
 class Message(SQLModel, table=True):
