@@ -33,14 +33,8 @@ RUN uv sync --frozen --no-dev
 # DB and uploads live under /app/data (a volume). Absolute env defaults make the
 # image behave the same regardless of how the caller mounts it. load_dotenv() in
 # the app is a no-op in the image (no .env is copied), so these win.
-#
-# The app user has no home directory (--no-create-home), but `uv run` still
-# writes a cache to $HOME/.cache/uv. Point HOME and UV_CACHE_DIR at /app — which
-# is app-owned and writable — so the non-root runtime has somewhere to write.
 ENV DATABASE_URL=sqlite:////app/data/newboom.db \
-    UPLOAD_DIR=/app/data/uploads \
-    HOME=/app \
-    UV_CACHE_DIR=/app/.cache/uv
+    UPLOAD_DIR=/app/data/uploads
 
 # Non-root: the venv + sources stay root-owned but read-only at runtime; only
 # /app/data is writable and is chowned to the app user so the first (empty)
@@ -62,6 +56,8 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 
 USER app
 
-# Matches the compose.yml run recipe (uv run uvicorn newboom.api:app …). --frozen
-# stops uv from re-resolving the lock at startup.
-CMD ["uv", "run", "--frozen", "uvicorn", "newboom.api:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run the pre-built venv's uvicorn directly. The environment is fully built at
+# image time (uv sync --frozen --no-dev), so invoking the binary skips uv's
+# runtime sync — no building / downloading / uninstalling when the container
+# starts. (This is what `uv run` would otherwise re-do on every start.)
+CMD ["/app/.venv/bin/uvicorn", "newboom.api:app", "--host", "0.0.0.0", "--port", "8000"]

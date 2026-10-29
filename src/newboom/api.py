@@ -44,15 +44,8 @@ app.add_middleware(
 )
 
 
-# Dependency for database sessions
-
-
-@app.on_event("startup")
-def on_startup():
-    from newboom.database import create_db_and_tables
-
-    create_db_and_tables()
-
+# Database schema creation moved to worker.lifespan (a custom lifespan=
+# replaces Starlette's default startup, so @app.on_event handlers never ran).
 
 app.include_router(upload_router, prefix="/api/upload", tags=["Upload"])
 app.include_router(boom_router)

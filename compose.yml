@@ -1,22 +1,21 @@
 services:
-  boom_api:
-    image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+  newboom:
+    image: crpi-zuhwpd6fwca3b0fc.cn-shanghai.personal.cr.aliyuncs.com/afmkt/ppi-recovery:latest
     container_name: newboom
     restart: unless-stopped
     env_file:
       - ./.env
 
-    command: "uv run uvicorn newboom.api:app --host 0.0.0.0 --port 8000"
-    volumes:
-      - ./:/app
-    working_dir: /app
-
     ports:
       - "8000:8000"
 
-    depends_on:
-      postgres:
-        condition: service_healthy
+    # The image's WORKDIR is /app and its CMD launches the server
+    # (uv run --frozen uvicorn newboom.api:app --host 0.0.0.0 --port 8000),
+    # so no command / working_dir override is needed.
+    # DB + uploads persist in a named volume at /app/data (the image's
+    # declared VOLUME, pre-owned by the non-root app user).
+    volumes:
+      - ./data:/app/data
 
     deploy:
       resources:
