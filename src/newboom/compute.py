@@ -795,6 +795,12 @@ def process_autonomic_episodes(device_id: int) -> int:
             ).all()
             for e in existing:
                 session.delete(e)
+            # Flush the deletes before adding the replacements: the new
+            # episodes share the (device_id, night_date, episode_id) natural
+            # key with the ones just deleted, and SQLAlchemy would otherwise
+            # emit the INSERT before the pending DELETE, hitting the unique
+            # constraint.
+            session.flush()
 
             for ep in episodes:
                 ep.device_id = device_id
