@@ -4,30 +4,22 @@
 The legacy data on prod (``/root/boom/boom_api/repo``) is stored as one JSON file
 per device capture. Each file's bytes are *exactly* a newboom upload request body:
 
-    ppi   -> {"device","address","timezone","datas":[{time,hr,spo2,ppi}]}
+    ppi   -> {"device","address","timezone","datas":[{time,hr,spo2,ppi,activity}]}
     sleep -> {"device","address","timezone","datas":[{time,sleepOnsetTime,
               awakeTime,lightSleepPeriod,deepSleepPeriod,otherSleepPeriod,
               heartRateRest}]}
 
-Pushing is therefore a *normalizing replay*: read the file, reshape it to the
-current request contract, and POST it to ``{target}{api_prefix}/{ppi|sleep}``.
-
-Two legacy-shape gaps must be bridged (both are flags, defaulted for this data):
-
-  * ``activity`` -- new ``PPIUploadRequest`` requires an ``activity`` int per row
-    (``ActivityState``, 0..7); it drives sleep-window detection in the compute
-    pipeline. Legacy ppi rows carry none, so a default is injected (``--activity-
-    default``; 3=RELAXED = "awake" so windows are not all treated as sleep).
-  * ``spo2`` -- the source transitions from legacy percent (0-100, e.g. 93 ==
-    93.0%%) to the new device-raw *x10* units (e.g. 862 == 86.2%%). A single
-    global scale can't fit both, so ``--spo2-scale auto`` (default) detects the
-    unit per file from its max spo2 (>150 -> already *x10, pass through; else
-    percent -> multiply by 10). 0 ("not reported") is unaffected.
+The source files are the source of truth: pull is a faithful copy
+(server -> local) and push is a faithful replay (local -> server). We never
+rewrite a file between the two -- a capture that reaches the staging dir is the
+capture that is POSTed, byte for byte. The data is produced in its final shape
+by the upstream system; any old-shape -> new-shape bridging is the server's
+responsibility, not this tool's.
 
 Subcommands:
 
   pull      rsync the prod repo -> a local staging dir (filtered, resumable)
-  push      normalize + POST a local staging dir -> a newboom REST target
+  push      POST a local staging dir verbatim -> a newboom REST target
             (filtered, resumable; the local->server inverse of ``pull``)
 
 Stdlib only; no new dependencies.
@@ -65,8 +57,6 @@ DEFAULTS = {
     "staging": _env("NEWBOOM_SYNC_STAGING", "staging"),
     "target": _env("NEWBOOM_SYNC_TARGET", "http://localhost:8000"),
     "api_prefix": _env("NEWBOOM_SYNC_API_PREFIX", "/api/upload"),
-    "activity_default": int(_env("NEWBOOM_SYNC_ACTIVITY_DEFAULT", "3")),
-    "spo2_scale": _env("NEWBOOM_SYNC_SPO2_SCALE", "auto"),
     "concurrency": int(_env("NEWBOOM_SYNC_CONCURRENCY", "4")),
     "retry": int(_env("NEWBOOM_SYNC_RETRY", "3")),
     "http_timeout": int(_env("NEWBOOM_SYNC_HTTP_TIMEOUT", "30")),
@@ -92,68 +82,12 @@ def log(msg: str, *, quiet: bool = False) -> None:
 
 
 def classify(name: str) -> str:
-    """Classify a repo filename. ``bare`` = the legacy extensionless captures."""
+    """Classify a repo filename by its capture extension."""
     if name.endswith(".ppi"):
         return "ppi"
     if name.endswith(".sleep"):
         return "sleep"
-    # Legacy captures without an extension are a bare sha256 hash.
-    if (
-        "." not in name
-        and len(name) >= 16
-        and all(c in "0123456789abcdef" for c in name)
-    ):
-        return "bare"
     return "unknown"
-
-
-def load_body(path: Path) -> dict:
-    with open(path, "rb") as f:
-        raw = f.read()
-    return json.loads(raw.decode("utf-8"))
-
-
-def _spo2_scale_for(body: dict, mode: float | str) -> float:
-    """Resolve the spo2 multiplier for one file.
-
-    ``mode`` is ``"auto"`` or a float. The source transitions from legacy
-    percent spo2 (0-100, e.g. 93 == 93.0%%) to the new device-raw *x10* units
-    (e.g. 862 == 86.2%%). A single global scale can't fit both, so ``auto``
-    inspects the file's own max spo2: >150 means it is already *x10 (pass
-    through); otherwise it is percent, so multiply by 10. 0 (not reported)
-    stays 0 under any scale.
-    """
-    if mode == "auto":
-        mx = max((int(r.get("spo2") or 0) for r in body.get("datas", [])), default=0)
-        return 1.0 if mx > 150 else 10.0
-    return float(mode)
-
-
-def normalize_ppi(
-    body: dict, activity_default: int, spo2_mode: float | str, stats: dict
-) -> dict:
-    """Inject a missing ``activity`` and rescale legacy percent spo2.
-
-    Mutates in place. ``activity`` is injected only where absent so any row that
-    already carries it is preserved. The spo2 scale is resolved per file
-    (``spo2_mode`` ``"auto"`` picks percent-vs-x10 by magnitude).
-    """
-    scale = _spo2_scale_for(body, spo2_mode)
-    if scale != 1.0:
-        stats["spo2_scale"] = scale
-    for row in body.get("datas", []):
-        if "activity" not in row:
-            row["activity"] = activity_default
-            stats["activity_injected"] += 1
-        if scale != 1.0 and "spo2" in row and row["spo2"]:
-            row["spo2"] = round(row["spo2"] * scale)
-            stats["spo2_rescaled"] += 1
-    return body
-
-
-def normalize_sleep(body: dict) -> dict:
-    """Sleep rows already match the contract; return unchanged."""
-    return body
 
 
 # --------------------------------------------------------------------------- #
@@ -188,15 +122,15 @@ class HttpTarget:
             self._local.c = c
         return c
 
-    def post(self, dtype: str, body: dict) -> tuple[int, dict]:
-        """POST a request body; return (status, parsed_json). Resets the
-        connection on transport failure so the next call reconnects."""
+    def post(self, dtype: str, body: bytes) -> tuple[int, dict]:
+        """POST the file's raw bytes verbatim; return (status, parsed_json).
+        Resets the connection on transport failure so the next call reconnects."""
         conn = self._conn()
         try:
             conn.request(
                 "POST",
                 f"{self.prefix}/{dtype}",
-                json.dumps(body),
+                body,
                 {"Content-Type": "application/json"},
             )
             resp = conn.getresponse()
@@ -238,26 +172,33 @@ class StateLog:
                         rec = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if rec.get("status") == "ok":
+                    status = rec.get("status")
+                    if status in ("ok", "skipped"):
                         self.done.add(rec["sha256"])
-                    else:
+                    elif status == "error":
                         self.errors[rec["sha256"]] = rec.get("error", "?")
 
     def record(
-        self, sha256: str, status: str, processed: int = 0, error: str = ""
+        self,
+        sha256: str,
+        status: str,
+        processed: int = 0,
+        error: str = "",
+        name: str = "",
     ) -> None:
         rec = {
             "sha256": sha256,
             "status": status,
             "processed": processed,
             "error": error,
+            "name": name,
             "ts": time.time(),
         }
         line = json.dumps(rec) + "\n"
         with _lock:
             with open(self.path, "a") as f:
                 f.write(line)
-            if status == "ok":
+            if status in ("ok", "skipped"):
                 self.done.add(sha256)
             elif status == "error":
                 self.errors[sha256] = error
@@ -279,8 +220,34 @@ def sha256_file(path: Path) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def _describe_error(parsed: dict) -> str:
+    """Human-readable reason from an error body.
+
+    FastAPI/validation errors arrive as ``{"detail": [{loc,msg,type}, ...]}``;
+    newboom's own endpoints use ``message``/``raw``.  Without this a 422 logs as
+    a blank ``HTTP 422:`` and the cause is lost.
+    """
+    detail = parsed.get("detail")
+    if detail:
+        items = detail if isinstance(detail, list) else [detail]
+        parts: list[str] = []
+        for item in items:
+            if isinstance(item, dict):
+                loc = ".".join(
+                    str(x)
+                    for x in item.get("loc", [])
+                    if x not in ("body", "query", "path")
+                )
+                msg = item.get("msg", "")
+                parts.append(f"{loc}: {msg}" if loc else str(msg))
+            else:
+                parts.append(str(item))
+        return "; ".join(parts)
+    return str(parsed.get("message") or parsed.get("raw") or "")
+
+
 def _post_one(
-    path: Path, target: HttpTarget, dtype: str, body: dict, retries: int
+    path: Path, target: HttpTarget, dtype: str, body: bytes, retries: int
 ) -> tuple[bool, int, str]:
     """POST a single file with backoff on transient/5xx failures.
 
@@ -296,16 +263,10 @@ def _post_one(
             if status == 200 and parsed.get("ok"):
                 return True, int(parsed.get("processed") or 0), ""
             if 500 <= status < 600:
-                last_err = (
-                    f"HTTP {status}: {parsed.get('message') or parsed.get('raw', '')}"
-                )
+                last_err = f"HTTP {status}: {_describe_error(parsed)}"
             else:
                 # 4xx: bad body, not transient.
-                return (
-                    False,
-                    0,
-                    f"HTTP {status}: {parsed.get('message') or parsed.get('raw', '')}",
-                )
+                return False, 0, f"HTTP {status}: {_describe_error(parsed)}"
         if attempt < retries:
             time.sleep(min(2**attempt, 8))
     return False, 0, last_err or "unknown"
@@ -313,12 +274,12 @@ def _post_one(
 
 def cmd_push(args: argparse.Namespace) -> int:
     """Filter a local staging dir (the same filters as ``pull``) and POST the
-    survivors, normalized, to a newboom REST target (``--target``).
+    survivors verbatim to a newboom REST target (``--target``).
 
     ``pull`` is server -> local (rsync); ``push`` is local -> server (REST),
     independent of where the server lives. The source is a local directory
     shared with ``pull`` via ``--staging``, so this uploads whatever ``pull``
-    left behind.
+    left behind, byte for byte -- no field is injected or rescaled.
     """
     src = Path(args.staging)
     if not src.is_dir():
@@ -329,7 +290,7 @@ def cmd_push(args: argparse.Namespace) -> int:
     state = StateLog(Path(args.state) if args.state else src / ".import-state.jsonl")
 
     # Local filters mirror cmd_pull's server-side find, applied to the dir:
-    #   --type        ppi / sleep / all (extension + bare gating)
+    #   --type        ppi / sleep / all (by extension)
     #   --mac         MAC prefix (filename starts with "<mac>.")
     #   --capture     exact capture date (filename's 2nd dot-segment)
     #   --since       mtime on/after a date (disk write time, not capture time)
@@ -338,7 +299,9 @@ def cmd_push(args: argparse.Namespace) -> int:
     include_all = types == ["all"]
     since_d = date.fromisoformat(args.since) if args.since else None
     since_ts = (
-        datetime(since_d.year, since_d.month, since_d.day).timestamp() if since_d else None
+        datetime(since_d.year, since_d.month, since_d.day).timestamp()
+        if since_d
+        else None
     )
     capture = None
     if args.capture:
@@ -361,21 +324,13 @@ def cmd_push(args: argparse.Namespace) -> int:
 
     # Pre-filter by type/mac/capture/since, then skip already-done.
     pending: list[Path] = []
-    skipped_bare = skipped_unknown = skipped_filter = skipped_done = 0
+    skipped_unknown = skipped_filter = skipped_done = 0
     for p in files:
         kind = classify(p.name)
         if kind == "unknown":
             skipped_unknown += 1
             continue
-        if kind == "bare":
-            if args.bare_files == "error":
-                log(f"ERROR: bare file not allowed: {p.name}", quiet=args.quiet)
-                return 1
-            if args.bare_files == "skip":
-                skipped_bare += 1
-                continue
-            kind = "ppi"  # fill: treat bare as ppi
-        elif not include_all and kind not in types:
+        if not include_all and kind not in types:
             skipped_filter += 1
             continue
         if mac and not p.name.startswith(mac + "."):
@@ -395,14 +350,13 @@ def cmd_push(args: argparse.Namespace) -> int:
             continue
         pending.append(p)
 
-    # --limit: most-recent N by embedded capture time (mirrors cmd_pull). Only
-    # the non-all case; bare is excluded then, so no named/bare split is needed.
+    # --limit: most-recent N by embedded capture time (mirrors cmd_pull).
     if args.limit and args.limit > 0 and not include_all:
         pending.sort(key=lambda p: _file_ts(p.name) or datetime.min, reverse=True)
         pending = pending[: args.limit]
 
     log(
-        f"to push: {len(pending)}  (skip bare={skipped_bare}, unknown={skipped_unknown}, "
+        f"to push: {len(pending)}  (skip unknown={skipped_unknown}, "
         f"filtered={skipped_filter}, already-done={skipped_done})",
         quiet=args.quiet,
     )
@@ -410,60 +364,68 @@ def cmd_push(args: argparse.Namespace) -> int:
         log(f"DRY-RUN: no POSTs. {len(pending)} files would be sent.", quiet=args.quiet)
         return 0
 
-    ok = err = 0
+    ok = err = skipped = 0
     err_lock = threading.Lock()
-    scale_tally: dict[float, int] = {}
 
     def work(p: Path) -> None:
-        nonlocal ok, err
-        kind = (
-            "ppi"
-            if p.name.endswith(".ppi")
-            or (args.bare_files == "fill" and classify(p.name) == "bare")
-            else "sleep"
-        )
+        nonlocal ok, err, skipped
+        dtype = "ppi" if p.name.endswith(".ppi") else "sleep"
         try:
-            body = load_body(p)
-        except Exception as e:  # noqa: BLE001
+            raw = p.read_bytes()
+        except OSError as e:
             with err_lock:
-                err += 1
-            state.record(sha256_file(p), "error", 0, f"parse: {e}")
+                skipped += 1
+            log(f"  SKIP {p.name}: read: {e}", quiet=args.quiet)
+            state.record(sha256_file(p), "skipped", 0, f"read: {e}", p.name)
             return
-        stats = {"activity_injected": 0, "spo2_rescaled": 0}
-        if kind == "ppi":
-            normalize_ppi(body, args.activity_default, args.spo2_scale, stats)
+        # Refuse to POST undecodable bytes: a truncated/empty capture can never
+        # import, so skip it rather than 422-storm the server.
+        try:
+            json.loads(raw)
+        except (ValueError, UnicodeDecodeError) as e:
             with err_lock:
-                scale_tally.setdefault(stats.get("spo2_scale", 1.0), 0)
-                scale_tally[stats.get("spo2_scale", 1.0)] += 1
-        ok_flag, processed, errmsg = _post_one(p, target, kind, body, args.retry)
+                skipped += 1
+            log(f"  SKIP {p.name}: parse: {e}", quiet=args.quiet)
+            state.record(sha256_file(p), "skipped", 0, f"parse: {e}", p.name)
+            return
+        ok_flag, processed, errmsg = _post_one(p, target, dtype, raw, args.retry)
         if ok_flag:
             with err_lock:
                 ok += 1
-            state.record(sha256_file(p), "ok", processed)
+            state.record(sha256_file(p), "ok", processed, "", p.name)
             if ok % 100 == 0:
                 log(f"pushed {ok} ok / {err} err", quiet=args.quiet)
         else:
             with err_lock:
                 err += 1
-            state.record(sha256_file(p), "error", 0, errmsg)
+            log(f"  FAIL {p.name}: {errmsg}", quiet=args.quiet)
+            state.record(sha256_file(p), "error", 0, errmsg, p.name)
 
     with cf.ThreadPoolExecutor(max_workers=args.concurrency) as ex:
         list(ex.map(work, pending))
 
     log(
-        f"DONE: ok={ok} err={err} skip_bare={skipped_bare} "
+        f"DONE: ok={ok} err={err} skipped={skipped} "
         f"skip_unknown={skipped_unknown} skip_filtered={skipped_filter} "
         f"skip_done={skipped_done}",
         quiet=args.quiet,
     )
-    if scale_tally:
+    if err:
+        # Reconcile against done: a file that failed earlier but imported on a
+        # later attempt is not failing now, so drop shas that are in done.
+        counts: dict[str, int] = {}
+        for sha, msg in state.errors.items():
+            if sha in state.done:
+                continue
+            counts[msg] = counts.get(msg, 0) + 1
+        total_live = sum(counts.values())
         log(
-            f"spo2 scale applied: "
-            + ", ".join(f"{s:g}x={n}" for s, n in sorted(scale_tally.items())),
+            f"{err} file(s) failed this run; {total_live} still failing "
+            f"(of {len(state.errors)} recorded; see {state.path})",
             quiet=args.quiet,
         )
-    if err:
-        log(f"{err} file(s) failed; see state log {state.path}", quiet=args.quiet)
+        for msg, n in sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:10]:
+            log(f"  {n:6d}  {msg}", quiet=args.quiet)
     return 1 if err else 0
 
 
@@ -474,7 +436,7 @@ def cmd_push(args: argparse.Namespace) -> int:
 
 def _file_ts(name: str) -> datetime | None:
     """Parse the capture timestamp embedded in a named file:
-    ``{MAC}.{YYYYMMDD-HHMMSS}.{hash}.{ext}``. Bare files have no timestamp."""
+    ``{MAC}.{YYYYMMDD-HHMMSS}.{hash}.{ext}``. An unparseable name yields None."""
     parts = name.split(".")
     if len(parts) < 2:
         return None
@@ -554,9 +516,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
 
     # build_find_cmd's 5th positional is the find -type value ("f"); pass it
     # explicitly so MAC / capture / since / exts land in the filter slots.
-    list_cmd = build_find_cmd(
-        args.repo, args.mac or None, capture, since_d, "f", *exts
-    )
+    list_cmd = build_find_cmd(args.repo, args.mac or None, capture, since_d, "f", *exts)
     log(f'listing: ssh {args.ssh} "{list_cmd}"', quiet=args.quiet)
     res = subprocess.run(
         ["ssh", args.ssh, list_cmd], capture_output=True, text=True, check=False
@@ -569,26 +529,20 @@ def cmd_pull(args: argparse.Namespace) -> int:
         f"server returned {len(all_names)} file(s); filtering locally", quiet=args.quiet
     )
 
-    candidates: list[tuple[str, str]] = []
+    candidates: list[str] = []
     for n in all_names:
         kind = classify(n)
         if kind == "unknown":
             continue
-        if include_all:
-            if kind == "bare" and args.bare_files == "error":
-                log(f"ERROR: bare file not allowed: {n}", quiet=args.quiet)
-                return 1
-        elif kind not in types:
+        if not include_all and kind not in types:
             continue
-        candidates.append((n, kind))
+        candidates.append(n)
 
     if args.limit and args.limit > 0 and not include_all:
-        named = [c for c in candidates if c[1] != "bare"]
-        bare = [c for c in candidates if c[1] == "bare"]
-        named.sort(key=lambda c: _file_ts(c[0]) or datetime.min, reverse=True)
-        candidates = named[: args.limit] + bare
+        candidates.sort(key=lambda n: _file_ts(n) or datetime.min, reverse=True)
+        candidates = candidates[: args.limit]
 
-    names = [c[0] for c in candidates]
+    names = candidates
     list_path.write_text("\n".join(names) + ("\n" if names else ""))
     log(f"matched {len(names)} file(s) -> {list_path}", quiet=args.quiet)
     if not names:
@@ -633,11 +587,9 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument(
         "--type",
         default="ppi,sleep",
-        help="comma list: ppi / sleep / all (default excludes bare)",
+        help="comma list: ppi / sleep / all",
     )
-    q.add_argument(
-        "--mac", default="", help="MAC filter, e.g. D6:02:32:72:6A:81"
-    )
+    q.add_argument("--mac", default="", help="MAC filter, e.g. D6:02:32:72:6A:81")
     q.add_argument(
         "--capture",
         default="",
@@ -649,19 +601,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="only files whose mtime is after YYYY-MM-DD (disk write time, not capture time)",
     )
     q.add_argument("--limit", type=int, default=0, help="most-recent N files only")
-    q.add_argument(
-        "--bare-files",
-        dest="bare_files",
-        choices=["skip", "fill", "error"],
-        default="skip",
-        help="only with --type all: skip / fill-as-ppi / error on bare",
-    )
     q.add_argument("--dry-run", action="store_true")
     q.set_defaults(func=cmd_pull)
 
     # push (local -> REST target; reuses pull's filters + the POST pipeline)
     u = sub.add_parser(
-        "push", help="normalize + POST a local staging dir -> a newboom REST target"
+        "push", help="POST a local staging dir verbatim -> a newboom REST target"
     )
     u.add_argument(
         "--staging",
@@ -677,7 +622,7 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument(
         "--type",
         default="ppi,sleep",
-        help="comma list: ppi / sleep / all (default excludes bare)",
+        help="comma list: ppi / sleep / all",
     )
     u.add_argument("--mac", default="", help="MAC filter, e.g. D6:02:32:72:6A:81")
     u.add_argument(
@@ -691,25 +636,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="only files whose mtime is after YYYY-MM-DD (disk write time, not capture time)",
     )
     u.add_argument("--limit", type=int, default=0, help="most-recent N files only")
-    u.add_argument(
-        "--bare-files",
-        dest="bare_files",
-        choices=["skip", "fill", "error"],
-        default="skip",
-        help="skip / fill-as-ppi / error on bare (hash-only, no extension)",
-    )
-    u.add_argument(
-        "--activity-default",
-        dest="activity_default",
-        type=int,
-        default=DEFAULTS["activity_default"],
-    )
-    u.add_argument(
-        "--spo2-scale",
-        dest="spo2_scale",
-        default="auto",
-        help="spo2 units: auto (detect per file) | 1 (pass-through) | 10",
-    )
     u.add_argument("--concurrency", type=int, default=DEFAULTS["concurrency"])
     u.add_argument("--retry", type=int, default=DEFAULTS["retry"])
     u.add_argument(
@@ -719,7 +645,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULTS["http_timeout"],
     )
     u.add_argument(
-        "--state", default="", help="state-log path (default: <staging>/.import-state.jsonl)"
+        "--state",
+        default="",
+        help="state-log path (default: <staging>/.import-state.jsonl)",
     )
     u.add_argument("--dry-run", action="store_true")
     u.set_defaults(func=cmd_push)
