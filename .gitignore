@@ -49,7 +49,7 @@ staging/
 .pull-filelist.txt
 
 # --- File Storage / Audit Logs ---
-storage/
+staging/
 
 # --- IDE & Editor Specific ---
 .vscode/

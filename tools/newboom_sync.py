@@ -456,7 +456,9 @@ def cmd_pull(args: argparse.Namespace) -> int:
 
     list_cmd = f"cd {args.repo} && find . -maxdepth 1 -type f -printf '%P\\n'"
     log(f'listing: ssh {args.ssh} "{list_cmd}"', quiet=args.quiet)
-    res = subprocess.run(["ssh", args.ssh, list_cmd], capture_output=True, text=True)
+    res = subprocess.run(
+        ["ssh", args.ssh, list_cmd], capture_output=True, text=True, check=False
+    )
     if res.returncode != 0:
         log(f"listing failed: {res.stderr.strip()[:500]}", quiet=args.quiet)
         return 1
