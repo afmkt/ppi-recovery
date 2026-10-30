@@ -50,6 +50,7 @@ staging/
 
 # --- File Storage / Audit Logs ---
 staging/
+uploads/
 
 # --- IDE & Editor Specific ---
 .vscode/

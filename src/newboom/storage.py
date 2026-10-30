@@ -23,7 +23,7 @@ def save_data_to_file(data: dict, data_type: str, device: str) -> str:
     data_hash = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
     filename = (
         STORAGE_PATH
-        / f"{device}-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}-{data_hash}.{data_type}.json"
+        / f"{device}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{data_hash}.{data_type}.json"
     )
 
     # Save the data to the file
@@ -81,7 +81,7 @@ def save_audio(device: str, filename: str, data: bytes) -> str:
     digest = hashlib.sha256(data).hexdigest()[:12]
     path = (
         STORAGE_PATH
-        / f"{device}-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}-{digest}-{filename}"
+        / f"{device}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{digest}-{filename}"
     )
     path.write_bytes(data)
     return str(path)

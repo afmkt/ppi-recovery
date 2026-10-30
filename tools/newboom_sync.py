@@ -9,7 +9,7 @@ per device capture. Each file's bytes are *exactly* a newboom upload request bod
               awakeTime,lightSleepPeriod,deepSleepPeriod,otherSleepPeriod,
               heartRateRest}]}
 
-Reimporting is therefore a *normalizing replay*: read the file, reshape it to the
+Pushing is therefore a *normalizing replay*: read the file, reshape it to the
 current request contract, and POST it to ``{target}{api_prefix}/{ppi|sleep}``.
 
 Two legacy-shape gaps must be bridged (both are flags, defaulted for this data):
@@ -27,9 +27,8 @@ Two legacy-shape gaps must be bridged (both are flags, defaulted for this data):
 Subcommands:
 
   pull      rsync the prod repo -> a local staging dir (filtered, resumable)
-  import    normalize + POST a staging dir -> a newboom REST target
-  reimport  run ``import`` *on prod* against the new instance (deploy path)
-  verify    reconcile source vs imported (state log) + spot-check the target
+  push      normalize + POST a local staging dir -> a newboom REST target
+            (filtered, resumable; the local->server inverse of ``pull``)
 
 Stdlib only; no new dependencies.
 """
@@ -64,7 +63,7 @@ DEFAULTS = {
     "ssh": _env("NEWBOOM_SYNC_SSH", "root@47.100.30.18"),
     "repo": _env("NEWBOOM_SYNC_REPO", "/root/boom/boom_api/repo"),
     "staging": _env("NEWBOOM_SYNC_STAGING", "staging"),
-    "target": _env("NEWBOOM_SYNC_TARGET", "http://127.0.0.1:8000"),
+    "target": _env("NEWBOOM_SYNC_TARGET", "http://localhost:8000"),
     "api_prefix": _env("NEWBOOM_SYNC_API_PREFIX", "/api/upload"),
     "activity_default": int(_env("NEWBOOM_SYNC_ACTIVITY_DEFAULT", "3")),
     "spo2_scale": _env("NEWBOOM_SYNC_SPO2_SCALE", "auto"),
@@ -211,19 +210,6 @@ class HttpTarget:
             parsed = {"ok": False, "raw": data[:300]}
         return resp.status, parsed
 
-    def health(self) -> tuple[bool, str]:
-        """Reachable + the upload route exists. Tolerates the app's 500-on-bad-
-        schema by treating any HTTP response as "up"."""
-        try:
-            conn = self._conn()
-            conn.request("GET", f"{self.prefix}/ppi?limit=1")
-            resp = conn.getresponse()
-            resp.read()
-            return True, f"HTTP {resp.status}"
-        except Exception as e:  # noqa: BLE001
-            self._local.c = None
-            return False, str(e)
-
 
 # --------------------------------------------------------------------------- #
 # State log (resume / idempotency)
@@ -289,7 +275,7 @@ def sha256_file(path: Path) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# import
+# push
 # --------------------------------------------------------------------------- #
 
 
@@ -325,45 +311,99 @@ def _post_one(
     return False, 0, last_err or "unknown"
 
 
-def cmd_import(args: argparse.Namespace) -> int:
-    in_dir = Path(args.in_dir)
-    if not in_dir.is_dir():
-        log(f"--in dir not found: {in_dir}", quiet=args.quiet)
+def cmd_push(args: argparse.Namespace) -> int:
+    """Filter a local staging dir (the same filters as ``pull``) and POST the
+    survivors, normalized, to a newboom REST target (``--target``).
+
+    ``pull`` is server -> local (rsync); ``push`` is local -> server (REST),
+    independent of where the server lives. The source is a local directory
+    shared with ``pull`` via ``--staging``, so this uploads whatever ``pull``
+    left behind.
+    """
+    src = Path(args.staging)
+    if not src.is_dir():
+        log(f"--staging not found: {src}", quiet=args.quiet)
         return 2
 
     target = HttpTarget(args.target, args.api_prefix, args.http_timeout)
-    state = StateLog(Path(args.state) if args.state else in_dir / ".import-state.jsonl")
+    state = StateLog(Path(args.state) if args.state else src / ".import-state.jsonl")
+
+    # Local filters mirror cmd_pull's server-side find, applied to the dir:
+    #   --type        ppi / sleep / all (extension + bare gating)
+    #   --mac         MAC prefix (filename starts with "<mac>.")
+    #   --capture     exact capture date (filename's 2nd dot-segment)
+    #   --since       mtime on/after a date (disk write time, not capture time)
+    #   --limit       most-recent N by the embedded capture timestamp
+    types = [t.strip() for t in args.type.split(",")] if args.type else ["ppi", "sleep"]
+    include_all = types == ["all"]
+    since_d = date.fromisoformat(args.since) if args.since else None
+    since_ts = (
+        datetime(since_d.year, since_d.month, since_d.day).timestamp() if since_d else None
+    )
+    capture = None
+    if args.capture:
+        cap = args.capture.replace("-", "")
+        try:
+            datetime.strptime(cap, "%Y%m%d")
+        except ValueError:
+            log(
+                f"ERROR: --capture must be a date (got {args.capture!r})",
+                quiet=args.quiet,
+            )
+            return 1
+        capture = cap
+    mac = args.mac or None
 
     files = sorted(
-        p for p in in_dir.rglob("*") if p.is_file() and not p.name.startswith(".")
+        p for p in src.rglob("*") if p.is_file() and not p.name.startswith(".")
     )
-    log(f"found {len(files)} files in {in_dir}", quiet=args.quiet)
+    log(f"found {len(files)} files in {src}", quiet=args.quiet)
 
-    # Pre-filter by classification + skip already-done.
+    # Pre-filter by type/mac/capture/since, then skip already-done.
     pending: list[Path] = []
-    skipped_bare = skipped_unknown = skipped_done = 0
+    skipped_bare = skipped_unknown = skipped_filter = skipped_done = 0
     for p in files:
         kind = classify(p.name)
         if kind == "unknown":
             skipped_unknown += 1
             continue
         if kind == "bare":
-            if args.bare_files == "skip":
-                skipped_bare += 1
-                continue
             if args.bare_files == "error":
                 log(f"ERROR: bare file not allowed: {p.name}", quiet=args.quiet)
                 return 1
+            if args.bare_files == "skip":
+                skipped_bare += 1
+                continue
             kind = "ppi"  # fill: treat bare as ppi
+        elif not include_all and kind not in types:
+            skipped_filter += 1
+            continue
+        if mac and not p.name.startswith(mac + "."):
+            skipped_filter += 1
+            continue
+        if capture:
+            parts = p.name.split(".")
+            if len(parts) < 2 or not parts[1].startswith(capture):
+                skipped_filter += 1
+                continue
+        if since_ts is not None and p.stat().st_mtime < since_ts:
+            skipped_filter += 1
+            continue
         sha = sha256_file(p)
         if sha in state.done:
             skipped_done += 1
             continue
         pending.append(p)
 
+    # --limit: most-recent N by embedded capture time (mirrors cmd_pull). Only
+    # the non-all case; bare is excluded then, so no named/bare split is needed.
+    if args.limit and args.limit > 0 and not include_all:
+        pending.sort(key=lambda p: _file_ts(p.name) or datetime.min, reverse=True)
+        pending = pending[: args.limit]
+
     log(
-        f"to import: {len(pending)}  (skip bare={skipped_bare}, unknown={skipped_unknown}, "
-        f"already-done={skipped_done})",
+        f"to push: {len(pending)}  (skip bare={skipped_bare}, unknown={skipped_unknown}, "
+        f"filtered={skipped_filter}, already-done={skipped_done})",
         quiet=args.quiet,
     )
     if args.dry_run:
@@ -401,7 +441,7 @@ def cmd_import(args: argparse.Namespace) -> int:
                 ok += 1
             state.record(sha256_file(p), "ok", processed)
             if ok % 100 == 0:
-                log(f"imported {ok} ok / {err} err", quiet=args.quiet)
+                log(f"pushed {ok} ok / {err} err", quiet=args.quiet)
         else:
             with err_lock:
                 err += 1
@@ -412,7 +452,8 @@ def cmd_import(args: argparse.Namespace) -> int:
 
     log(
         f"DONE: ok={ok} err={err} skip_bare={skipped_bare} "
-        f"skip_unknown={skipped_unknown} skip_done={skipped_done}",
+        f"skip_unknown={skipped_unknown} skip_filtered={skipped_filter} "
+        f"skip_done={skipped_done}",
         quiet=args.quiet,
     )
     if scale_tally:
@@ -443,18 +484,79 @@ def _file_ts(name: str) -> datetime | None:
         return None
 
 
-def cmd_pull(args: argparse.Namespace) -> int:
-    """List the repo once over ssh, filter locally, rsync the survivors.
+def build_find_cmd(
+    path: str,
+    mac: str | None,
+    capture: str | None,
+    since: date | None,
+    _type: str = "f",
+    *exts: str,
+) -> str:
+    # Base find command
+    cmd = f"find {path} -maxdepth 1 -type {_type}"
+    names = []
+    if exts:
+        macs = [mac or "*" for _ in range(len(exts))]
+        caps = [capture or "*" for _ in range(len(exts))]
+        for m, d, e in zip(macs, caps, exts):
+            names.append(f"{m}.{d}-*.{e}")
+    else:
+        if mac or capture:
+            names.append(f"{mac or '*'}.{capture or '*'}-*")
 
-    Filtering locally (extension / device prefix / embedded timestamp / most-
-    recent-N) keeps the remote command shell-safe (no find groups or globs) and
-    lets ``--since/--until`` use the filename's own capture time, not mtime.
+    # Only add name filtering if names were actually provided
+    if names:
+        name_conditions = " -o ".join([f'-name "{n}"' for n in names])
+        cmd += f" \\( {name_conditions} \\)"
+
+    # Add date condition and formatting (GNU find specific)
+    if since is not None:
+        d = str(since)
+        cmd += f" -newermt '{d}'"
+
+    return cmd + " -printf '%P\\n'"
+
+
+def cmd_pull(args: argparse.Namespace) -> int:
+    """List the repo once over ssh, filter, rsync the survivors.
+
+    The filters ``find`` can express -- MAC prefix, exact capture date, extension
+    type, and mtime-newer (``--since``) -- are pushed to the server as a single
+    find command, so the list we pull back is already narrow. The only thing
+    left to do locally is the most-recent-N sort (``--limit``): it needs the
+    filename's embedded capture time ordered, which find can't do.
     """
     staging = Path(args.staging)
     staging.mkdir(parents=True, exist_ok=True)
     list_path = staging / ".pull-filelist.txt"
 
-    list_cmd = f"cd {args.repo} && find . -maxdepth 1 -type f -printf '%P\\n'"
+    types = [t.strip() for t in args.type.split(",")] if args.type else ["ppi", "sleep"]
+    include_all = types == ["all"]
+    since_d = date.fromisoformat(args.since) if args.since else None
+
+    # --capture is the filename's own capture date (exact day). Accept either
+    # YYYYMMDD or YYYY-MM-DD; find's glob needs the on-disk 8-digit segment.
+    capture = None
+    if args.capture:
+        cap = args.capture.replace("-", "")
+        try:
+            datetime.strptime(cap, "%Y%m%d")
+        except ValueError:
+            log(
+                f"ERROR: --capture must be a date (got {args.capture!r})",
+                quiet=args.quiet,
+            )
+            return 1
+        capture = cap
+
+    # --type drives the extension globs; "all" pushes no extension filter.
+    exts = [t for t in types if t in ("ppi", "sleep")] if not include_all else []
+
+    # build_find_cmd's 5th positional is the find -type value ("f"); pass it
+    # explicitly so MAC / capture / since / exts land in the filter slots.
+    list_cmd = build_find_cmd(
+        args.repo, args.mac or None, capture, since_d, "f", *exts
+    )
     log(f'listing: ssh {args.ssh} "{list_cmd}"', quiet=args.quiet)
     res = subprocess.run(
         ["ssh", args.ssh, list_cmd], capture_output=True, text=True, check=False
@@ -463,12 +565,9 @@ def cmd_pull(args: argparse.Namespace) -> int:
         log(f"listing failed: {res.stderr.strip()[:500]}", quiet=args.quiet)
         return 1
     all_names = [ln for ln in res.stdout.splitlines() if ln]
-    log(f"server has {len(all_names)} file(s); filtering locally", quiet=args.quiet)
-
-    types = [t.strip() for t in args.type.split(",")] if args.type else ["ppi", "sleep"]
-    include_all = types == ["all"]
-    since_d = date.fromisoformat(args.since) if args.since else None
-    until_d = date.fromisoformat(args.until) if args.until else None
+    log(
+        f"server returned {len(all_names)} file(s); filtering locally", quiet=args.quiet
+    )
 
     candidates: list[tuple[str, str]] = []
     for n in all_names:
@@ -481,18 +580,6 @@ def cmd_pull(args: argparse.Namespace) -> int:
                 return 1
         elif kind not in types:
             continue
-        # Device prefix filter: named files start "{MAC}.".
-        if args.device and not n.startswith(args.device + "."):
-            continue
-        # Embedded-timestamp filter (bare files carry no timestamp).
-        if (since_d or until_d) and kind != "bare":
-            ts = _file_ts(n)
-            if ts is None:
-                continue
-            if since_d and ts.date() < since_d:
-                continue
-            if until_d and ts.date() > until_d:
-                continue
         candidates.append((n, kind))
 
     if args.limit and args.limit > 0 and not include_all:
@@ -510,7 +597,8 @@ def cmd_pull(args: argparse.Namespace) -> int:
     # rsync the matched basenames. -a + --partial = resumable.
     rsync = [
         "rsync",
-        "-a",
+        "-avz",
+        "--progress",
         "--partial",
         "--files-from",
         str(list_path),
@@ -520,148 +608,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
     if args.dry_run:
         rsync.insert(1, "-n")
     log(f"rsync: {' '.join(rsync)}", quiet=args.quiet)
-    return subprocess.run(rsync).returncode
-
-
-# --------------------------------------------------------------------------- #
-# reimport (deploy: run import on prod against the new instance)
-# --------------------------------------------------------------------------- #
-
-
-def cmd_reimport(args: argparse.Namespace) -> int:
-    here = Path(__file__).resolve()
-    if args.local:
-        # Local preflight: the target is reachable from this machine.
-        target = HttpTarget(args.target, args.api_prefix, args.http_timeout)
-        up, detail = target.health()
-        if not up:
-            log(
-                f"target {args.target} not reachable ({detail}); "
-                f"start the new newboom first.",
-                quiet=args.quiet,
-            )
-            return 1
-        log(f"target {args.target} up ({detail}).", quiet=args.quiet)
-        # Pull everything, then import locally against --target.
-        log("reimport --local: pulling full repo to staging.", quiet=args.quiet)
-        pull_args = argparse.Namespace(
-            ssh=args.ssh,
-            repo=args.repo,
-            staging=args.staging,
-            type=args.type,
-            device="",
-            since="",
-            until="",
-            limit=0,
-            bare_files=args.bare_files,
-            dry_run=args.dry_run,
-            quiet=args.quiet,
-        )
-        if cmd_pull(pull_args) != 0:
-            return 1
-        import_args = argparse.Namespace(
-            in_dir=args.staging,
-            target=args.target,
-            api_prefix=args.api_prefix,
-            bare_files=args.bare_files,
-            activity_default=args.activity_default,
-            spo2_scale=args.spo2_scale,
-            concurrency=args.concurrency,
-            retry=args.retry,
-            http_timeout=args.http_timeout,
-            state=args.state,
-            dry_run=args.dry_run,
-            quiet=args.quiet,
-        )
-        return cmd_import(import_args)
-
-    # Default: run the importer ON prod against prod's localhost. The target is
-    # prod-side, so the preflight and the import both go over ssh (no 1.1G of
-    # data crosses the network).
-    route = f"{args.target}{args.api_prefix}/ppi?limit=1"
-    check = f"curl -s -o /dev/null -w '%{{http_code}}' --max-time 5 {route} || echo 000"
-    r = subprocess.run(
-        ["ssh", args.ssh, check], capture_output=True, text=True, check=False
-    )
-    code = r.stdout.strip()
-    if not code or code == "000":
-        log(
-            f"target {args.target} on {args.ssh} not reachable "
-            f"({code or r.stderr.strip()[:120]}); start the new newboom first.",
-            quiet=args.quiet,
-        )
-        return 1
-    if code == "404":
-        log(
-            f"WARNING: {route} on {args.ssh} returned 404 -- the upload route "
-            f"is not there yet (new newboom not deployed on prod:8000?). "
-            f"Proceeding; the import will fail per-file if it is.",
-            quiet=args.quiet,
-        )
-    else:
-        log(f"target {args.target} on {args.ssh} up (HTTP {code}).", quiet=args.quiet)
-
-    remote_script = "/root/newboom_sync.py"
-    log(f"uploading importer to {args.ssh}:{remote_script}", quiet=args.quiet)
-    scp = subprocess.run(["scp", str(here), f"{args.ssh}:{remote_script}"], check=False)
-    if scp.returncode != 0:
-        return scp.returncode
-    cmd = (
-        f"python3 {remote_script} import --in {args.repo} "
-        f"--target {args.target} --api-prefix {args.api_prefix} "
-        f"--bare-files {args.bare_files} --activity-default {args.activity_default} "
-        f"--spo2-scale {args.spo2_scale} --concurrency {args.concurrency} "
-        f"--retry {args.retry}"
-    )
-    if args.dry_run:
-        cmd += " --dry-run"
-    if args.state:
-        cmd += f" --state {args.state}"
-    log(f'reimport: ssh {args.ssh} "{cmd}"', quiet=args.quiet)
-    return subprocess.run(["ssh", args.ssh, cmd], check=False).returncode
-
-
-# --------------------------------------------------------------------------- #
-# verify
-# --------------------------------------------------------------------------- #
-
-
-def cmd_verify(args: argparse.Namespace) -> int:
-    target = HttpTarget(args.target, args.api_prefix, args.http_timeout)
-    up, detail = target.health()
-    log(
-        f"target {args.target}: {'UP ' + detail if up else 'DOWN (' + detail + ')'}",
-        quiet=args.quiet,
-    )
-    state_path = (
-        Path(args.state) if args.state else Path(args.in_dir) / ".import-state.jsonl"
-    )
-    if state_path.exists():
-        st = StateLog(state_path)
-        log(f"state log {state_path}: {st.summary()}", quiet=args.quiet)
-    if up:
-        # Route liveness: an empty POST is rejected (422) but proves the route
-        # exists; a non-422 (e.g. 200/500) also proves reachability.
-        for dtype in ("ppi", "sleep"):
-            status, _ = target.post(dtype, {})
-            log(f"  {dtype} route reachable (HTTP {status})", quiet=args.quiet)
-        # Retrieval spot-check: the default 7-day window proves rows are
-        # queryable post-import. A true total count needs a server count
-        # endpoint (the GETs are capped at 10000 rows).
-        for dtype in ("ppi", "sleep"):
-            conn = target._conn()
-            conn.request("GET", f"{target.prefix}/{dtype}?start=1970-01-01&limit=10000")
-            resp = conn.getresponse()
-            try:
-                data = json.loads(resp.read().decode("utf-8", "replace"))
-                n = len(data.get("data", []))
-            except Exception:  # noqa: BLE001
-                n = -1
-            log(
-                f"  {dtype} recent-window rows fetched: {n} (capped at 10000)",
-                quiet=args.quiet,
-            )
-    return 0 if up else 1
+    return subprocess.run(rsync, check=False).returncode
 
 
 # --------------------------------------------------------------------------- #
@@ -689,13 +636,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="comma list: ppi / sleep / all (default excludes bare)",
     )
     q.add_argument(
-        "--device", default="", help="MAC prefix filter, e.g. D6:02:32:72:6A:81"
+        "--mac", default="", help="MAC filter, e.g. D6:02:32:72:6A:81"
     )
     q.add_argument(
-        "--since", default="", help="only files newer than YYYY-MM-DD (mtime)"
+        "--capture",
+        default="",
+        help="exact capture date YYYYMMDD (matches the filename's own timestamp)",
     )
     q.add_argument(
-        "--until", default="", help="only files older than YYYY-MM-DD (mtime)"
+        "--since",
+        default="",
+        help="only files whose mtime is after YYYY-MM-DD (disk write time, not capture time)",
     )
     q.add_argument("--limit", type=int, default=0, help="most-recent N files only")
     q.add_argument(
@@ -708,108 +659,70 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--dry-run", action="store_true")
     q.set_defaults(func=cmd_pull)
 
-    # import
-    i = sub.add_parser("import", help="normalize + POST staging -> REST target")
-    i.add_argument(
-        "--in",
-        dest="in_dir",
-        default=DEFAULTS["staging"],
-        help="dir to import (staging or the prod repo itself)",
+    # push (local -> REST target; reuses pull's filters + the POST pipeline)
+    u = sub.add_parser(
+        "push", help="normalize + POST a local staging dir -> a newboom REST target"
     )
-    i.add_argument("--target", default=DEFAULTS["target"])
-    i.add_argument("--api-prefix", dest="api_prefix", default=DEFAULTS["api_prefix"])
-    i.add_argument(
+    u.add_argument(
+        "--staging",
+        default=DEFAULTS["staging"],
+        help="local dir to push from (shared with pull's staging)",
+    )
+    u.add_argument(
+        "--target",
+        default=DEFAULTS["target"],
+        help="newboom REST base URL (default http://localhost:8000)",
+    )
+    u.add_argument("--api-prefix", dest="api_prefix", default=DEFAULTS["api_prefix"])
+    u.add_argument(
+        "--type",
+        default="ppi,sleep",
+        help="comma list: ppi / sleep / all (default excludes bare)",
+    )
+    u.add_argument("--mac", default="", help="MAC filter, e.g. D6:02:32:72:6A:81")
+    u.add_argument(
+        "--capture",
+        default="",
+        help="exact capture date YYYYMMDD (matches the filename's own timestamp)",
+    )
+    u.add_argument(
+        "--since",
+        default="",
+        help="only files whose mtime is after YYYY-MM-DD (disk write time, not capture time)",
+    )
+    u.add_argument("--limit", type=int, default=0, help="most-recent N files only")
+    u.add_argument(
         "--bare-files",
         dest="bare_files",
         choices=["skip", "fill", "error"],
         default="skip",
+        help="skip / fill-as-ppi / error on bare (hash-only, no extension)",
     )
-    i.add_argument(
+    u.add_argument(
         "--activity-default",
         dest="activity_default",
         type=int,
         default=DEFAULTS["activity_default"],
     )
-    i.add_argument(
+    u.add_argument(
         "--spo2-scale",
         dest="spo2_scale",
         default="auto",
         help="spo2 units: auto (detect per file) | 1 (pass-through) | 10",
     )
-    i.add_argument("--concurrency", type=int, default=DEFAULTS["concurrency"])
-    i.add_argument("--retry", type=int, default=DEFAULTS["retry"])
-    i.add_argument(
+    u.add_argument("--concurrency", type=int, default=DEFAULTS["concurrency"])
+    u.add_argument("--retry", type=int, default=DEFAULTS["retry"])
+    u.add_argument(
         "--http-timeout",
         dest="http_timeout",
         type=int,
         default=DEFAULTS["http_timeout"],
     )
-    i.add_argument(
-        "--state", default="", help="state-log path (default: <in>/.import-state.jsonl)"
+    u.add_argument(
+        "--state", default="", help="state-log path (default: <staging>/.import-state.jsonl)"
     )
-    i.add_argument("--dry-run", action="store_true")
-    i.set_defaults(func=cmd_import)
-
-    # reimport
-    r = sub.add_parser("reimport", help="deploy: run import on prod vs new instance")
-    r.add_argument("--ssh", default=DEFAULTS["ssh"])
-    r.add_argument("--repo", default=DEFAULTS["repo"])
-    r.add_argument(
-        "--target",
-        default=DEFAULTS["target"],
-        help="new instance URL (default 127.0.0.1:8000, i.e. on prod)",
-    )
-    r.add_argument("--api-prefix", dest="api_prefix", default=DEFAULTS["api_prefix"])
-    r.add_argument("--staging", default=DEFAULTS["staging"])
-    r.add_argument("--type", default="ppi,sleep")
-    r.add_argument(
-        "--bare-files",
-        dest="bare_files",
-        choices=["skip", "fill", "error"],
-        default="skip",
-    )
-    r.add_argument(
-        "--activity-default",
-        dest="activity_default",
-        type=int,
-        default=DEFAULTS["activity_default"],
-    )
-    r.add_argument(
-        "--spo2-scale",
-        dest="spo2_scale",
-        default="auto",
-        help="spo2 units: auto (detect per file) | 1 | 10",
-    )
-    r.add_argument("--concurrency", type=int, default=DEFAULTS["concurrency"])
-    r.add_argument("--retry", type=int, default=DEFAULTS["retry"])
-    r.add_argument(
-        "--http-timeout",
-        dest="http_timeout",
-        type=int,
-        default=DEFAULTS["http_timeout"],
-    )
-    r.add_argument("--state", default="")
-    r.add_argument(
-        "--local",
-        action="store_true",
-        help="pull to local then import (instead of running on prod)",
-    )
-    r.add_argument("--dry-run", action="store_true")
-    r.set_defaults(func=cmd_reimport)
-
-    # verify
-    v = sub.add_parser("verify", help="reconcile source vs target")
-    v.add_argument("--in", dest="in_dir", default=DEFAULTS["staging"])
-    v.add_argument("--target", default=DEFAULTS["target"])
-    v.add_argument("--api-prefix", dest="api_prefix", default=DEFAULTS["api_prefix"])
-    v.add_argument("--state", default="")
-    v.add_argument(
-        "--http-timeout",
-        dest="http_timeout",
-        type=int,
-        default=DEFAULTS["http_timeout"],
-    )
-    v.set_defaults(func=cmd_verify)
+    u.add_argument("--dry-run", action="store_true")
+    u.set_defaults(func=cmd_push)
 
     return p
 
