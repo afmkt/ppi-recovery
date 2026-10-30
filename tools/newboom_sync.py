@@ -16,11 +16,17 @@ capture that is POSTed, byte for byte. The data is produced in its final shape
 by the upstream system; any old-shape -> new-shape bridging is the server's
 responsibility, not this tool's.
 
+Idempotency is server-side. A re-run of push first queries ``GET {prefix}/file``
+for the content hashes the server has already saved and skips any local file whose
+canonical hash matches -- there is no local state file to keep in sync. (The
+server's DB upserts by ``(device_id, time)``, so a re-POST is safe regardless.)
+
 Subcommands:
 
   pull      rsync the prod repo -> a local staging dir (filtered, resumable)
   push      POST a local staging dir verbatim -> a newboom REST target
-            (filtered, resumable; the local->server inverse of ``pull``)
+            (filtered; the local->server inverse of ``pull``; skips files the
+            server already has via the content-hash query above)
 
 Stdlib only; no new dependencies.
 """
@@ -33,6 +39,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import ssl
 import subprocess
 import sys
@@ -144,75 +151,78 @@ class HttpTarget:
             parsed = {"ok": False, "raw": data[:300]}
         return resp.status, parsed
 
+    def get(self, path: str) -> tuple[int, dict]:
+        """GET {prefix}/{path}; return (status, parsed_json). Resets the
+        connection on transport failure so the next call reconnects."""
+        conn = self._conn()
+        try:
+            conn.request("GET", f"{self.prefix}/{path}")
+            resp = conn.getresponse()
+            data = resp.read().decode("utf-8", "replace")
+        except (http.client.HTTPException, ConnectionError, TimeoutError, OSError):
+            self._local.c = None  # half-open / dead socket
+            raise
+        try:
+            parsed = json.loads(data) if data else {}
+        except json.JSONDecodeError:
+            parsed = {"ok": False, "raw": data[:300]}
+        return resp.status, parsed
+
 
 # --------------------------------------------------------------------------- #
-# State log (resume / idempotency)
+# Uploaded-content index (server-side idempotency)
 # --------------------------------------------------------------------------- #
 
 
-class StateLog:
-    """Append-only JSONL of per-file import outcomes, keyed by content sha256.
+_NAME_HASH_RE = re.compile(r"([0-9a-f]{64})\.(?:ppi|sleep)\.json$")
 
-    A file whose sha256 already has an ``ok`` line is skipped on rerun; a crash
-    between POST and state-write is the only gap, and a rerun simply re-POSTs
-    (the DB upserts by ``(device_id, time)``, so that is safe).
+
+def _content_hash(parsed: object) -> str:
+    """Canonical content hash, identical to the one the server bakes into the
+    saved filename: ``sha256(json.dumps(parsed, sort_keys=True))``. A local file
+    is "already uploaded" when this hash is in the server's uploaded-file list."""
+    return hashlib.sha256(json.dumps(parsed, sort_keys=True).encode()).hexdigest()
+
+
+def _hash_from_filename(name: str) -> str | None:
+    """Pull the 64-hex content hash out of a saved upload filename
+    (``{device}-{YYYYMMDD-HHMMSS}-{hash}.{type}.json``); None if it doesn't match."""
+    m = _NAME_HASH_RE.search(name)
+    return m.group(1) if m else None
+
+
+def fetch_uploaded_hashes(target: HttpTarget, retries: int) -> tuple[set[str], str]:
+    """GET {prefix}/file and return (content_hashes, error).
+
+    The server lists every body it has saved, each filename embedding the content
+    hash we recompute on the client. On failure returns an empty set with a
+    non-empty error, so the caller can fall back to "skip nothing" -- re-uploading
+    is safe because the DB upserts by ``(device_id, time)``.
     """
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.done: set[str] = set()
-        self.errors: dict[str, str] = {}
-        if path.exists():
-            with open(path) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    status = rec.get("status")
-                    if status in ("ok", "skipped"):
-                        self.done.add(rec["sha256"])
-                    elif status == "error":
-                        self.errors[rec["sha256"]] = rec.get("error", "?")
-
-    def record(
-        self,
-        sha256: str,
-        status: str,
-        processed: int = 0,
-        error: str = "",
-        name: str = "",
-    ) -> None:
-        rec = {
-            "sha256": sha256,
-            "status": status,
-            "processed": processed,
-            "error": error,
-            "name": name,
-            "ts": time.time(),
-        }
-        line = json.dumps(rec) + "\n"
-        with _lock:
-            with open(self.path, "a") as f:
-                f.write(line)
-            if status in ("ok", "skipped"):
-                self.done.add(sha256)
-            elif status == "error":
-                self.errors[sha256] = error
-
-    def summary(self) -> dict:
-        return {"ok": len(self.done), "errors": len(self.errors)}
-
-
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    last_err = ""
+    for attempt in range(retries + 1):
+        try:
+            status, parsed = target.get("file")
+        except Exception as e:  # noqa: BLE001
+            last_err = f"transport: {e}"
+        else:
+            if 200 <= status < 300 and parsed.get("ok"):
+                names = parsed.get("data") or []
+                if not isinstance(names, list):
+                    last_err = f"/file data not a list: {type(names).__name__}"
+                else:
+                    return (
+                        {
+                            h
+                            for n in names
+                            if (h := _hash_from_filename(n)) is not None
+                        },
+                        "",
+                    )
+            last_err = f"HTTP {status}: {_describe_error(parsed)}"
+        if attempt < retries:
+            time.sleep(min(2 ** attempt, 8))
+    return set(), last_err or "unknown"
 
 
 # --------------------------------------------------------------------------- #
@@ -287,7 +297,6 @@ def cmd_push(args: argparse.Namespace) -> int:
         return 2
 
     target = HttpTarget(args.target, args.api_prefix, args.http_timeout)
-    state = StateLog(Path(args.state) if args.state else src / ".import-state.jsonl")
 
     # Local filters mirror cmd_pull's server-side find, applied to the dir:
     #   --type        ppi / sleep / all (by extension)
@@ -322,9 +331,9 @@ def cmd_push(args: argparse.Namespace) -> int:
     )
     log(f"found {len(files)} files in {src}", quiet=args.quiet)
 
-    # Pre-filter by type/mac/capture/since, then skip already-done.
+    # Pre-filter by type/mac/capture/since.
     pending: list[Path] = []
-    skipped_unknown = skipped_filter = skipped_done = 0
+    skipped_unknown = skipped_filter = 0
     for p in files:
         kind = classify(p.name)
         if kind == "unknown":
@@ -344,10 +353,6 @@ def cmd_push(args: argparse.Namespace) -> int:
         if since_ts is not None and p.stat().st_mtime < since_ts:
             skipped_filter += 1
             continue
-        sha = sha256_file(p)
-        if sha in state.done:
-            skipped_done += 1
-            continue
         pending.append(p)
 
     # --limit: most-recent N by embedded capture time (mirrors cmd_pull).
@@ -357,74 +362,85 @@ def cmd_push(args: argparse.Namespace) -> int:
 
     log(
         f"to push: {len(pending)}  (skip unknown={skipped_unknown}, "
-        f"filtered={skipped_filter}, already-done={skipped_done})",
+        f"filtered={skipped_filter})",
         quiet=args.quiet,
     )
     if args.dry_run:
         log(f"DRY-RUN: no POSTs. {len(pending)} files would be sent.", quiet=args.quiet)
         return 0
 
-    ok = err = skipped = 0
+    # Query the server for what it already has and skip those (server-side
+    # idempotency, no local state file). A failed query just means "skip
+    # nothing" -- re-uploading is safe because the DB upserts by (device_id, time).
+    uploaded_hashes, hash_err = fetch_uploaded_hashes(target, args.retry)
+    if hash_err:
+        log(
+            f"WARN: could not query uploaded files ({hash_err}); skip disabled, "
+            "re-uploading everything (idempotent)",
+            quiet=args.quiet,
+        )
+    else:
+        log(
+            f"server has {len(uploaded_hashes)} uploaded file(s); skipping matches",
+            quiet=args.quiet,
+        )
+
+    ok = err = 0
     err_lock = threading.Lock()
+    err_counts: dict[str, int] = {}
+    skip_counts: dict[str, int] = {}
 
     def work(p: Path) -> None:
-        nonlocal ok, err, skipped
+        nonlocal ok, err
         dtype = "ppi" if p.name.endswith(".ppi") else "sleep"
         try:
             raw = p.read_bytes()
         except OSError as e:
             with err_lock:
-                skipped += 1
+                skip_counts["read"] = skip_counts.get("read", 0) + 1
             log(f"  SKIP {p.name}: read: {e}", quiet=args.quiet)
-            state.record(sha256_file(p), "skipped", 0, f"read: {e}", p.name)
             return
         # Refuse to POST undecodable bytes: a truncated/empty capture can never
         # import, so skip it rather than 422-storm the server.
         try:
-            json.loads(raw)
+            parsed = json.loads(raw)
         except (ValueError, UnicodeDecodeError) as e:
             with err_lock:
-                skipped += 1
+                skip_counts["parse"] = skip_counts.get("parse", 0) + 1
             log(f"  SKIP {p.name}: parse: {e}", quiet=args.quiet)
-            state.record(sha256_file(p), "skipped", 0, f"parse: {e}", p.name)
             return
-        ok_flag, processed, errmsg = _post_one(p, target, dtype, raw, args.retry)
+        # Server-side idempotency: skip if this exact content is already saved.
+        if _content_hash(parsed) in uploaded_hashes:
+            with err_lock:
+                skip_counts["uploaded"] = skip_counts.get("uploaded", 0) + 1
+            log(f"  SKIP {p.name}: already uploaded", quiet=args.quiet)
+            return
+        ok_flag, _, errmsg = _post_one(p, target, dtype, raw, args.retry)
         if ok_flag:
             with err_lock:
                 ok += 1
-            state.record(sha256_file(p), "ok", processed, "", p.name)
             if ok % 100 == 0:
                 log(f"pushed {ok} ok / {err} err", quiet=args.quiet)
         else:
             with err_lock:
                 err += 1
+                err_counts[errmsg] = err_counts.get(errmsg, 0) + 1
             log(f"  FAIL {p.name}: {errmsg}", quiet=args.quiet)
-            state.record(sha256_file(p), "error", 0, errmsg, p.name)
 
     with cf.ThreadPoolExecutor(max_workers=args.concurrency) as ex:
         list(ex.map(work, pending))
 
+    skipped = sum(skip_counts.values())
+    skip_detail = ", ".join(f"{k}={v}" for k, v in sorted(skip_counts.items())) or "none"
     log(
         f"DONE: ok={ok} err={err} skipped={skipped} "
         f"skip_unknown={skipped_unknown} skip_filtered={skipped_filter} "
-        f"skip_done={skipped_done}",
+        f"skip[{skip_detail}]",
         quiet=args.quiet,
     )
     if err:
-        # Reconcile against done: a file that failed earlier but imported on a
-        # later attempt is not failing now, so drop shas that are in done.
-        counts: dict[str, int] = {}
-        for sha, msg in state.errors.items():
-            if sha in state.done:
-                continue
-            counts[msg] = counts.get(msg, 0) + 1
-        total_live = sum(counts.values())
-        log(
-            f"{err} file(s) failed this run; {total_live} still failing "
-            f"(of {len(state.errors)} recorded; see {state.path})",
-            quiet=args.quiet,
-        )
-        for msg, n in sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:10]:
+        log(f"{err} file(s) failed this run:")
+        for msg, n in sorted(err_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]:
             log(f"  {n:6d}  {msg}", quiet=args.quiet)
     return 1 if err else 0
 
@@ -490,7 +506,6 @@ def cmd_pull(args: argparse.Namespace) -> int:
     """
     staging = Path(args.staging)
     staging.mkdir(parents=True, exist_ok=True)
-    list_path = staging / ".pull-filelist.txt"
 
     types = [t.strip() for t in args.type.split(",")] if args.type else ["ppi", "sleep"]
     include_all = types == ["all"]
@@ -543,26 +558,25 @@ def cmd_pull(args: argparse.Namespace) -> int:
         candidates = candidates[: args.limit]
 
     names = candidates
-    list_path.write_text("\n".join(names) + ("\n" if names else ""))
-    log(f"matched {len(names)} file(s) -> {list_path}", quiet=args.quiet)
+    log(f"matched {len(names)} file(s)", quiet=args.quiet)
     if not names:
         return 0
 
-    # rsync the matched basenames. -a + --partial = resumable.
+    # Feed the matched basenames to rsync over stdin (--files-from=-): no
+    # scratch file is left in staging. -a + --partial = resumable.
     rsync = [
         "rsync",
         "-avz",
         "--progress",
         "--partial",
-        "--files-from",
-        str(list_path),
+        "--files-from=-",
         f"{args.ssh}:{args.repo}/",
         f"{staging}/",
     ]
     if args.dry_run:
         rsync.insert(1, "-n")
-    log(f"rsync: {' '.join(rsync)}", quiet=args.quiet)
-    return subprocess.run(rsync, check=False).returncode
+    log(f"rsync: {' '.join(rsync)}  (+{len(names)} names on stdin)", quiet=args.quiet)
+    return subprocess.run(rsync, check=False, input="\n".join(names) + "\n").returncode
 
 
 # --------------------------------------------------------------------------- #
@@ -643,11 +657,6 @@ def build_parser() -> argparse.ArgumentParser:
         dest="http_timeout",
         type=int,
         default=DEFAULTS["http_timeout"],
-    )
-    u.add_argument(
-        "--state",
-        default="",
-        help="state-log path (default: <staging>/.import-state.jsonl)",
     )
     u.add_argument("--dry-run", action="store_true")
     u.set_defaults(func=cmd_push)

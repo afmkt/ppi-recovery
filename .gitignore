@@ -45,8 +45,6 @@ app.db
 
 # --- newboom-sync staging / transfer artifacts ---
 staging/
-.import-state.jsonl
-.pull-filelist.txt
 
 # --- File Storage / Audit Logs ---
 staging/
