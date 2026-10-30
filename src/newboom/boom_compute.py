@@ -398,12 +398,16 @@ def _temporary_status(
             delta_hrv = -3
 
     # Δ_SpO2 vs absolute thresholds (§6.3): >=95% 0; 90-95% -5; <90% -10.
+    # PPI.spo2 / spo2_night_avg is device-raw (×10, 950 = 95.0%); fold back to a
+    # percentage before comparing to the 90/95 tiers (0 = not reported, already
+    # filtered out by _aggregate_night_spo2).
     delta_spo2 = 0
     spo2 = metrics.get("spo2_night_avg")
     if spo2 is not None:
-        if spo2 < 90:
+        pct = spo2 / 10.0
+        if pct < 90:
             delta_spo2 = -10
-        elif spo2 < 95:
+        elif pct < 95:
             delta_spo2 = -5
 
     status_score = int(
@@ -472,11 +476,14 @@ def _deduction_bonus(
             False,
         ),
     ]
+    # SpO2 is device-raw (×10); fold to a percentage before the 90/95 tiers
+    # (deduction only, no bonus — see docstring).
     spo2 = metrics.get("spo2_night_avg")
     if spo2 is not None:
-        if spo2 < 90:
+        pct = spo2 / 10.0
+        if pct < 90:
             deltas.append(-10)
-        elif spo2 < 95:
+        elif pct < 95:
             deltas.append(-5)
 
     deduction_points = sum(d for d in deltas if d < 0)
@@ -797,7 +804,7 @@ def process_daily_summary(device_id: int, target_date: date) -> DailySummary | N
             existing.boom_go_text = coaching_text
             existing.supercomp_time = "次日 10:00 – 14:00"
             existing.training_suggestion = "中高强度训练（阈值 / 间歇）"
-            existing.training_duration = "60-90分钟"
+            existing.training_duration = "60–90分钟"
             existing.training_target = "提升能力上限（耐力/阈值）"
             existing.is_temporary_algorithm = is_temporary
             existing.status_morning = status_score

@@ -145,7 +145,7 @@ def test_deduction_worst_tier_summed():
         "rest_hr_val": 70.0,
         "hrv_night_val": 40.0,
         "hrv_morning_val": 30.0,
-        "spo2_night_avg": 88.0,
+        "spo2_night_avg": 880.0,  # device-raw ×10: 88% -> -10 tier
     }
     baselines = {
         "rhr_avg": 60.0,
@@ -175,6 +175,41 @@ def test_bonus_worst_tier_summed():
     assert bonus == 30
     assert deduction == 0
     assert adjustment == 30
+
+
+def test_spo2_deduction_folds_raw_x10_scale():
+    # PPI.spo2 / spo2_night_avg is device-raw (×10, 950 = 95.0%); the 90/95
+    # percentage tiers must fold the raw value to a percentage first. 0 (not
+    # reported) is filtered upstream by _aggregate_night_spo2, so only None or a
+    # positive raw value reaches the tier logic.
+    baselines = {
+        "rhr_avg": 60.0,
+        "rhr_std": 5.0,
+        "hrv_night_avg": 50.0,
+        "hrv_night_std": 5.0,
+        "hrv_morning_avg": 40.0,
+        "hrv_morning_std": 5.0,
+    }
+    for raw in (950.0, 980.0):  # 95-99% healthy -> no SpO2 deduction
+        deduction, bonus, adjustment = _deduction_bonus(
+            {"spo2_night_avg": raw}, baselines
+        )
+        assert deduction == 0 and bonus == 0, raw
+    assert _deduction_bonus({"spo2_night_avg": 920.0}, baselines)[0] == -5  # 92%
+    assert _deduction_bonus({"spo2_night_avg": 880.0}, baselines)[0] == -10  # 88%
+    assert _deduction_bonus({"spo2_night_avg": None}, baselines)[0] == 0
+
+
+def test_temporary_spo2_delta_folds_raw_x10_scale():
+    # §6.3 Δ_SpO2 on the device-raw scale: 88% (-10) carried on the prior
+    # morning score (60) with all other deltas 0 -> 50.
+    out = _temporary_status(
+        _tmp_metrics(spo2_night_avg=880.0),
+        {"valid_days_count": 3},
+        [_summary(status_score=60)],
+        65,
+    )
+    assert out[0] == 50
 
 
 # --- P0-2 RHR baseline fallback chain --------------------------------------
