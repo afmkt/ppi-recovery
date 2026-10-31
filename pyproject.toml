@@ -27,7 +27,7 @@ build-backend = "uv_build"
 [dependency-groups]
 dashboard = [
     "altair>=6.3.0",
-    "streamlit>=1.66.1",
+    "marimo[recommended]>=0.25.2",
 ]
 dev = [
     "pytest>=9.1.1",
