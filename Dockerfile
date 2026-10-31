@@ -47,12 +47,14 @@ RUN groupadd --gid 10001 app \
 
 VOLUME ["/app/data"]
 
-# Image-level healthcheck so a plain `docker run` detects a wedged server the way
-# compose does. FastAPI always serves /openapi.json; no config is required, so no
-# extra runtime deps (curl) need to be installed.
+# Image-level healthcheck so a plain `docker run` detects a wedged worker the
+# way compose does. /healthz reflects the background worker: 200 while a cycle
+# has succeeded within its stale window, 503 otherwise — so a worker that can't
+# persist (e.g. a read-only database) flips the container to "unhealthy" instead
+# of looping forever. Stdlib only: no curl needed.
 EXPOSE 8000
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/openapi.json').status==200 else 1)" || exit 1
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+    CMD python3 -c "import http.client,sys; c=http.client.HTTPConnection('127.0.0.1',8000,timeout=4); c.request('GET','/healthz'); sys.exit(0 if c.getresponse().status==200 else 1)" || exit 1
 
 USER app
 
