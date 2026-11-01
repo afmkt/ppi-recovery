@@ -28,6 +28,7 @@ build-backend = "uv_build"
 dashboard = [
     "altair>=6.3.0",
     "marimo[recommended]>=0.25.2",
+    "pandas>=3.1.0",
 ]
 dev = [
     "pytest>=9.1.1",
