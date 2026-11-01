@@ -1,15 +1,27 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from newboom.boom import router as boom_router
+from newboom.dashboard import dashboard_lifespan, mount_dashboard
 from newboom.schema import ApiResponse
 from newboom.upload import router as upload_router
-from newboom.worker import lifespan, worker_health
+from newboom.worker import lifespan as worker_lifespan
+from newboom.worker import worker_health
+
 
 # --- FastAPI App Initialization ---
+# A Starlette Mount does not run the dashboard sub-app's own lifespan, so its
+# runtime (kernel + session manager) is composed into the host lifespan here.
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with worker_lifespan(app), dashboard_lifespan(app):
+        yield
+
 app = FastAPI(title="Device Ingestion API", version="1.0.0", lifespan=lifespan)
 
 
@@ -49,6 +61,9 @@ app.add_middleware(
 
 app.include_router(upload_router, prefix="/api/upload", tags=["Upload"])
 app.include_router(boom_router)
+
+# Serve the marimo dashboard at /dashboard.
+mount_dashboard(app)
 
 
 @app.get("/healthz", include_in_schema=False)
