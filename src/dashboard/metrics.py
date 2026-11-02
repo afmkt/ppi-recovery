@@ -14,6 +14,7 @@ from datetime import datetime
 
 import altair as alt
 import pandas as pd
+from altair.typing import EncodeKwds
 
 # --- physiological sanity bounds --------------------------------------------
 # Device-raw scale. See docs/new-interface.md §3.1: spo2 is stored raw ×10
@@ -149,7 +150,7 @@ def fleet_header(fresh: pd.DataFrame) -> str:
 def throughput_chart(daily: pd.DataFrame):
     """Grouped bar of PPI rows/day; color by device only when the column exists."""
     ref = pd.DataFrame([{"v": FULL_DAY_S}])
-    enc = {
+    enc: EncodeKwds = {
         "x": alt.X("day:T", title="date", scale=alt.Scale(zero=False)),
         "y": alt.Y("rows:Q", title="PPI rows / day"),
     }
