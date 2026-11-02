@@ -39,9 +39,6 @@ class Device(SQLModel, table=True):
     daily_summary: Mapped[list["DailySummary"]] = Relationship(back_populates="device")
     minute_metrics: Mapped[list["MinuteMetric"]] = Relationship(back_populates="device")
     hourly_status: Mapped[list["HourlyStatus"]] = Relationship(back_populates="device")
-    questionnaire_answers: Mapped[list["QuestionnaireAnswer"]] = Relationship(
-        back_populates="device"
-    )
     coach_conversations: Mapped[list["Conversation"]] = Relationship(
         back_populates="device"
     )
@@ -444,13 +441,12 @@ class HourlyStatus(SQLModel, table=True):
 
 
 class QuestionnaireAnswer(SQLModel, table=True):
-    """§9.2 问卷提交: one row per submitted question/answer pair, tied to the
-    submitting device (``device_id`` -> ``Device.mac``) and the submit time.
+    """§9.2 问卷提交: one row per submitted question/answer pair, with the
+    submit time.
 
     ``user_type`` / ``question`` / ``selected`` mirror the §9.2 request body
     (``userType`` and each ``answers[]`` pair); ``created_at`` is the submit
-    timestamp. A device that has not yet paired is created on submit — the
-    request carries only the device ``mac`` (in the path), no name.
+    timestamp. The submission is device-less — the request carries no device.
     """
 
     id: int | None = Field(default=None, primary_key=True)
@@ -472,6 +468,8 @@ class Conversation(SQLModel, table=True):
     """
 
     id: int | None = Field(default=None, primary_key=True)
+    device_id: int = Field(foreign_key="device.id", index=True)
+    device: Device = Relationship(back_populates="coach_conversations")
     title: str = Field(default="新对话", unique=True, description="对话标题")
     created_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
     updated_at: NaiveDatetime = Field(default_factory=datetime.utcnow)

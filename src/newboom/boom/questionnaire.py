@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
-from sqlmodel import Session, select
+from sqlmodel import Session
 
 from newboom.boom.schemas import BoomResponse
 from newboom.database import get_session
-from newboom.model import Device, QuestionnaireAnswer
+from newboom.model import QuestionnaireAnswer
 
 router = APIRouter(tags=["问卷"])
 
@@ -102,19 +102,17 @@ async def get_questionnaire() -> BoomResponse[QuestionnaireData]:
     response_model=QuestionnaireSubmitResponse,
 )
 async def submit_questionnaire(
-    address: str,
     body: QuestionnaireSubmitRequest,
     session: Session = Depends(get_session),
 ) -> QuestionnaireSubmitResponse:
     """9.2 提交问卷答案.
 
-    Resolves the device by ``mac == address``, creating it (``name = address``)
-    when it has not paired yet so an answer is never lost; then validates
-    ``userType`` against the static user-type set and persists one
+    Validates ``userType`` against the static user-type set and persists one
     ``QuestionnaireAnswer`` row per ``answers[]`` pair (``user_type`` /
-    ``question`` / ``selected`` plus the submit timestamp). An unknown
-    ``userType`` yields ``{code:1, message}`` — a non-zero code keeps the
-    ``{code, message}`` envelope, which a FastAPI 422 would bypass.
+    ``question`` / ``selected`` plus the submit timestamp). The submission is
+    device-less — it carries no device. An unknown ``userType`` yields
+    ``{code:1, message}`` — a non-zero code keeps the ``{code, message}``
+    envelope, which a FastAPI 422 would bypass.
     """
     if body.userType not in _USER_TYPE_VALUES:
         return QuestionnaireSubmitResponse(

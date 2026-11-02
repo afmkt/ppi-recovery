@@ -18,6 +18,7 @@ def create_db_and_tables():
 
     SQLModel.metadata.create_all(engine)
     _migrate_add_columns()
+    _migrate_drop_columns()
 
 
 # Columns added after the initial schema. create_all() only creates missing
@@ -73,6 +74,52 @@ def _migrate_add_columns() -> None:
                         text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
                     )
                     session.commit()
+
+
+# Columns removed from the model after the schema was first written. create_all()
+# never drops a column, and SQLite rejects ``ALTER TABLE DROP COLUMN`` for a
+# column that is part of a foreign-key definition, so an obsolete column is shed
+# by rebuilding its table from the surviving columns. Each entry is a no-op once
+# the column is already gone.
+_DROPPED_COLUMNS: dict[str, list[str]] = {
+    "questionnaireanswer": ["device_id"],
+}
+
+
+def _column_def(row) -> str:
+    """Rebuild a ``CREATE TABLE`` column clause from a ``table_info`` row.
+
+    ``row`` is ``(cid, name, type, notnull, dflt_value, pk)``.
+    """
+    _cid, name, ctype, notnull, dflt, pk = row
+    parts = [name, ctype or "TEXT"]
+    if pk:
+        parts.append("PRIMARY KEY")
+    elif notnull:
+        parts.append("NOT NULL")
+    if dflt is not None:
+        parts.append(f"DEFAULT {dflt}")
+    return " ".join(parts)
+
+
+def _migrate_drop_columns() -> None:
+    """Shed columns removed from the model from pre-existing tables."""
+    with engine.begin() as conn:
+        for table, cols in _DROPPED_COLUMNS.items():
+            info = conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
+            present = {row[1] for row in info}
+            drop = [c for c in cols if c in present]
+            if not drop:
+                continue
+            keep = [row for row in info if row[1] not in drop]
+            defs = [_column_def(row) for row in keep]
+            names = ", ".join(row[1] for row in keep)
+            conn.exec_driver_sql(f"CREATE TABLE {table}_new ({', '.join(defs)})")
+            conn.exec_driver_sql(
+                f"INSERT INTO {table}_new ({names}) SELECT {names} FROM {table}"
+            )
+            conn.exec_driver_sql(f"DROP TABLE {table}")
+            conn.exec_driver_sql(f"ALTER TABLE {table}_new RENAME TO {table}")
 
 
 def get_session():
