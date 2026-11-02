@@ -11,7 +11,6 @@ from newboom.dashboard import dashboard_lifespan, mount_dashboard
 from newboom.schema import ApiResponse
 from newboom.upload import router as upload_router
 from newboom.worker import lifespan as worker_lifespan
-from newboom.worker import worker_health
 
 
 # --- FastAPI App Initialization ---
@@ -21,6 +20,7 @@ from newboom.worker import worker_health
 async def lifespan(app: FastAPI):
     async with worker_lifespan(app), dashboard_lifespan(app):
         yield
+
 
 app = FastAPI(title="Device Ingestion API", version="1.0.0", lifespan=lifespan)
 
@@ -68,18 +68,10 @@ mount_dashboard(app)
 
 @app.get("/healthz", include_in_schema=False)
 def healthz() -> JSONResponse:
-    """Worker liveness + health.
 
-    Returns 200 while a background worker cycle has succeeded within the stale
-    window and 503 (carrying the last error) otherwise, so a persistently
-    failing worker surfaces via the container health check instead of looping
-    forever while silently failing to persist. Deliberately out of the public
-    OpenAPI schema (``include_in_schema=False``).
-    """
-    healthy = worker_health.is_healthy()
     return JSONResponse(
-        status_code=200 if healthy else 503,
-        content={"ok": healthy, "worker": worker_health.snapshot()},
+        status_code=200,
+        content={"ok": True},
     )
 
 

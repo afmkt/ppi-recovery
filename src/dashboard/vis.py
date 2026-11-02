@@ -19,7 +19,7 @@ def device_sidebar(mo, sql, devices):
         buttons.append(btn)
 
     sidebar = mo.sidebar(
-        [mo.md("### Devices"), mo.vstack(buttons, gap=0.3)], width="280px"
+        [mo.md("### Devices"), mo.vstack(buttons, gap=0.3)], width="200px"
     )
     return get_device, set_device, sidebar
 
