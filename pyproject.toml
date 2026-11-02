@@ -8,10 +8,13 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "altair>=6.3.0",
     "fastapi>=0.161.1",
+    "marimo[recommended]>=0.25.2",
     "numpy>=2.5.4",
-    "python-multipart>=0.0.9",
+    "pandas>=3.1.0",
     "python-dotenv>=1.2.4",
+    "python-multipart>=0.0.9",
     "scipy>=1.18.1",
     "sqlmodel>=0.0.48",
     "uvicorn>=0.54.0",
@@ -25,11 +28,6 @@ requires = ["uv_build>=0.12.2,<0.13.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
-dashboard = [
-    "altair>=6.3.0",
-    "marimo[recommended]>=0.25.2",
-    "pandas>=3.1.0",
-]
 dev = [
     "pytest>=9.1.1",
 ]

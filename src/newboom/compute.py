@@ -43,7 +43,7 @@ from newboom.model import (
 def clean_ppi_series(ppi_list: list[float]) -> list[float | None]:
     """
     # 4. PPI 清洗
-    频域和 RMSSD 都依赖高质量 PPI。每个窗口内先清洗 PPI，再判断窗口是否可用。
+    频域和 RMSSD 都依赖高质量 PPI。每个窗口内先清洗 PPI, 再判断窗口是否可用。
     valid_range_i = 350 <= ppi_i <= 2000
     m_i = median(ppi_{i-5}, ..., ppi_i, ..., ppi_{i+5})
     local_valid_i = abs(ppi_i - m_i) <= max(250, 0.25 * m_i)
@@ -767,12 +767,12 @@ def _recon_verdict(expected: float, observed: float) -> tuple[ReconVerdict, floa
 
 
 def record_diagnostics(device_id: int) -> None:
-    """Q1–Q6 pipeline progress/health, one pass per device at the end of the
+    """Q1-Q6 pipeline progress/health, one pass per device at the end of the
     pipeline. Writes the three reporting read-models and is never read back by
     the pipeline, so a failed diagnostic can only make a report look laggy — it
     cannot skew processing. The caller wraps this in try/except.
 
-    Q1–Q4 → ``LayerFreshness`` (most-recent time + lag per layer).
+    Q1-Q4 → ``LayerFreshness`` (most-recent time + lag per layer).
     Q5     → ``DataGap`` (raw coverage of the current calendar day; closed days
              finalized to immutable).
     Q6     → ``Reconciliation`` (raw PPI activity vs the most-recent ``Sleep``
@@ -781,7 +781,7 @@ def record_diagnostics(device_id: int) -> None:
     with Session(engine) as session:
         now = datetime.now(UTC).replace(tzinfo=None)
 
-        # --- Q1–Q4: per-layer freshness ---
+        # --- Q1-Q4: per-layer freshness ---
         raw_max, raw_n = _max_count(session, PPI, PPI.time, device_id)
         clean_max, clean_n = _max_count(
             session, PPI, PPI.time, device_id, col(PPI.ppi_clean).isnot(None)
