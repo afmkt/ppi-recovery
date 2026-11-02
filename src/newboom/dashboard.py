@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import cast
 
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
@@ -31,10 +32,14 @@ def build_dashboard() -> Starlette:
     """Build (once) the standalone marimo dashboard sub-app, unmounted."""
     global _dashboard_app
     if _dashboard_app is None:
-        built = (
+        # `build()` is typed to return `ASGIApp` (a bare callable), but it
+        # actually returns the `Starlette` base app the builder wraps its
+        # sub-apps in, which is what exposes `.routes`.
+        built = cast(
+            Starlette,
             create_asgi_app(quiet=True)
             .with_app(path="/dashboard", root=DASHBOARD_ROOT)
-            .build()
+            .build(),
         )
         for route in built.routes:
             sub = getattr(route, "app", None)
