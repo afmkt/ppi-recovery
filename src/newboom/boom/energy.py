@@ -43,9 +43,7 @@ def _charge_consume(e_d: float, f_d: float) -> tuple[int, int]:
     return charge, consume
 
 
-def _energy_chart_data(
-    session: Session, device_id: int, day: date
-) -> list[TimePoint]:
+def _energy_chart_data(session: Session, device_id: int, day: date) -> list[TimePoint]:
     """That night's per-minute energy as intraday HH:mm points.
 
     One point per ``MinuteMetric.total_energy`` (the F_(d,t) product score),
@@ -106,11 +104,7 @@ async def get_energy_status(
         return BoomResponse(code=0, data=EnergyStatusData())
 
     chart = _energy_chart_data(session, device.id, summary.summary_date)
-    e_d = (
-        summary.energy_start_e
-        if summary.energy_start_e is not None
-        else FIRST_ENERGY
-    )
+    e_d = summary.energy_start_e if summary.energy_start_e is not None else FIRST_ENERGY
     f_d = summary.energy_end_f
     if f_d is None:
         f_d = chart[-1].value / 100.0 if chart else e_d
@@ -176,4 +170,3 @@ async def get_energy_trend(
         start, end = end, start
     points = _energy_trend(session, device.id, start, end)
     return BoomResponse(code=0, data=points)
-

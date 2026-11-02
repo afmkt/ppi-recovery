@@ -7,6 +7,7 @@ from datetime import UTC, date, datetime, time, timedelta
 import numpy as np
 from scipy.interpolate import interp1d
 from scipy.signal import windows
+from sqlalchemy import func, update
 from sqlmodel import Session, col, select
 
 from newboom.boom_compute import (
@@ -18,11 +19,20 @@ from newboom.config import CLEAN_CONTEXT, NIGHT_START_HOUR, night_key
 from newboom.database import engine
 from newboom.model import (
     PPI,
-    AutonomicEpisode,
     ActivityState,
+    DailySummary,
+    DataGap,
     Device,
+    HourlyStatus,
+    Layer,
+    LayerFreshness,
+    MinuteMetric,
     Progress,
+    ReconCheck,
+    Reconciliation,
+    ReconVerdict,
     RmssdSegment,
+    Sleep,
     Task,
     TrendType,
     WindowMetric,
@@ -690,125 +700,238 @@ def _rolling_median(
     return out
 
 
-def _make_autonomic_episode(
-    episode_id: int,
-    night_date: date,
-    valid: list[tuple[WindowState, float, float | None]],
-    start: int,
-    end: int,
-    state: WindowState,
-    step_min: float,
-) -> AutonomicEpisode:
-    """One episode record from a contiguous same-state slice of ``valid``."""
-    chunk = valid[start:end]
-    mids = [v[1] for v in chunk]
-    smooths = [v[2] for v in chunk if v[2] is not None]
-    return AutonomicEpisode(
-        night_date=night_date,
-        episode_id=episode_id,
-        state=state,
-        start_h=mids[0] - step_min / 120.0,
-        end_h=mids[-1] + step_min / 120.0,
-        window_count=len(chunk),
-        duration_min=float(len(chunk) * step_min),
-        lf_hf_median=float(np.median(smooths)) if smooths else None,
+def _max_count(
+    session: Session, model, time_col, device_id: int, extra_where=None
+) -> tuple:
+    """``(max(time_col), count(*))`` for ``device_id`` in one aggregate row."""
+    stmt = select(func.max(time_col), func.count(model.id)).where(
+        model.device_id == device_id
     )
+    if extra_where is not None:
+        stmt = stmt.where(extra_where)
+    row = session.exec(stmt).first()
+    if row:
+        return (row[0], int(row[1] or 0))
+    else:
+        return (None, 0)
 
 
-def build_autonomic_episodes(
-    night_date: date, windows: list[WindowMetric]
-) -> list[AutonomicEpisode]:
-    """Port of the recovery reference ``state_episodes`` (docs/recovery_v06.py):
-    group the night's classified windows into contiguous episodes of one
-    :class:`WindowState`, broken by a state change or a time gap
-    (``> 1.8 ×`` the median 1-min window step). Per-episode ``lf_hf_median``
-    uses the 9-window smoothed LF/HF, matching the reference."""
-    ordered = sorted(windows, key=lambda w: w.window_start)
-    smoothed = _rolling_median([w.lf_hf for w in ordered])
-
-    valid: list[tuple[WindowState, float, float | None]] = []
-    for i, w in enumerate(ordered):
-        st = w.state
-        if st is not None and st != WindowState.INVALID:
-            valid.append((st, w.window_mid_h, smoothed[i]))
-    if not valid:
-        return []
-
-    mids = [v[1] for v in valid]
-    step_min = float(np.median(np.diff(mids)) * 60.0) if len(mids) > 1 else 1.0
-    if not np.isfinite(step_min) or step_min <= 0:
-        step_min = 1.0
-
-    cuts: list[int] = [0]
-    prev_mid: float | None = None
-    for idx in range(1, len(valid)):
-        state, mid, _ = valid[idx]
-        prev_state = valid[idx - 1][0]
-        gap_break = prev_mid is not None and (mid - prev_mid) * 60.0 > step_min * 1.8
-        if state != prev_state or gap_break:
-            cuts.append(idx)
-        prev_mid = mid
-    cuts.append(len(valid))
-
-    episodes: list[AutonomicEpisode] = []
-    for eid, (s, e) in enumerate(zip(cuts, cuts[1:]), 1):
-        episodes.append(
-            _make_autonomic_episode(eid, night_date, valid, s, e, valid[s][0], step_min)
+def _upsert_layer_freshness(
+    session: Session,
+    device_id: int,
+    layer: Layer,
+    latest_data_time,
+    row_count: int,
+    now: datetime,
+) -> None:
+    lag = None if latest_data_time is None else (now - latest_data_time).total_seconds()
+    row = session.exec(
+        select(LayerFreshness)
+        .where(LayerFreshness.device_id == device_id)
+        .where(LayerFreshness.layer == layer)
+    ).first()
+    if row is None:
+        session.add(
+            LayerFreshness(
+                device_id=device_id,
+                layer=layer,
+                latest_data_time=latest_data_time,
+                row_count=row_count,
+                lag_s=lag,
+                last_scan_at=now,
+            )
         )
-    return episodes
+    else:
+        row.latest_data_time = latest_data_time
+        row.row_count = row_count
+        row.lag_s = lag
+        row.last_scan_at = now
+        session.add(row)
 
 
-def process_autonomic_episodes(device_id: int) -> int:
-    """Ports the recovery reference ``state_episodes`` into the
-    :class:`AutonomicEpisode` table (P1-1): per-night episode start/end/duration/
-    window-count/median so the ribbon structure is queryable, not just the
-    per-night balance percentages on :class:`DailySummary`.
+def _recon_verdict(expected: float, observed: float) -> tuple[ReconVerdict, float, str]:
+    """PASS/WARN/FAIL by relative deviation; 10% / 30% bands (1 row ≈ 1 s)."""
+    delta = observed - expected
+    if expected <= 0:
+        if observed <= 0:
+            return ReconVerdict.PASS, delta, "observed and expected both ~0"
+        return ReconVerdict.FAIL, delta, f"expected ~0 but observed={observed}"
+    rel = abs(delta) / expected
+    if rel <= 0.10:
+        verdict = ReconVerdict.PASS
+    elif rel <= 0.30:
+        verdict = ReconVerdict.WARN
+    else:
+        verdict = ReconVerdict.FAIL
+    return verdict, delta, f"observed={observed} expected={expected} rel={rel:.0%}"
 
-    Triggered by fresh WindowMetrics *before* :func:`process_rmssd_segments`
-    clears the flag; idempotent per night (clears old episodes, inserts new).
-    Does not reset ``WindowMetric.fresh`` (rmssd_segments owns that)."""
+
+def record_diagnostics(device_id: int) -> None:
+    """Q1–Q6 pipeline progress/health, one pass per device at the end of the
+    pipeline. Writes the three reporting read-models and is never read back by
+    the pipeline, so a failed diagnostic can only make a report look laggy — it
+    cannot skew processing. The caller wraps this in try/except.
+
+    Q1–Q4 → ``LayerFreshness`` (most-recent time + lag per layer).
+    Q5     → ``DataGap`` (raw coverage of the current calendar day; closed days
+             finalized to immutable).
+    Q6     → ``Reconciliation`` (raw PPI activity vs the most-recent ``Sleep``
+             summary; 1 PPI row ≈ 1 s).
+    """
     with Session(engine) as session:
-        fresh_windows = session.exec(
-            select(WindowMetric)
-            .where(WindowMetric.device_id == device_id)
-            .where(WindowMetric.fresh == True)
-            .order_by(col(WindowMetric.window_start).asc())
-        ).all()
-        if not fresh_windows:
-            return 0
+        now = datetime.now(UTC).replace(tzinfo=None)
 
-        night_dates = {w.night_date for w in fresh_windows}
-        total = 0
-        for night_date in night_dates:
-            all_night = session.exec(
-                select(WindowMetric)
-                .where(WindowMetric.device_id == device_id)
-                .where(WindowMetric.night_date == night_date)
-                .order_by(col(WindowMetric.window_start).asc())
-            ).all()
-            episodes = build_autonomic_episodes(night_date, list(all_night))
+        # --- Q1–Q4: per-layer freshness ---
+        raw_max, raw_n = _max_count(session, PPI, PPI.time, device_id)
+        clean_max, clean_n = _max_count(
+            session, PPI, PPI.time, device_id, col(PPI.ppi_clean).isnot(None)
+        )
+        wm_max, wm_n = _max_count(
+            session, WindowMetric, WindowMetric.window_end, device_id
+        )
+        mm_max, mm_n = _max_count(
+            session, MinuteMetric, MinuteMetric.timestamp, device_id
+        )
+        hs_max, hs_n = _max_count(
+            session, HourlyStatus, HourlyStatus.hour_start, device_id
+        )
+        ds_max, ds_n = _max_count(
+            session, DailySummary, DailySummary.summary_date, device_id
+        )
+        ds_max = datetime(ds_max.year, ds_max.month, ds_max.day) if ds_max else None
+        for layer, latest, n in (
+            (Layer.RAW_PPI, raw_max, raw_n),
+            (Layer.CLEANED_PPI, clean_max, clean_n),
+            (Layer.WINDOW_METRIC, wm_max, wm_n),
+            (Layer.MINUTE_METRIC, mm_max, mm_n),
+            (Layer.HOURLY_STATUS, hs_max, hs_n),
+            (Layer.DAILY_SUMMARY, ds_max, ds_n),
+        ):
+            _upsert_layer_freshness(session, device_id, layer, latest, n, now)
 
-            existing = session.exec(
-                select(AutonomicEpisode)
-                .where(AutonomicEpisode.device_id == device_id)
-                .where(AutonomicEpisode.night_date == night_date)
-            ).all()
-            for e in existing:
-                session.delete(e)
-            # Flush the deletes before adding the replacements: the new
-            # episodes share the (device_id, night_date, episode_id) natural
-            # key with the ones just deleted, and SQLAlchemy would otherwise
-            # emit the INSERT before the pending DELETE, hitting the unique
-            # constraint.
-            session.flush()
+        # --- Q5: raw-PPI coverage of the current calendar day ---
+        current_day = now.date()
+        actual = int(
+            session.exec(
+                select(func.count(col(PPI.id)))
+                .where(col(PPI.device_id) == device_id)
+                .where(func.date(col(PPI.time)) == current_day.isoformat())
+            ).one()
+            or 0
+        )
+        expected_s = 86400
+        gap = session.exec(
+            select(DataGap)
+            .where(DataGap.device_id == device_id)
+            .where(DataGap.gap_date == current_day)
+        ).first()
+        if gap is None:
+            session.add(
+                DataGap(
+                    device_id=device_id,
+                    gap_date=current_day,
+                    expected_s=expected_s,
+                    actual_s=actual,
+                    gap_s=max(expected_s - actual, 0),
+                    gap_pct=100.0 * (expected_s - actual) / expected_s,
+                    coverage_pct=100.0 * actual / expected_s,
+                    is_closed=False,
+                    computed_at=now,
+                )
+            )
+        else:
+            gap.actual_s = actual
+            gap.gap_s = max(expected_s - actual, 0)
+            gap.gap_pct = 100.0 * (expected_s - actual) / expected_s
+            gap.coverage_pct = 100.0 * actual / expected_s
+            gap.is_closed = False
+            gap.computed_at = now
+            session.add(gap)
+        # Finalize (close) any open day strictly before today; O(1) per cycle.
+        session.exec(
+            update(DataGap)
+            .where(col(DataGap.device_id) == device_id)
+            .where(col(DataGap.is_closed).is_(False))
+            .where(col(DataGap.gap_date) < current_day)
+            .values(is_closed=True, computed_at=now)
+        )
 
-            for ep in episodes:
-                ep.device_id = device_id
-                session.add(ep)
-                total += 1
+        # --- Q6: raw PPI activity vs the most-recent Sleep summary ---
+        sleep_row = session.exec(
+            select(Sleep)
+            .where(Sleep.device_id == device_id)
+            .order_by(col(Sleep.time).desc())
+        ).first()
+        if sleep_row is not None:
+            day = sleep_row.time.date()
+            day_start = datetime(day.year, day.month, day.day)
+            day_end = day_start + timedelta(days=1)
+            counts_by_activity: dict[int, int] = {}
+            total_observed = 0
+            for activity, count in session.exec(
+                select(PPI.activity, func.count(col(PPI.id)))
+                .where(PPI.device_id == device_id)
+                .where(col(PPI.time) >= day_start)
+                .where(col(PPI.time) < day_end)
+                .group_by(col(PPI.activity))
+            ).all():
+                ai = int(activity)
+                counts_by_activity[ai] = counts_by_activity.get(ai, 0) + int(count)
+                total_observed += int(count)
+            observed = {
+                ReconCheck.DEEP_SLEEP: counts_by_activity.get(0, 0),
+                ReconCheck.LIGHT_SLEEP: counts_by_activity.get(1, 0),
+                ReconCheck.OTHER_SLEEP: counts_by_activity.get(2, 0),
+                ReconCheck.AWAKE: sum(
+                    counts_by_activity.get(i, 0) for i in (3, 4, 5, 6, 7)
+                ),
+                ReconCheck.TOTAL_COVERAGE: total_observed,
+            }
+            expected = {
+                ReconCheck.DEEP_SLEEP: float(sleep_row.deep_sleep_period),
+                ReconCheck.LIGHT_SLEEP: float(sleep_row.light_sleep_period),
+                ReconCheck.OTHER_SLEEP: float(sleep_row.other_sleep_period),
+                ReconCheck.AWAKE: float(sleep_row.awake_time),
+                ReconCheck.TOTAL_COVERAGE: float(
+                    sleep_row.deep_sleep_period
+                    + sleep_row.light_sleep_period
+                    + sleep_row.other_sleep_period
+                    + sleep_row.awake_time
+                ),
+            }
+            for check, exp in expected.items():
+                obs = observed[check]
+                verdict, delta, detail = _recon_verdict(exp, obs)
+                rec = session.exec(
+                    select(Reconciliation)
+                    .where(Reconciliation.device_id == device_id)
+                    .where(Reconciliation.night_date == day)
+                    .where(Reconciliation.check == check)
+                ).first()
+                if rec is None:
+                    session.add(
+                        Reconciliation(
+                            device_id=device_id,
+                            night_date=day,
+                            check=check,
+                            expected=exp,
+                            observed=obs,
+                            delta=delta,
+                            verdict=verdict,
+                            detail=detail,
+                            computed_at=now,
+                        )
+                    )
+                else:
+                    rec.expected = exp
+                    rec.observed = obs
+                    rec.delta = delta
+                    rec.verdict = verdict
+                    rec.detail = detail
+                    rec.computed_at = now
+                    session.add(rec)
 
         session.commit()
-        return total
 
 
 def process_pipeline(all_devices: list[Device]) -> None:
@@ -817,11 +940,6 @@ def process_pipeline(all_devices: list[Device]) -> None:
         if device.id is not None:
             count = process_window_metrics(device.id)
             print(f"Processed {count} window metrics for device {device.id}")
-            ep_count = process_autonomic_episodes(device.id)
-            if ep_count > 0:
-                print(
-                    f"Built {ep_count} autonomic episodes for device {device.id}"
-                )
             seg_count = process_rmssd_segments(device.id)
             if seg_count > 0:
                 print(
@@ -840,3 +958,9 @@ def process_pipeline(all_devices: list[Device]) -> None:
             hourly_count = process_hourly_status(device.id)
             if hourly_count > 0:
                 print(f"Updated hourly dynamic status for device {device.id}")
+            # Q1–Q6 reporting read-models — diagnostic, best-effort: a failure
+            # here must never abort the pipeline (they are reports, not processing).
+            try:
+                record_diagnostics(device.id)
+            except Exception as e:  # noqa: BLE001
+                print(f"record_diagnostics failed for device {device.id}: {e}")

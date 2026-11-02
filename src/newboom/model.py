@@ -39,13 +39,17 @@ class Device(SQLModel, table=True):
     daily_summary: Mapped[list["DailySummary"]] = Relationship(back_populates="device")
     minute_metrics: Mapped[list["MinuteMetric"]] = Relationship(back_populates="device")
     hourly_status: Mapped[list["HourlyStatus"]] = Relationship(back_populates="device")
-    autonomic_episodes: Mapped[list["AutonomicEpisode"]] = Relationship(
-        back_populates="device",
-    )
     questionnaire_answers: Mapped[list["QuestionnaireAnswer"]] = Relationship(
         back_populates="device"
     )
     coach_conversations: Mapped[list["Conversation"]] = Relationship(
+        back_populates="device"
+    )
+    layer_freshness: Mapped[list["LayerFreshness"]] = Relationship(
+        back_populates="device"
+    )
+    data_gaps: Mapped[list["DataGap"]] = Relationship(back_populates="device")
+    reconciliations: Mapped[list["Reconciliation"]] = Relationship(
         back_populates="device"
     )
 
@@ -227,39 +231,6 @@ class RmssdSegment(SQLModel, table=True):
     # Volatility and Error
     segment_volatility: float = Field(description="Std dev of residuals")
     segment_sse: float = Field(description="Sum of squared errors")
-
-
-class AutonomicEpisode(SQLModel, table=True):
-    """Per-night autonomic ribbon episode (recovery reference ``state_episodes``).
-
-    A contiguous run of windows sharing one classified :class:`WindowState` that
-    is broken by a state change or a time gap (> 1.8× the median 1-min window
-    step), mirroring ``docs/recovery_v06.py``. This is the granular episode
-    structure the per-night balance percentages on :class:`DailySummary`
-    cannot express (P1-1).
-    """
-
-    id: int | None = Field(default=None, primary_key=True)
-    device_id: int = Field(foreign_key="device.id", index=True)
-    device: Device = Relationship(back_populates="autonomic_episodes")
-
-    night_date: date = Field(index=True, description="Night session date")
-    episode_id: int = Field(description="Sequence number within the night (1..n)")
-
-    state: WindowState = Field(description="sympathetic / parasympathetic / transition")
-    start_h: float = Field(description="Episode start, hours from night start")
-    end_h: float = Field(description="Episode end, hours from night start")
-    window_count: int = Field(description="Number of windows in the episode")
-    duration_min: float = Field(description="Episode duration in minutes")
-    lf_hf_median: float | None = Field(
-        default=None, description="Median LF/HF over the episode windows"
-    )
-
-    __table_args__ = (
-        UniqueConstraint(
-            "device_id", "night_date", "episode_id", name="uix_device_night_episode"
-        ),
-    )
 
 
 class DailySummary(SQLModel, table=True):
@@ -483,8 +454,6 @@ class QuestionnaireAnswer(SQLModel, table=True):
     """
 
     id: int | None = Field(default=None, primary_key=True)
-    device_id: int = Field(foreign_key="device.id", index=True)
-    device: Device = Relationship(back_populates="questionnaire_answers")
 
     user_type: str = Field(description="User type value: beginner/serious/professional")
     question: str = Field(description="Submitted question text")
@@ -503,8 +472,6 @@ class Conversation(SQLModel, table=True):
     """
 
     id: int | None = Field(default=None, primary_key=True)
-    device_id: int = Field(foreign_key="device.id", index=True)
-    device: Device = Relationship(back_populates="coach_conversations")
     title: str = Field(default="新对话", unique=True, description="对话标题")
     created_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
     updated_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
@@ -534,3 +501,135 @@ class Message(SQLModel, table=True):
     transcript: str | None = Field(default=None, description="语音转文本(仅语音消息)")
     feedback: str | None = Field(default=None, description="like / dislike (§11.11)")
     created_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline progress / data-health reporting read-models.
+#
+# These are written by the worker's diagnostic stage (``record_diagnostics`` in
+# compute.py) at the end of every pipeline pass and are consumed by reporting /
+# the dashboard, NOT read back by the pipeline. ``Progress`` remains the
+# load-bearing operational cursor (read to resume, written to advance); the
+# three tables below are derived, so a stale or failed diagnostic can only make
+# a report look laggy — it can never skew processing.
+# ---------------------------------------------------------------------------
+
+
+class Layer(StrEnum):
+    """A pipeline layer, ordered raw → derived, for ``LayerFreshness``."""
+
+    RAW_PPI = "raw_ppi"
+    CLEANED_PPI = "cleaned_ppi"
+    WINDOW_METRIC = "window_metric"
+    MINUTE_METRIC = "minute_metric"
+    HOURLY_STATUS = "hourly_status"
+    DAILY_SUMMARY = "daily_summary"
+
+
+class LayerFreshness(SQLModel, table=True):
+    """Q1–Q4: the most-recent data time, row count, and lag back to *now* for
+    each pipeline layer, one upserted row per (device, layer). ``CLEANED_PPI``
+    is distinct from ``RAW_PPI`` so a lagging cleaner shows up as raw-fresh but
+    cleaned-stale. A reporting read-model, derived from the layers above."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    device_id: int = Field(foreign_key="device.id", index=True)
+    device: Device = Relationship(back_populates="layer_freshness")
+
+    layer: Layer = Field(index=True)
+    latest_data_time: NaiveDatetime | None = Field(
+        default=None, description="Max time observed in this layer; NULL if empty"
+    )
+    row_count: int = Field(default=0)
+    lag_s: float | None = Field(
+        default=None, description="now - latest_data_time in seconds; NULL if empty"
+    )
+    last_scan_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("device_id", "layer", name="uix_device_layer"),)
+
+
+class DataGap(SQLModel, table=True):
+    """Q5: raw-PPI coverage of a calendar day vs a full day (``FULL_DAY_S``).
+
+    The current in-progress day is upserted every cycle; a day flips
+    ``is_closed`` and becomes immutable once it elapses. ``gap_pct`` /
+    ``coverage_pct`` are meaningful for closed days only — a closed day should
+    read ~100% coverage when the feed had no holes.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    device_id: int = Field(foreign_key="device.id", index=True)
+    device: Device = Relationship(back_populates="data_gaps")
+
+    gap_date: date = Field(
+        index=True,
+        description="Calendar day (date(time)) the coverage is measured over",
+    )
+    expected_s: int = Field(default=86400, description="Seconds in a full day")
+    actual_s: int = Field(default=0, description="PPI rows observed that day")
+    gap_s: int = Field(default=0, description="max(expected_s - actual_s, 0)")
+    gap_pct: float = Field(
+        default=0.0, description="100 * (expected_s - actual_s) / expected_s"
+    )
+    coverage_pct: float = Field(default=0.0, description="100 * actual_s / expected_s")
+    is_closed: bool = Field(
+        default=False,
+        description="True once the day has elapsed; closed rows are immutable",
+    )
+    computed_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
+    __table_args__ = (
+        UniqueConstraint("device_id", "gap_date", name="uix_device_gap_date"),
+    )
+
+
+class ReconCheck(StrEnum):
+    """A raw-PPI-vs-Sleep reconciliation check (Q6)."""
+
+    DEEP_SLEEP = "deep_sleep"
+    LIGHT_SLEEP = "light_sleep"
+    OTHER_SLEEP = "other_sleep"
+    AWAKE = "awake"
+    TOTAL_COVERAGE = "total_coverage"
+
+
+class ReconVerdict(StrEnum):
+    PASS = "pass"
+    WARN = "warn"
+    FAIL = "fail"
+
+
+class Reconciliation(SQLModel, table=True):
+    """Q6: does the raw PPI activity distribution match the Sleep summary, per
+    (device, night)?
+
+    ``expected`` comes from the ``Sleep`` record (``*_period`` / ``awake_time``,
+    in seconds); ``observed`` is the count of raw PPI rows in that state over
+    the same window — 1 PPI row ≈ 1 second, so the two are directly comparable.
+    ``night_date`` is the calendar day of the Sleep record, matching the
+    dashboard's ``date(time)`` PPI bucketing; a night straddling midnight is
+    therefore compared per calendar day, not the folded ``night_key`` window.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    device_id: int = Field(foreign_key="device.id", index=True)
+    device: Device = Relationship(back_populates="reconciliations")
+
+    night_date: date = Field(index=True, description="Calendar day of the Sleep record")
+    check: ReconCheck = Field(index=True)
+    expected: float | None = Field(
+        default=None, description="From Sleep.*_period / awake_time (s)"
+    )
+    observed: float | None = Field(
+        default=None, description="Raw PPI rows in the state (≈ s)"
+    )
+    delta: float | None = Field(default=None, description="observed - expected")
+    verdict: ReconVerdict = Field(default=ReconVerdict.PASS)
+    detail: str | None = Field(
+        default=None, description="Tolerance band + observed/expected"
+    )
+    computed_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
+    __table_args__ = (
+        UniqueConstraint(
+            "device_id", "night_date", "check", name="uix_device_night_check"
+        ),
+    )

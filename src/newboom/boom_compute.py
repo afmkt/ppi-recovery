@@ -958,10 +958,7 @@ def _resolve_hr_rest(
     """
     if summary is not None and summary.rest_heart_rate_avg is not None:
         return float(summary.rest_heart_rate_avg)
-    if (
-        latest_summary is not None
-        and latest_summary.rest_heart_rate_avg is not None
-    ):
+    if latest_summary is not None and latest_summary.rest_heart_rate_avg is not None:
         return float(latest_summary.rest_heart_rate_avg)
     sleep_hr = sleep_by_night.get(night)
     if sleep_hr is not None and sleep_hr > 0:

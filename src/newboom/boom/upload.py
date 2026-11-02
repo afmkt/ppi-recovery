@@ -101,9 +101,9 @@ async def get_ppi(
 async def upload_ppi(
     req: PPIUploadRequest, session: Session = Depends(get_session)
 ) -> BoomMessage:
-    """10.1 上传 PPI 数据（逐秒分期曲线 + 心率/血氧/PPI）.
+    """10.1 上传 PPI 数据（逐秒分期曲线 + 心率/血氧/PPI).
 
-    new-interface.md §3.1: ``spo2`` 为设备原始值(×10)，落库/上传均用原始值，
+    new-interface.md §3.1: ``spo2`` 为设备原始值(x10)，落库/上传均用原始值，
     仅界面展示时折算百分比；``spo2=0`` 表示该秒设备未给血氧。
     """
     device = _upsert_device(session, req.device, req.address, req.timezone)

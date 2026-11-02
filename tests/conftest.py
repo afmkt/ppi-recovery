@@ -4,6 +4,7 @@ The engine (and every module that imports it) is created at import time from
 ``DATABASE_URL``, so the env var must be set *before* importing
 ``newboom.database``. A per-test truncation gives each test an empty schema.
 """
+
 import os
 import tempfile
 
@@ -15,16 +16,18 @@ from sqlalchemy import text  # noqa: E402
 
 from newboom.database import create_db_and_tables, engine  # noqa: E402
 from newboom.model import (  # noqa: E402
-    AutonomicEpisode,
+    PPI,
     Conversation,
     DailySummary,
+    DataGap,
     Device,
     HourlyStatus,
+    LayerFreshness,
     Message,
     MinuteMetric,
-    PPI,
     Progress,
     QuestionnaireAnswer,
+    Reconciliation,
     RmssdSegment,
     Sleep,
     WindowMetric,
@@ -40,7 +43,6 @@ _TABLES = [
     Sleep,
     WindowMetric,
     RmssdSegment,
-    AutonomicEpisode,
     MinuteMetric,
     DailySummary,
     HourlyStatus,
@@ -48,6 +50,9 @@ _TABLES = [
     Progress,
     Conversation,
     Message,
+    LayerFreshness,
+    DataGap,
+    Reconciliation,
 ]
 
 

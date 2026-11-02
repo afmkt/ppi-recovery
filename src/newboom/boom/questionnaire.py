@@ -61,7 +61,7 @@ _USER_TYPES: list[Option] = [
 
 _QUESTIONS: list[Question] = [
     Question(
-        text="01.前几天连续训练负荷较大，HRV较低但储能情况良好",
+        text="01.前几天连续训练负荷较大, HRV较低但储能情况良好",
         options=[Option(label="是", value="yes"), Option(label="否", value="no")],
     ),
     Question(
@@ -98,7 +98,7 @@ async def get_questionnaire() -> BoomResponse[QuestionnaireData]:
 
 
 @router.post(
-    "/app/{address}/questionnaire/submit",
+    "/app/questionnaire/submit",
     response_model=QuestionnaireSubmitResponse,
 )
 async def submit_questionnaire(
@@ -121,17 +121,9 @@ async def submit_questionnaire(
             code=1, message=f"invalid userType: {body.userType}"
         )
 
-    device = session.exec(select(Device).where(Device.mac == address)).first()
-    if device is None:
-        device = Device(name=address, mac=address)
-        session.add(device)
-        session.commit()
-        session.refresh(device)
-
     for ans in body.answers:
         session.add(
             QuestionnaireAnswer(
-                device_id=device.id or 0,
                 user_type=body.userType,
                 question=ans.question,
                 selected=ans.selected,

@@ -13,6 +13,7 @@ real LLM (swap it via :func:`set_provider`). Streamed replies (§11.4) are
 tracked by a process-local :class:`_StreamRegistry` so §11.10 can interrupt
 an in-flight stream by conversation id.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -61,9 +62,7 @@ class NewConversation(BaseModel):
 class SendResult(BaseModel):
     conversationId: str = Field(default="", description="对话唯一标识")
     messageId: str = Field(default="", description="用户消息ID")
-    aiResponse: CoachMessage = Field(
-        default_factory=CoachMessage, description="AI回复"
-    )
+    aiResponse: CoachMessage = Field(default_factory=CoachMessage, description="AI回复")
 
 
 class WelcomeData(BaseModel):
@@ -139,15 +138,13 @@ class DefaultCoachProvider(CoachProvider):
     """
 
     def reply(self, ctx: CoachContext) -> str:
-        topic = ctx.user_message or (
-            "（语音消息）" if ctx.user_type == "voice" else ""
-        )
+        topic = ctx.user_message or ("（语音消息）" if ctx.user_type == "voice" else "")
         return f"[占位回复] 已收到你的消息：{topic}。"
 
     async def stream(self, ctx: CoachContext) -> AsyncGenerator[str, None]:
         text = self.reply(ctx)
         for i in range(0, len(text), 6):
-            yield text[i:i + 6]
+            yield text[i : i + 6]
 
 
 _provider: CoachProvider = DefaultCoachProvider()
@@ -273,9 +270,9 @@ def _resolve_or_create_conversation(
 
 def _history(session: Session, conversation_id: int) -> list[tuple[str, str]]:
     msgs = session.exec(
-        select(Message).where(Message.conversation_id == conversation_id).order_by(
-            Message.id
-        )
+        select(Message)
+        .where(Message.conversation_id == conversation_id)
+        .order_by(Message.id)
     ).all()
     return [(m.role, m.content) for m in msgs]
 
@@ -361,9 +358,7 @@ async def send_message(
         history=_history(session, conv.id),
     )
     reply = get_provider().reply(ctx)
-    ai_msg = Message(
-        conversation_id=conv.id, role="ai", type="text", content=reply
-    )
+    ai_msg = Message(conversation_id=conv.id, role="ai", type="text", content=reply)
     session.add(ai_msg)
     session.commit()
     session.refresh(ai_msg)
@@ -390,6 +385,7 @@ async def send_message_stream(
     """11.4 发送消息(流式输出) — SSE ``event: message`` chunks, then ``event: done``."""
     device = _device(session, address)
     if device is None:
+
         async def empty() -> AsyncGenerator[str, None]:
             yield _sse("done", StreamEvent(messageId="", content=None, done=True))
 
@@ -429,9 +425,7 @@ async def send_message_stream(
                 chunks.append(chunk)
                 yield _sse(
                     "message",
-                    StreamEvent(
-                        messageId=str(user_id), content=chunk, done=False
-                    ),
+                    StreamEvent(messageId=str(user_id), content=chunk, done=False),
                 )
             full = "".join(chunks)
             # Persist the completed AI turn in a fresh session: the request
