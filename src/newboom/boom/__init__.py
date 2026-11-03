@@ -30,6 +30,7 @@ from newboom.boom.coach import router as coach_router
 from newboom.boom.energy import router as energy_router
 from newboom.boom.home import router as home_router
 from newboom.boom.load import router as load_router
+from newboom.boom.ppi import router as ppi_router
 from newboom.boom.questionnaire import router as questionnaire_router
 from newboom.boom.sleep import router as sleep_router
 from newboom.boom.status import router as status_router
@@ -49,5 +50,7 @@ router.include_router(calendar_router)
 router.include_router(questionnaire_router)
 router.include_router(upload_router)
 router.include_router(coach_router)
+# Legacy raw PPI read (compat shim, raw-list contract — not a doc page).
+router.include_router(ppi_router)
 
 __all__ = ["router"]
