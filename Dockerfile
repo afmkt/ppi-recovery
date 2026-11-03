@@ -40,10 +40,17 @@ ENV DATABASE_URL=sqlite:////app/data/newboom.db \
 # /app/data is writable and is chowned to the app user so the first (empty)
 # volume inherits UID 10001 ownership. The chown lives in this cached layer so
 # it only re-runs when the project layer changes.
+#
+# The app user also gets a real, writable home dir (/home/app). Without it,
+# HOME=/home/app (the useradd default) points at a path that neither exists nor
+# can be created by uid 10001 (/home is root:755), so marimo's config manager
+# fails to create ~/.config/marimo/ and logs at every startup:
+#   "Encountered error when searching for config: [Errno 13]
+#    Permission denied: '/home/app'"  (marimo/_config/manager.py)
 RUN groupadd --gid 10001 app \
-    && useradd --uid 10001 --gid app --shell /usr/sbin/nologin --no-create-home app \
-    && mkdir -p /app/data \
-    && chown -R app:app /app
+    && useradd --uid 10001 --gid app --shell /usr/sbin/nologin --home /home/app app \
+    && mkdir -p /app/data /home/app \
+    && chown -R app:app /app /home/app
 
 VOLUME ["/app/data"]
 
