@@ -55,6 +55,58 @@ def view_device(get_device, mo):
 
 
 @app.cell
+def _(get_device, mo, engine, pd):
+    def query(sql: str) -> pd.DataFrame:
+        return pd.read_sql(sql, engine)
+
+    dv = get_device()
+    if dv is None:
+        view = mo.md("Select a device")
+        prog = layers = prod = None
+    else:
+        device_id = int(dv["id"])
+
+        # Progress tables
+        from dashboard import metrics as m
+
+        prog = m.aggregation_progress(query, device_id)
+        prod = m.aggregation_production(query, device_id)
+        layers = m.layer_freshness(query, device_id)  # after you add it
+        gaps = m.data_gap_chart(query, device_id)  # or return df + chart separately
+
+        summary = mo.md(
+            f"### Pipeline progress — `{dv['mac']}`\n"
+            f"Raw PPI max feeds the lag numbers below."
+        )
+
+        # Tables
+        prog_table = mo.ui.table(prog[["task", "end_time", "age", "lag_raw"]])
+        layer_table = mo.ui.table(
+            layers[["layer", "latest_data_time", "row_count", "lag"]]
+        )
+
+        # Charts
+        prod_chart = m.production_chart(prod)
+        lag_chart = m.layer_lag_chart(layers)
+
+        view = mo.vstack(
+            [
+                summary,
+                mo.md("#### Task watermarks (`progress`)"),
+                prog_table,
+                mo.md("#### Layer lag (`layerfreshness`)"),
+                layer_table,
+                lag_chart,
+                mo.md("#### Downstream production"),
+                prod_chart,
+                mo.md("#### Coverage gaps"),
+                gaps,
+            ]
+        )
+    return view, prog, layers, prod
+
+
+@app.cell
 def _(mo, sidebar, device_view):
     mo.hstack([sidebar, device_view], gap=0.5)
 

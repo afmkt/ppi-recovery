@@ -3,8 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import threading
-import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -22,18 +20,41 @@ logger = logging.getLogger("newboom.worker")
 WORKER_INTERVAL_S = float(os.getenv("WORKER_INTERVAL_S", "10"))
 WORKER_STALE_S = float(os.getenv("WORKER_STALE_S", "30"))
 
+# Run the Q1–Q6 reporting read-models (record_diagnostics) on at most every
+# Nth cycle. They're dashboard-only health reports, not pipeline inputs, so
+# skipping them on idle cycles keeps a frozen device near-zero-cost. Throttled
+# by cycle count, not wall-clock: with WORKER_INTERVAL_S=10, N=6 ≈ 1 min.
+# Clamped to >=1 so a bad env value can't cause a ZeroDivisionError.
+DIAGNOSTICS_EVERY_N_CYCLES = max(1, int(os.getenv("DIAGNOSTICS_EVERY_N_CYCLES", "6")))
+
 
 async def background_worker_loop() -> None:
 
+    cycle = 0
     while True:
         try:
-            with Session(engine) as session:
-                all_devices = session.exec(select(Device)).all()
-                process_pipeline(list(all_devices))
+            # The Q1–Q6 reporting read-models are throttled to every
+            # DIAGNOSTICS_EVERY_N_CYCLES-th cycle; processing runs every cycle.
+            run_diagnostics = (cycle % DIAGNOSTICS_EVERY_N_CYCLES) == 0
+            # The pipeline is CPU- and I/O-bound and, if run inline, would block
+            # the single uvicorn event loop for the whole cycle (~seconds),
+            # freezing /api/upload, the boom endpoints, the dashboard and even
+            # /healthz. Offloading it to a worker thread keeps the loop free to
+            # serve HTTP between cycles. Each pipeline stage opens its own
+            # Session, so the thread is independent of the loop's sessions.
+            await asyncio.to_thread(_run_pipeline_cycle, run_diagnostics)
 
-        except Exception as e:  # a bad cycle must not kill the loop
+        except Exception:  # a bad cycle must not kill the loop
             logger.exception("background worker cycle failed")
+        cycle += 1
         await asyncio.sleep(WORKER_INTERVAL_S)
+
+
+def _run_pipeline_cycle(run_diagnostics: bool) -> None:
+    """One worker cycle, executed off the event loop by ``to_thread``."""
+    with Session(engine) as session:
+        all_devices = session.exec(select(Device)).all()
+        process_pipeline(list(all_devices), run_diagnostics=run_diagnostics)
 
 
 @asynccontextmanager

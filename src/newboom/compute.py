@@ -402,14 +402,32 @@ def process_window_metrics(device_id: int) -> int:
             session.commit()
             session.refresh(progress)
 
+        # Idle short-circuit: if the newest PPI is already at or behind the
+        # processed cursor, this device has no new data and its last night is
+        # already built — skip so a frozen device (data stopped) doesn't
+        # re-render its last night every cycle. Watermark = Progress.end_time
+        # (the resume cursor); max(PPI.time) shows the cursor is caught up. A
+        # backfill older than the cursor wouldn't be caught, but PPI is
+        # appended chronologically.
+        if progress.end_time is not None:
+            max_ppi = session.exec(
+                select(func.max(PPI.time)).where(PPI.device_id == device_id)
+            ).one()
+            if max_ppi is not None and max_ppi <= progress.end_time:
+                return 0
+
         # Determine start time based on last processed window, or default to 7 days ago
         start_time = progress.end_time
         if not start_time:
             # Look at the earliest available PPI or default to 7 days ago
+            # Limit to 1: an unbounded `order_by(time).first()` materializes the
+            # entire PPI table through the ORM to read a single row (~6s on a
+            # 1M-row device). The index seek with LIMIT 1 is sub-millisecond.
             earliest_ppi = session.exec(
                 select(PPI)
                 .where(PPI.device_id == device_id)
                 .order_by(col(PPI.time).asc())
+                .limit(1)
             ).first()
             start_time = earliest_ppi.time if earliest_ppi else datetime.now(UTC)
 
@@ -934,7 +952,16 @@ def record_diagnostics(device_id: int) -> None:
         session.commit()
 
 
-def process_pipeline(all_devices: list[Device]) -> None:
+def process_pipeline(
+    all_devices: list[Device], run_diagnostics: bool = True
+) -> None:
+    """Run one pipeline pass over ``all_devices``.
+
+    ``run_diagnostics`` gates the best-effort Q1–Q6 reporting read-models
+    (``record_diagnostics``). They're dashboard-only health reports, not
+    pipeline inputs, so the worker can skip them on most cycles (throttled)
+    without affecting processing.
+    """
     clean_ppi(all_devices)
     for device in all_devices:
         if device.id is not None:
@@ -959,8 +986,11 @@ def process_pipeline(all_devices: list[Device]) -> None:
             if hourly_count > 0:
                 print(f"Updated hourly dynamic status for device {device.id}")
             # Q1–Q6 reporting read-models — diagnostic, best-effort: a failure
-            # here must never abort the pipeline (they are reports, not processing).
-            try:
-                record_diagnostics(device.id)
-            except Exception as e:  # noqa: BLE001
-                print(f"record_diagnostics failed for device {device.id}: {e}")
+            # here must never abort the pipeline (they are reports, not
+            # processing). Throttled by the worker via run_diagnostics so a
+            # fully-idle cycle skips the always-on reporting work.
+            if run_diagnostics:
+                try:
+                    record_diagnostics(device.id)
+                except Exception as e:  # noqa: BLE001
+                    print(f"record_diagnostics failed for device {device.id}: {e}")

@@ -995,10 +995,14 @@ def process_minute_metric(device_id: int) -> int:
 
         start_time = progress.end_time
         if not start_time:
+            # Limit to 1: an unbounded `order_by(time).first()` materializes the
+            # entire PPI table through the ORM to read a single row (~6s on a
+            # 1M-row device). The index seek with LIMIT 1 is sub-millisecond.
             earliest_ppi = session.exec(
                 select(PPI)
                 .where(PPI.device_id == device_id)
                 .order_by(col(PPI.time).asc())
+                .limit(1)
             ).first()
             start_time = earliest_ppi.time if earliest_ppi else datetime.min
 
@@ -1413,9 +1417,15 @@ def process_daily_summary_pipeline(device_id: int) -> int:
             .where(Progress.task == Task.DAILY_SUMMARY)
         ).first()
 
-        # Find the absolute earliest PPI date for this device as our baseline start
+        # Find the absolute earliest PPI date for this device as our baseline start.
+        # Limit to 1: an unbounded `order_by(time).first()` materializes the entire
+        # PPI table through the ORM to read one row (~6s on a 1M-row device); the
+        # index seek with LIMIT 1 is sub-millisecond. Runs every worker cycle.
         earliest_ppi = session.exec(
-            select(PPI).where(PPI.device_id == device_id).order_by(col(PPI.time).asc())
+            select(PPI)
+            .where(PPI.device_id == device_id)
+            .order_by(col(PPI.time).asc())
+            .limit(1)
         ).first()
 
         if not earliest_ppi:

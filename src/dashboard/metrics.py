@@ -19,11 +19,11 @@ from altair.typing import EncodeKwds
 # --- physiological sanity bounds --------------------------------------------
 # Device-raw scale. See docs/new-interface.md §3.1: spo2 is stored raw ×10
 # (950 = 95.0%); a 0 means "device did not report spo2 this second", not 0%.
-HR_MIN, HR_MAX = 30, 220        # bpm
+HR_MIN, HR_MAX = 30, 220  # bpm
 SPO2_MIN, SPO2_MAX = 800, 1000  # raw ×10 -> 80.0% .. 100.0%
-PPI_MIN, PPI_MAX = 300, 2000    # ms between two beats
-STALE_HOURS = 48.0              # ingestion considered stale past this age
-FULL_DAY_S = 86_400            # seconds in a full per-second ingestion day
+PPI_MIN, PPI_MAX = 300, 2000  # ms between two beats
+STALE_HOURS = 48.0  # ingestion considered stale past this age
+FULL_DAY_S = 86_400  # seconds in a full per-second ingestion day
 
 
 # ===========================================================================
@@ -36,6 +36,8 @@ def fmt_dur(hours) -> str:
     try:
         hours = float(hours)
     except (TypeError, ValueError):
+        return "—"
+    if math.isnan(hours):
         return "—"
     if hours < 0:
         return f"-{abs(hours):.1f}h"
@@ -69,6 +71,16 @@ def fmt_num(x, digits=0) -> str:
         return f"{v:,.{digits}f}"
     except (TypeError, ValueError):
         return "—"
+
+
+def _chart_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop rows with any missing value before handing a frame to Altair.
+
+    A NULL/NaT cell means the layer/day has no data yet; Altair's JSON export
+    (``to_json(allow_nan=False)``) rejects NaN/NaT, so such rows are omitted
+    rather than crashing the dashboard.
+    """
+    return df.dropna()
 
 
 # ===========================================================================
@@ -113,7 +125,8 @@ def fleet_freshness(query, devices: pd.DataFrame) -> pd.DataFrame:
         ("DAILY_SUMMARY", "daily"),
     ):
         raw[col] = (
-            pd.NaT if task not in piv.columns
+            pd.NaT
+            if task not in piv.columns
             else pd.to_datetime(raw[task], errors="coerce")
         )
         raw[f"lag_{col}_h"] = (now - raw[col]).dt.total_seconds() / 3600.0
@@ -156,7 +169,12 @@ def throughput_chart(daily: pd.DataFrame):
     }
     if "device" in daily.columns:
         enc["color"] = alt.Color("device:N", title="device")
-    base = alt.Chart(daily).mark_bar().encode(**enc).properties(width=560, height=260)
+    base = (
+        alt.Chart(_chart_df(daily))
+        .mark_bar()
+        .encode(**enc)
+        .properties(width=560, height=260)
+    )
     layer = alt.Chart(ref).mark_rule(color="crimson", strokeDash=[4, 2]).encode(y="v:Q")
     return base + layer
 
@@ -220,7 +238,9 @@ def ingestion_summary(meta: dict) -> str:
 def aggregation_progress(query, device_id: int) -> pd.DataFrame:
     """Task watermarks with age and lag back to the raw PPI feed."""
     raw_max = pd.to_datetime(
-        query(f"select max(time) t from ppi where device_id = {int(device_id)}").iloc[0]["t"],
+        query(f"select max(time) t from ppi where device_id = {int(device_id)}").iloc[
+            0
+        ]["t"],
         errors="coerce",
     )
     prog = query(
@@ -255,7 +275,7 @@ def production_chart(prod: pd.DataFrame):
     """Grouped bar of windowmetric vs minutemetric rows/day."""
     melt = prod.melt(id_vars="day", var_name="metric", value_name="n")
     return (
-        alt.Chart(melt)
+        alt.Chart(_chart_df(melt))
         .mark_bar()
         .encode(
             x=alt.X("day:T", title="date", scale=alt.Scale(zero=False)),
@@ -307,13 +327,22 @@ def quality_checks(s: pd.Series) -> pd.DataFrame:
         verdict = "PASS" if oob == 0 else ("WARN" if pct < 5 else "FAIL")
         checks.append([metric, f"{oob:,} ({pct:.1f}%)", verdict, note])
 
-    add("HR out of band", s["hr_oob"],
-        f"outside {HR_MIN}–{HR_MAX} bpm (min {fmt_num(s['hr_min'])}, max {fmt_num(s['hr_max'])})")
+    add(
+        "HR out of band",
+        s["hr_oob"],
+        f"outside {HR_MIN}–{HR_MAX} bpm (min {fmt_num(s['hr_min'])}, max {fmt_num(s['hr_max'])})",
+    )
     add("SpO₂ not reported", s["spo2_zero"], "spo2 = 0 (no report this second)")
-    add("SpO₂ out of band", s["spo2_oob"],
-        f"outside {SPO2_MIN}–{SPO2_MAX} raw (80–100%)")
-    add("PPI out of band", s["ppi_oob"],
-        f"outside {PPI_MIN}–{PPI_MAX} ms (min {fmt_num(s['ppi_min'])}, max {fmt_num(s['ppi_max'])})")
+    add(
+        "SpO₂ out of band",
+        s["spo2_oob"],
+        f"outside {SPO2_MIN}–{SPO2_MAX} raw (80–100%)",
+    )
+    add(
+        "PPI out of band",
+        s["ppi_oob"],
+        f"outside {PPI_MIN}–{PPI_MAX} ms (min {fmt_num(s['ppi_min'])}, max {fmt_num(s['ppi_max'])})",
+    )
     return pd.DataFrame(checks, columns=["check", "count", "verdict", "note"])
 
 
@@ -350,7 +379,7 @@ def window_summary(query, device_id: int) -> dict:
 def state_chart(states: pd.DataFrame):
     """Horizontal bar of window counts by autonomic state."""
     return (
-        alt.Chart(states)
+        alt.Chart(_chart_df(states))
         .mark_bar()
         .encode(
             x=alt.X("windows:Q", title="windows"),
@@ -378,4 +407,67 @@ def daily_summary(query, device_id: int, limit: int = 14) -> pd.DataFrame:
                    rest_heart_rate_val as rhr, hrv_night_val as hrv
             from dailysummary where device_id = {int(device_id)}
             order by summary_date desc limit {int(limit)}"""
+    )
+
+
+# Add to metrics.py
+def layer_freshness(query, device_id: int) -> pd.DataFrame:
+    df = query(
+        f"""
+        select layer, latest_data_time, row_count, lag_s, last_scan_at
+        from layerfreshness
+        where device_id = {int(device_id)}
+        order by case layer
+            when 'raw_ppi' then 1 when 'cleaned_ppi' then 2
+            when 'window_metric' then 3 when 'minute_metric' then 4
+            when 'hourly_status' then 5 when 'daily_summary' then 6
+        end
+        """
+    )
+    df["latest_data_time"] = pd.to_datetime(df["latest_data_time"], errors="coerce")
+    df["lag_h"] = df["lag_s"] / 3600.0
+    df["lag"] = df["lag_h"].apply(fmt_dur)
+    return df
+
+
+def layer_lag_chart(df: pd.DataFrame):
+    """Horizontal bar of lag (hours) per pipeline layer."""
+    return (
+        alt.Chart(_chart_df(df))
+        .mark_bar()
+        .encode(
+            x=alt.X("lag_h:Q", title="lag (hours)"),
+            y=alt.Y("layer:N", title="layer", sort=None),
+            color=alt.condition(
+                alt.datum.lag_h > 1,  # threshold you care about
+                alt.value("crimson"),
+                alt.value("steelblue"),
+            ),
+            tooltip=["layer", "lag", "row_count", "latest_data_time"],
+        )
+        .properties(width=480, height=220, title="Pipeline layer lag")
+    )
+
+
+def data_gap_chart(query, device_id: int, limit: int = 30):
+    df = query(
+        f"""
+        select gap_date as day, coverage_pct, gap_pct, is_closed
+        from datagap
+        where device_id = {int(device_id)}
+        order by gap_date desc limit {int(limit)}
+        """
+    )
+    return (
+        alt.Chart(_chart_df(df))
+        .mark_bar()
+        .encode(
+            x=alt.X("day:T", title="date"),
+            y=alt.Y(
+                "coverage_pct:Q", title="coverage %", scale=alt.Scale(domain=[0, 100])
+            ),
+            color=alt.Color("is_closed:N"),
+            tooltip=["day", "coverage_pct", "gap_pct", "is_closed"],
+        )
+        .properties(width=560, height=220, title="Daily PPI coverage")
     )
