@@ -272,17 +272,25 @@ def aggregation_production(query, device_id: int) -> pd.DataFrame:
 
 
 def production_chart(prod: pd.DataFrame):
-    """Grouped bar of windowmetric vs minutemetric rows/day."""
-    melt = prod.melt(id_vars="day", var_name="metric", value_name="n")
+    """Grouped bar of windowmetric vs minutemetric rows/day.
+
+    The two series are relabeled to human names so the legend and tooltip read
+    ``Window metric`` / ``Minute metric`` instead of the raw columns ``n_wm`` /
+    ``n_mm``.
+    """
+    melt = (
+        prod.rename(columns={"n_wm": "Window metric", "n_mm": "Minute metric"})
+        .melt(id_vars="day", var_name="metric", value_name="n")
+    )
     return (
         alt.Chart(_chart_df(melt))
         .mark_bar()
         .encode(
             x=alt.X("day:T", title="date", scale=alt.Scale(zero=False)),
             y=alt.Y("n:Q", title="rows / day"),
-            color=alt.Color("metric:N", title="metric"),
+            color=alt.Color("metric:N", title=""),
         )
-        .properties(width=560, height=240)
+        .properties(width=560, height=240, title="Downstream production — rows / day")
     )
 
 
@@ -410,23 +418,58 @@ def daily_summary(query, device_id: int, limit: int = 14) -> pd.DataFrame:
     )
 
 
-# Add to metrics.py
-def layer_freshness(query, device_id: int) -> pd.DataFrame:
+# Pipeline layer order (raw -> derived) and human labels. The DB stores the layer
+# enum name (e.g. RAW_PPI), so ordering/labels are matched case-insensitively.
+_LAYER_ORDER = [
+    "raw_ppi", "cleaned_ppi", "window_metric",
+    "minute_metric", "hourly_status", "daily_summary",
+]
+LAYER_LABELS = {
+    "raw_ppi": "Raw PPI",
+    "cleaned_ppi": "Cleaned PPI",
+    "window_metric": "Window",
+    "minute_metric": "Minute",
+    "hourly_status": "Hourly",
+    "daily_summary": "Daily",
+}
+
+
+def layer_freshness(query, device_id: int, now=None) -> pd.DataFrame:
+    """Six pipeline layers (raw -> derived): newest data time, row count, lag.
+
+    ``lag`` is *live* when ``now`` is given (``now - latest_data_time`` — a frozen
+    device reads stale, which is the point of a status view); when omitted it
+    falls back to the worker's stored ``lag_s`` (as of the last diagnostic scan).
+    NULL data times render as ``—`` (no data yet), never NaN. A ``stage`` column
+    holds the human label for each layer.
+    """
     df = query(
         f"""
         select layer, latest_data_time, row_count, lag_s, last_scan_at
         from layerfreshness
         where device_id = {int(device_id)}
-        order by case layer
-            when 'raw_ppi' then 1 when 'cleaned_ppi' then 2
-            when 'window_metric' then 3 when 'minute_metric' then 4
-            when 'hourly_status' then 5 when 'daily_summary' then 6
-        end
         """
     )
     df["latest_data_time"] = pd.to_datetime(df["latest_data_time"], errors="coerce")
-    df["lag_h"] = df["lag_s"] / 3600.0
+    if now is None:
+        df["lag_h"] = df["lag_s"] / 3600.0
+    else:
+        # Live lag. Normalize both sides to naive so the subtraction can't crash
+        # on a tz mismatch: the worker stores naive-UTC timestamps, but a
+        # caller may hand us a tz-aware ``now`` (pd.Timestamp.now("UTC")).
+        now_ts = pd.Timestamp(now)
+        if now_ts.tz is not None:
+            now_ts = now_ts.tz_localize(None)
+        latest = df["latest_data_time"]
+        if latest.dt.tz is not None:
+            latest = latest.dt.tz_localize(None)
+        df["lag_h"] = (now_ts - latest).dt.total_seconds() / 3600.0
     df["lag"] = df["lag_h"].apply(fmt_dur)
+    df["stage"] = df["layer"].str.lower().map(LAYER_LABELS).fillna(df["layer"])
+    df["_order"] = df["layer"].str.lower().map(
+        {name: i for i, name in enumerate(_LAYER_ORDER)}
+    )
+    df = df.sort_values("_order", kind="stable").drop(columns="_order")
     return df
 
 
@@ -449,25 +492,47 @@ def layer_lag_chart(df: pd.DataFrame):
     )
 
 
-def data_gap_chart(query, device_id: int, limit: int = 30):
-    df = query(
-        f"""
-        select gap_date as day, coverage_pct, gap_pct, is_closed
-        from datagap
-        where device_id = {int(device_id)}
-        order by gap_date desc limit {int(limit)}
-        """
+def coverage_chart(daily: pd.DataFrame, full_day_s: float = FULL_DAY_S) -> alt.Chart:
+    """Per-day raw-PPI coverage: one stacked bar per calendar day.
+
+    Each day is a full-height (100%) bar split into a *Covered* segment (the PPI
+    rows actually ingested that day) and a *Gap* segment (the rest of a full
+    day), so a 0%-coverage day reads as a solid gap bar instead of an absent
+    one. Days with no PPI at all are filled in from the observed day range as
+    100%-gap bars, so a broken feed shows up as a visible gap in the row.
+    """
+    d = daily[["day", "rows"]].copy()
+    if d.empty:
+        return alt.Chart(pd.DataFrame(columns=["day"])).mark_bar().properties(
+            width=560, height=240, title="Daily PPI coverage — no data"
+        )
+    d["day"] = pd.to_datetime(d["day"]).dt.normalize()
+    # Fill the whole observed range so missing days become full-gap bars.
+    rng = pd.date_range(d["day"].min(), d["day"].max(), freq="D")
+    d = d.set_index("day").reindex(rng, fill_value=0).reset_index()
+    d.columns = ["day", "rows"]
+    d["rows"] = d["rows"].clip(upper=full_day_s)
+    d["covered_pct"] = 100.0 * d["rows"] / full_day_s
+    d["gap_pct"] = 100.0 - d["covered_pct"]
+    long = d.melt(
+        id_vars="day", var_name="part", value_name="pct",
+        value_vars=["covered_pct", "gap_pct"],
     )
+    long["part"] = long["part"].map({"covered_pct": "Covered", "gap_pct": "Gap"})
     return (
-        alt.Chart(_chart_df(df))
+        alt.Chart(_chart_df(long))
         .mark_bar()
         .encode(
-            x=alt.X("day:T", title="date"),
+            x=alt.X("day:T", title="date", scale=alt.Scale(zero=False)),
             y=alt.Y(
-                "coverage_pct:Q", title="coverage %", scale=alt.Scale(domain=[0, 100])
+                "pct:Q", title="coverage %", stack=True, scale=alt.Scale(domain=[0, 100])
             ),
-            color=alt.Color("is_closed:N"),
-            tooltip=["day", "coverage_pct", "gap_pct", "is_closed"],
+            color=alt.Color(
+                "part:N",
+                title="",
+                scale=alt.Scale(domain=["Covered", "Gap"], range=["#2ca02c", "#d62728"]),
+            ),
+            tooltip=["day", "part", alt.Tooltip("pct:Q", title="pct", format=".1f")],
         )
-        .properties(width=560, height=220, title="Daily PPI coverage")
+        .properties(width=560, height=240, title="Daily PPI coverage — covered vs gap")
     )

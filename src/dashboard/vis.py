@@ -45,65 +45,90 @@ def connect_db(sql, pd):
 
 
 @app.cell
-def view_device(get_device, mo):
-    _dv = get_device()
-    if _dv is None:
-        device_view = mo.md("## Please select a device")
-    else:
-        device_view = mo.md(f"## {_dv['mac']}")
-    return (device_view,)
+def view_device(get_device, mo, pd, engine):
+    from dashboard import metrics as m
+    from dashboard.metrics import fmt_num, fmt_ts
 
-
-@app.cell
-def _(get_device, mo, engine, pd):
     def query(sql: str) -> pd.DataFrame:
         return pd.read_sql(sql, engine)
 
     dv = get_device()
     if dv is None:
-        view = mo.md("Select a device")
-        prog = layers = prod = None
+        device_view = mo.md("## Please select a device")
     else:
         device_id = int(dv["id"])
+        now = pd.Timestamp.now("UTC").tz_localize(None)  # naive UTC, matches worker
 
-        # Progress tables
-        from dashboard import metrics as m
+        # 1 — health banner: latest PPI, age, LIVE/STALE, row counts
+        meta = m.ingestion_meta(query, device_id)
+        banner = mo.md(m.ingestion_summary(meta))
 
+        # 2 — pipeline flow: 6 stages, raw -> derived, live lag per stage
+        stages = m.layer_freshness(query, device_id, now=now)
+        items = []
+        for pos, (_, s) in enumerate(stages.iterrows()):
+            rows = fmt_num(int(s["row_count"])) if pd.notna(s["row_count"]) else "0"
+            items.append(
+                mo.md(
+                    f"**{s['stage']}**\n"
+                    f"last {fmt_ts(s['latest_data_time'])}\n"
+                    f"lag {s['lag']} · {rows} rows"
+                )
+            )
+            if pos < len(stages) - 1:
+                items.append(mo.md("→"))
+        pipeline = (
+            mo.hstack(items, gap=0.2)
+            if items
+            else mo.md("*no layer data yet*")
+        )
+
+        # 3 — task watermarks: progress cursors and their lag back to the raw feed
         prog = m.aggregation_progress(query, device_id)
-        prod = m.aggregation_production(query, device_id)
-        layers = m.layer_freshness(query, device_id)  # after you add it
-        gaps = m.data_gap_chart(query, device_id)  # or return df + chart separately
-
-        summary = mo.md(
-            f"### Pipeline progress — `{dv['mac']}`\n"
-            f"Raw PPI max feeds the lag numbers below."
-        )
-
-        # Tables
         prog_table = mo.ui.table(prog[["task", "end_time", "age", "lag_raw"]])
-        layer_table = mo.ui.table(
-            layers[["layer", "latest_data_time", "row_count", "lag"]]
+
+        # 4 — downstream production: windowmetric vs minutemetric rows/day
+        prod = m.aggregation_production(query, device_id)
+        prod_chart = (
+            m.production_chart(prod)
+            if not prod.empty
+            else mo.md("*no downstream production yet*")
         )
 
-        # Charts
-        prod_chart = m.production_chart(prod)
-        lag_chart = m.layer_lag_chart(layers)
+        # 5 — daily coverage: stacked covered/gap per day + top gappy closed days
+        daily = m.ingestion_daily(query, device_id)
+        coverage = (
+            m.coverage_chart(daily)
+            if not daily.empty
+            else mo.md("*no PPI data yet*")
+        )
+        gaps = (
+            m.ingestion_gaps(daily, meta["last"])
+            if not pd.isna(meta["last"])
+            else pd.DataFrame(columns=["day", "rows", "gap_pct"])
+        )
+        gap_table = (
+            mo.ui.table(gaps)
+            if not gaps.empty
+            else mo.md("*no closed-day gaps yet*")
+        )
 
-        view = mo.vstack(
+        device_view = mo.vstack(
             [
-                summary,
-                mo.md("#### Task watermarks (`progress`)"),
+                mo.md(f"## {dv['mac']} — ingestion"),
+                banner,
+                mo.md("### Pipeline"),
+                pipeline,
+                mo.md("### Task watermarks"),
                 prog_table,
-                mo.md("#### Layer lag (`layerfreshness`)"),
-                layer_table,
-                lag_chart,
-                mo.md("#### Downstream production"),
+                mo.md("### Downstream production"),
                 prod_chart,
-                mo.md("#### Coverage gaps"),
-                gaps,
+                mo.md("### Daily coverage"),
+                coverage,
+                gap_table,
             ]
         )
-    return view, prog, layers, prod
+    return (device_view,)
 
 
 @app.cell
