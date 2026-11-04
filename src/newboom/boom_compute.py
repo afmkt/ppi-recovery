@@ -1406,6 +1406,14 @@ def process_daily_summary_pipeline(device_id: int) -> int:
     """
     Computes daily summaries day-by-day from the earliest available PPI up to the
     device's local today, finalizing each closed day (energy / ATL / CTL / TSB).
+
+    Closed days (``< today``) are processed once each and the cursor advances past
+    every one of them, summary or not, so a genuinely empty night (no PPI) does not
+    stall later days. The *open* (current) day is instead recomputed on every pass,
+    independent of the cursor: its data still arrives after local midnight, and the
+    cursor is left at the last *closed* day so the open day is re-processed rather
+    than frozen at its 00:00 (empty) snapshot. That is what previously left an active
+    device that started streaming mid-day with a zeroed ``/go`` forever.
     """
     with Session(engine) as session:
         device = session.exec(select(Device).where(Device.id == device_id)).first()
@@ -1455,23 +1463,30 @@ def process_daily_summary_pipeline(device_id: int) -> int:
         target_date = last_processed_date + timedelta(days=1)
 
         processed_count = 0
-        while target_date <= today:
-            # Run the formal / temporary summary calculation for this date
-            summary = process_daily_summary(device_id, target_date)
-            if summary:
+        # Closed days: process each once and advance the cursor past it whether or
+        # not a summary was produced, so a genuinely empty night does not stall
+        # later days (PPI is appended chronologically, so a closed date gains no
+        # windows after it is passed).
+        while target_date < today:
+            if process_daily_summary(device_id, target_date) is not None:
                 processed_count += 1
                 # Close the day so the next day's E_d chains off this F_d
-                if target_date < today:
-                    _finalize_one_day(device_id, target_date)
-
+                _finalize_one_day(device_id, target_date)
             # Advance progress cursor (naive local midnight, matches storage)
             progress.end_time = datetime(
                 target_date.year, target_date.month, target_date.day
             )
             session.add(progress)
             session.commit()
-
             target_date += timedelta(days=1)
+
+        # Open (current) day: recompute a rolling summary every cycle,
+        # independent of the cursor, so data arriving after local midnight is
+        # reflected and a mid-day-starting device is not frozen at its empty
+        # 00:00 snapshot. The cursor stays at the last *closed* day, so the day
+        # is closed+finalized once it rolls into the past.
+        if process_daily_summary(device_id, today) is not None:
+            processed_count += 1
 
         # Backfill any closed days created earlier that were never finalized.
         finalize_daily_summaries(device_id)
