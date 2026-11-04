@@ -24,7 +24,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, File, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlmodel import Session, select
+from sqlmodel import Session, col, select
 
 from newboom.boom.schemas import BoomMessage, BoomResponse
 from newboom.database import engine, get_session
@@ -126,7 +126,7 @@ class CoachProvider:
     def reply(self, ctx: CoachContext) -> str:
         raise NotImplementedError
 
-    async def stream(self, ctx: CoachContext) -> AsyncGenerator[str, None]:
+    def stream(self, ctx: CoachContext) -> AsyncGenerator[str, None]:
         raise NotImplementedError
 
 
@@ -258,10 +258,12 @@ def _resolve_or_create_conversation(
 ) -> Conversation:
     """The device's existing conversation, or a fresh one when ``conversation_id`` is None/unknown."""
     if conversation_id:
-        existing = _get_conversation(session, device.id, conversation_id)
+        existing = _get_conversation(
+            session, device.id if device.id else -1, conversation_id
+        )
         if existing is not None:
             return existing
-    conv = Conversation(device_id=device.id)
+    conv = Conversation(device_id=device.id if device.id else -1)
     session.add(conv)
     session.commit()
     session.refresh(conv)
@@ -272,7 +274,7 @@ def _history(session: Session, conversation_id: int) -> list[tuple[str, str]]:
     msgs = session.exec(
         select(Message)
         .where(Message.conversation_id == conversation_id)
-        .order_by(Message.id)
+        .order_by(col(Message.id))
     ).all()
     return [(m.role, m.content) for m in msgs]
 
@@ -319,11 +321,13 @@ async def list_messages(
     device = _device(session, address)
     if device is None:
         return BoomResponse(code=0, data=[])
-    conv = _get_conversation(session, device.id, conversationId)
+    conv = _get_conversation(session, device.id if device.id else -1, conversationId)
     if conv is None:
         return BoomResponse(code=0, data=[])
     msgs = session.exec(
-        select(Message).where(Message.conversation_id == conv.id).order_by(Message.id)
+        select(Message)
+        .where(Message.conversation_id == conv.id)
+        .order_by(col(Message.id))
     ).all()
     return BoomResponse(code=0, data=[_to_coach_message(m) for m in msgs])
 
@@ -341,7 +345,7 @@ async def send_message(
         return BoomResponse(code=0, data=SendResult(conversationId="", messageId=""))
     conv = _resolve_or_create_conversation(session, device, body.conversationId)
     user_msg = Message(
-        conversation_id=conv.id,
+        conversation_id=conv.id if conv.id else -1,
         role="user",
         type=body.type,
         content=body.content,
@@ -351,14 +355,19 @@ async def send_message(
     session.commit()
     session.refresh(user_msg)
     ctx = CoachContext(
-        conversation_id=conv.id,
-        device_id=device.id,
+        conversation_id=conv.id if conv.id else -1,
+        device_id=device.id if device.id else -1,
         user_message=body.content,
         user_type=body.type,
-        history=_history(session, conv.id),
+        history=_history(session, conv.id if conv.id else -1),
     )
     reply = get_provider().reply(ctx)
-    ai_msg = Message(conversation_id=conv.id, role="ai", type="text", content=reply)
+    ai_msg = Message(
+        conversation_id=conv.id if conv.id else -1,
+        role="ai",
+        type="text",
+        content=reply,
+    )
     session.add(ai_msg)
     session.commit()
     session.refresh(ai_msg)
@@ -392,7 +401,7 @@ async def send_message_stream(
         return StreamingResponse(empty(), media_type="text/event-stream")
     conv = _resolve_or_create_conversation(session, device, body.conversationId)
     user_msg = Message(
-        conversation_id=conv.id,
+        conversation_id=conv.id if conv.id else -1,
         role="user",
         type=body.type,
         content=body.content,
@@ -406,14 +415,14 @@ async def send_message_stream(
     conv_id = conv.id
     user_id = user_msg.id
     ctx = CoachContext(
-        conversation_id=conv_id,
-        device_id=device.id,
+        conversation_id=conv_id if conv_id else -1,
+        device_id=device.id if device.id else -1,
         user_message=body.content,
         user_type=body.type,
-        history=_history(session, conv_id),
+        history=_history(session, conv_id if conv_id else -1),
     )
     provider = get_provider()
-    handle = await _stream_registry.register(conv_id)
+    handle = await _stream_registry.register(conv_id if conv_id else -1)
 
     async def events() -> AsyncGenerator[str, None]:
         chunks: list[str] = []
@@ -432,7 +441,10 @@ async def send_message_stream(
             # session closes when the stream ends, so the writer cannot reuse it.
             with Session(engine) as writer:
                 ai = Message(
-                    conversation_id=conv_id, role="ai", type="text", content=full
+                    conversation_id=conv_id if conv_id else -1,
+                    role="ai",
+                    type="text",
+                    content=full,
                 )
                 writer.add(ai)
                 writer.commit()
@@ -448,7 +460,7 @@ async def send_message_stream(
                 StreamEvent(messageId=ai_id, content=None, done=True),
             )
         finally:
-            await _stream_registry.remove(conv_id)
+            await _stream_registry.remove(conv_id if conv_id else -1)
 
     return StreamingResponse(events(), media_type="text/event-stream")
 
@@ -463,7 +475,7 @@ async def create_conversation(
     device = _device(session, address)
     if device is None:
         return BoomResponse(code=0, data=NewConversation())
-    conv = Conversation(device_id=device.id)
+    conv = Conversation(device_id=device.id if device.id else -1)
     session.add(conv)
     session.commit()
     session.refresh(conv)
@@ -488,7 +500,7 @@ async def delete_conversation(
     device = _device(session, address)
     if device is None:
         return BoomMessage(code=0, msg="")
-    conv = _get_conversation(session, device.id, conversationId)
+    conv = _get_conversation(session, device.id if device.id else -1, conversationId)
     if conv is None:
         return BoomMessage(code=0, msg="")
     for m in session.exec(
@@ -511,7 +523,7 @@ async def delete_message(
     device = _device(session, address)
     if device is None:
         return BoomMessage(code=0, msg="")
-    msg = _get_message(session, device.id, messageId)
+    msg = _get_message(session, device.id if device.id else -1, messageId)
     if msg is None:
         return BoomMessage(code=0, msg="")
     session.delete(msg)
@@ -566,10 +578,12 @@ async def interrupt_stream(
         return BoomMessage(code=0, msg="")
     # The registry is keyed by the conversation id, so assert ownership first:
     # a device may only interrupt its own conversations.
-    conv = _get_conversation(session, device.id, body.conversationId)
+    conv = _get_conversation(
+        session, device.id if device.id else -1, body.conversationId
+    )
     if conv is None:
         return BoomMessage(code=0, msg="")
-    await _stream_registry.cancel(conv.id)
+    await _stream_registry.cancel(conv.id if conv.id else -1)
     return BoomMessage(code=0, msg="")
 
 
@@ -584,7 +598,7 @@ async def message_feedback(
     device = _device(session, address)
     if device is None:
         return BoomMessage(code=0, msg="")
-    msg = _get_message(session, device.id, body.messageId)
+    msg = _get_message(session, device.id if device.id else -1, body.messageId)
     if msg is None:
         return BoomMessage(code=0, msg="")
     msg.feedback = body.feedback

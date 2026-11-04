@@ -21,10 +21,10 @@ def _parse_date(value: str) -> date:
 
 
 class EnergyStatusData(BaseModel):
-    totalEnergy: int = Field(0, description="总储能值 0-100")
-    energyProgress: int = Field(0, description="储能进度百分比 0-100")
-    totalCharge: int = Field(0, description="总充能值")
-    totalConsume: int = Field(0, description="总耗能值")
+    totalEnergy: int = Field(default=0, description="总储能值 0-100")
+    energyProgress: int = Field(default=0, description="储能进度百分比 0-100")
+    totalCharge: int = Field(default=0, description="总充能值")
+    totalConsume: int = Field(default=0, description="总耗能值")
     energyChartData: list[TimePoint] = Field(
         default_factory=list, description="当日能量曲线数据"
     )
@@ -103,7 +103,9 @@ async def get_energy_status(
     if summary is None:
         return BoomResponse(code=0, data=EnergyStatusData())
 
-    chart = _energy_chart_data(session, device.id, summary.summary_date)
+    chart = _energy_chart_data(
+        session, device.id if device.id else -1, summary.summary_date
+    )
     e_d = summary.energy_start_e if summary.energy_start_e is not None else FIRST_ENERGY
     f_d = summary.energy_end_f
     if f_d is None:
@@ -139,7 +141,12 @@ def _energy_trend(
     return [
         DatePoint(
             date=r.summary_date.isoformat(),
-            value=round(100 * max(0.0, min(1.0, r.energy_end_f))),
+            value=round(
+                100
+                * max(
+                    0.0, min(1.0, r.energy_end_f if r.energy_end_f is not None else 1.0)
+                )
+            ),
         )
         for r in rows
     ]
@@ -168,5 +175,5 @@ async def get_energy_trend(
     end = _parse_date(endDate)
     if end < start:
         start, end = end, start
-    points = _energy_trend(session, device.id, start, end)
+    points = _energy_trend(session, device.id if device.id else -1, start, end)
     return BoomResponse(code=0, data=points)
