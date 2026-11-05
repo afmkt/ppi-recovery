@@ -536,3 +536,370 @@ def coverage_chart(daily: pd.DataFrame, full_day_s: float = FULL_DAY_S) -> alt.C
         )
         .properties(width=560, height=240, title="Daily PPI coverage — covered vs gap")
     )
+
+
+# ===========================================================================
+# Feature 4 — raw/derived table browser
+#
+# The per-second PPI table is a million rows; per-minute/per-window tables are
+# ~20k. None of them can be shipped to the browser whole, so every builder is
+# bounded server-side: a time-window ``cutoff`` plus a hard ``cap`` (a
+# ``LIMIT``). The bounded slice is then handed to a marimo table for client-side
+# paging/search. All four time columns are indexed, so the bounding query is
+# fast. Each builder takes the same ``query`` callable (``SQL -> DataFrame``)
+# as the rest of the module, so it is testable against any engine.
+# ===========================================================================
+
+# Per-second window presets for the time-series tables. ``None`` = no lower
+# bound ("All"). Values are in seconds.
+_WINDOW_PRESETS = {
+    "1h": 3600.0,
+    "6h": 6 * 3600.0,
+    "24h": 24 * 3600.0,
+    "7d": 7 * 86400.0,
+    "30d": 30 * 86400.0,
+    "All": None,
+}
+
+
+def window_cutoff(preset, anchor=None):
+    """Resolve a window preset to a lower bound relative to ``anchor``, or
+    None for "All".
+
+    ``anchor`` is the device's most recent data time (see ``last_data_time``).
+    Anchoring to the data rather than wall-clock "now" keeps a preset like
+    "1h" meaningful for a device whose latest sample is days old: it means the
+    last hour of *data the device has*, so a historical device shows its most
+    recent hour instead of an empty future window. A caller that omits
+    ``anchor`` falls back to naive-UTC "now" (a live device).
+    """
+    delta_s = _WINDOW_PRESETS.get(preset, 3600.0)
+    if delta_s is None:
+        return None
+    if anchor is None:
+        anchor = pd.Timestamp.now("UTC").tz_localize(None)
+    return pd.Timestamp(anchor) - pd.Timedelta(seconds=float(delta_s))
+
+
+def last_data_time(query, device_id, table, time_col):
+    """Most recent data time for a device's layer, or None when it has none.
+
+    Used to anchor a time window to the device's own data (rather than
+    wall-clock "now") so a historical device's "1h" window is its last hour of
+    data, not an empty future window. ``table``/``time_col`` are internal, not
+    user input, so they are interpolated directly.
+    """
+    row = query(f"select max({time_col}) as t from {table} where device_id = {int(device_id)}")
+    if row.empty:
+        return None
+    ts = pd.to_datetime(row.iloc[0]["t"], errors="coerce")
+    if pd.isna(ts):
+        return None
+    return ts
+
+
+def last_lfhf_time(query, device_id):
+    """Most recent ``window_start`` that carries an ``lf_hf`` value for a device,
+    or None.
+
+    Used to explain why an LF/HF ribbon can be empty even when the window is
+    full of windows: HRV (``lf_hf``) is computed only for *valid* windows, so a
+    recent all-invalid gap leaves the chart with nothing to plot. ``None`` means
+    the device has no LF/HF windows at all.
+    """
+    row = query(
+        "select max(case when lf_hf is not null then window_start end) as t "
+        "from windowmetric where device_id = " + str(int(device_id))
+    )
+    if row.empty:
+        return None
+    t = row.iloc[0]["t"]
+    return None if pd.isna(t) else pd.to_datetime(t, errors="coerce")
+
+
+def _cutoff_literal(cutoff) -> str:
+    """Fixed-width, single-quoted text literal so it compares correctly against
+    the stored ``'YYYY-MM-DD HH:MM:SS.ffffff'`` datetime text (a shorter,
+    non-padded string would sort wrong lexicographically; an unquoted one is a
+    syntax error). The value is a fixed-format timestamp, so no escaping is
+    needed."""
+    return "'" + pd.Timestamp(cutoff).strftime("%Y-%m-%d %H:%M:%S.%f") + "'"
+
+
+def _where_device(device_id, *clauses: str) -> str:
+    base = "device_id = " + str(int(device_id))
+    return base + (" and " + " and ".join(clauses) if clauses else "")
+
+
+def cleaned_ppi(query, device_id, cutoff=None, cap=2000,
+                cleaned_only=False, fresh_only=False) -> pd.DataFrame:
+    """Most-recent per-second PPI rows for a device, newest first, capped.
+
+    ``spo2`` is stored raw×10 (0 = "not reported this second"); a ``spo2_pct``
+    column (÷10, blank when 0) is appended for display. Rows are bounded by
+    ``cutoff`` and ``cap`` so the browser never receives the full per-second
+    table.
+    """
+    clauses: list[str] = []
+    if cutoff is not None:
+        clauses.append("time > " + _cutoff_literal(cutoff))
+    if cleaned_only:
+        clauses.append("ppi_clean IS NOT NULL")
+    if fresh_only:
+        clauses.append("fresh = 1")
+    sql = (
+        "select time, hr, spo2, ppi, ppi_clean, activity, fresh "
+        "from ppi where " + _where_device(device_id, *clauses)
+        + f" order by time desc limit {int(cap)}"
+    )
+    df = query(sql)
+    if df.empty:
+        return df
+    df = df.copy()
+    reported = df["spo2"].fillna(0).astype(int) != 0
+    df["spo2_pct"] = (df["spo2"] / 10.0).where(reported, other=float("nan"))
+    return df[["time", "hr", "spo2_pct", "ppi", "ppi_clean", "activity", "fresh"]]
+
+
+def window_table(query, device_id, cutoff=None, cap=5000,
+                 states=None, sleep_only=False, min_valid=0.0) -> pd.DataFrame:
+    """Most-recent windowmetrics for a device, newest first, capped and
+    optionally filtered by state / sleep / minimum ``valid_ratio``.
+
+    ``states`` matches case-insensitively (the DB stores the enum name, whose
+    case is not relied on).
+    """
+    clauses: list[str] = []
+    if cutoff is not None:
+        clauses.append("window_start > " + _cutoff_literal(cutoff))
+    if states:
+        ph = ", ".join(f"'{str(s)}'" for s in states)
+        clauses.append(f"lower(state) in ({ph})")
+    if sleep_only:
+        clauses.append("is_sleep = 1")
+    clauses.append(f"valid_ratio >= {float(min_valid):.6f}")
+    sql = (
+        "select night_date, window_start, window_mid_h, state, is_sleep, "
+        "valid_ratio, rmssd_ms, ln_rmssd, lf_hf, lf, hf "
+        "from windowmetric where " + _where_device(device_id, *clauses)
+        + f" order by window_start desc limit {int(cap)}"
+    )
+    return query(sql)
+
+
+def minute_table(query, device_id, cutoff=None, cap=5000) -> pd.DataFrame:
+    """Most-recent minutemetrics for a device, newest first, capped."""
+    clauses: list[str] = []
+    if cutoff is not None:
+        clauses.append("timestamp > " + _cutoff_literal(cutoff))
+    sql = (
+        "select timestamp, night_date, heart_rate, s1_load, tss_load, "
+        "total_load, heart_rate_zone, steps, calories "
+        "from minutemetric where " + _where_device(device_id, *clauses)
+        + f" order by timestamp desc limit {int(cap)}"
+    )
+    return query(sql)
+
+
+def daily_table(query, device_id) -> pd.DataFrame:
+    """Every daily-summary row for a device (one per day), newest first.
+
+    A curated column subset — scores, HRV baselines/vals, energy, autonomic
+    balance and the coaching text — rather than all 48 columns.
+    """
+    return query(
+        "select summary_date, status_score, base_score, sleep_score, "
+        "rest_heart_rate_val, hrv_night_val, hrv_morning_val, "
+        "spo2_night_avg, spo2_night_min, "
+        "energy_start_e, energy_end_f, total_load, total_tss, "
+        "atl, ctl, tsb, "
+        "sympathetic_pct, parasympathetic_pct, transition_pct, "
+        "boom_go_text, training_suggestion, is_temporary_algorithm "
+        "from dailysummary where " + _where_device(device_id)
+        + " order by summary_date desc"
+    )
+
+
+# --- Feature 4 chart helpers -----------------------------------------------
+# Each returns an Altair spec (NaN-dropped, so ``to_json(allow_nan=False)`` is
+# safe) plus a no-data placeholder of the same dimensions when the slice is
+# empty, so the panel never collapses.
+
+
+def _empty(line=True, title="no rows") -> alt.Chart:
+    cls = "time:T" if line else "x:N"
+    return (
+        alt.Chart(pd.DataFrame(columns=[cls]))
+        .mark_line()
+        .properties(width=560, height=180, title=title)
+    )
+
+
+def ppi_clean_chart(df: pd.DataFrame) -> alt.Chart:
+    """Cleaned PPI: ``ppi_clean`` (ms between beats) over time, raw ``ppi``
+    faint. Both series share the ms axis; a null in one does not blank the
+    other (each is drawn from its own non-null subset)."""
+    if df is None or df.empty:
+        return _empty(line=True, title="Cleaned PPI — no rows")
+    d = df.copy()
+    d["time"] = pd.to_datetime(d["time"], errors="coerce")
+    d = d.dropna(subset=["time"])
+    series = [c for c in ("ppi", "ppi_clean") if c in d.columns and d[c].notna().any()]
+    if not series:
+        return _empty(line=True, title="Cleaned PPI — no rows")
+    m = d[["time"] + series].melt(
+        id_vars="time", var_name="series", value_name="ms", value_vars=series
+    )
+    m["series"] = m["series"].map({"ppi": "raw ppi", "ppi_clean": "ppi_clean"})
+    m = m.dropna()
+    return (
+        alt.Chart(m)
+        .mark_line(point=False)
+        .encode(
+            x=alt.X("time:T", title="time (UTC)"),
+            y=alt.Y("ms:Q", title="ms between beats"),
+            color=alt.Color("series:N", title=""),
+        )
+        .properties(width=560, height=180, title="Cleaned PPI — ms between beats")
+    )
+
+
+def window_ribbon_chart(df: pd.DataFrame) -> alt.Chart:
+    """Autonomic ribbon: LF/HF vs hour-from-night-start, colored by state."""
+    if df is None or df.empty:
+        return _empty(line=True, title="Window ribbon — no LF/HF rows")
+    d = df.copy()
+    d["window_mid_h"] = pd.to_numeric(d.get("window_mid_h"), errors="coerce")
+    d = d.dropna(subset=["window_mid_h"])
+    if "lf_hf" not in d.columns or not d["lf_hf"].notna().any():
+        return _empty(line=True, title="Window ribbon — no LF/HF rows")
+    d = d[d["lf_hf"].notna()]
+    return (
+        alt.Chart(d)
+        .mark_line(point=False)
+        .encode(
+            x=alt.X("window_mid_h:Q", title="hour from night start"),
+            y=alt.Y("lf_hf:Q", title="LF/HF"),
+            color=alt.Color(
+                "state:N",
+                title="state",
+                scale=alt.Scale(
+                    domain=["sympathetic", "transition", "parasympathetic"],
+                    range=["#d62728", "#7f7f7f", "#2ca02c"],
+                ),
+            ),
+        )
+        .properties(width=560, height=180, title="Window ribbon — LF/HF by state")
+    )
+
+
+def window_ribbon_has_data(df: pd.DataFrame) -> bool:
+    """Whether the window holds any plottable LF/HF point."""
+    if df is None or df.empty or "lf_hf" not in df.columns:
+        return False
+    return bool(df["lf_hf"].notna().any())
+
+
+def window_ribbon_caption(df: pd.DataFrame, cutoff, anchor, last_lfhf) -> str:
+    """A self-explaining header for the LF/HF ribbon.
+
+    Always states the time window and how many windows it holds (and how many
+    carry an ``lf_hf``). When none carry one, it also says *why* the chart is
+    unavailable — HRV is computed only for valid windows — and when the most
+    recent LF/HF window was (or that the device has none at all), so an empty
+    chart explains itself instead of failing silently.
+    """
+    n = int(len(df)) if df is not None else 0
+    k = int(df["lf_hf"].notna().sum()) if window_ribbon_has_data(df) else 0
+    start = "all-time" if cutoff is None else fmt_ts(cutoff)
+    end = fmt_ts(anchor) if anchor is not None else "now"
+    head = (
+        "### Window ribbon — LF/HF by state  \n"
+        f"window **{start}–{end}** · **{n:,}** windows · **{k:,}** with LF/HF"
+    )
+    if k > 0:
+        return head
+    if last_lfhf is None:
+        why = (
+            "no LF/HF in this window — this device has **no LF/HF windows at all**; "
+            "HRV (LF/HF) is computed only for valid windows"
+        )
+    else:
+        gap = None
+        if cutoff is not None and last_lfhf < cutoff:
+            gap = fmt_dur((cutoff - last_lfhf).total_seconds() / 3600.0)
+        gap_txt = f", **{gap}** before this window" if gap else ""
+        why = (
+            f"no LF/HF in this window — the most recent LF/HF window was "
+            f"**{fmt_ts(last_lfhf)}**{gap_txt}; HRV is computed only for valid windows"
+        )
+    return head + "  \n" + why
+
+
+def minute_hr_chart(df: pd.DataFrame) -> alt.Chart:
+    """Per-minute heart rate over time, colored by HR zone."""
+    if df is None or df.empty:
+        return _empty(line=True, title="Per-minute heart rate — no rows")
+    d = df.copy()
+    d["timestamp"] = pd.to_datetime(d["timestamp"], errors="coerce")
+    d = d.dropna(subset=["timestamp"])
+    if not d["heart_rate"].notna().any():
+        return _empty(line=True, title="Per-minute heart rate — no rows")
+    d = d[d["heart_rate"].notna()]
+    return (
+        alt.Chart(d)
+        .mark_line(point=False)
+        .encode(
+            x=alt.X("timestamp:T", title="time (UTC)"),
+            y=alt.Y("heart_rate:Q", title="HR (bpm)"),
+            color=alt.Color("heart_rate_zone:N", title="HR zone"),
+        )
+        .properties(width=560, height=180, title="Per-minute heart rate")
+    )
+
+
+def daily_autonomic_chart(df: pd.DataFrame) -> alt.Chart:
+    """Stacked bar of night-window state balance (% sympathetic/para/transition)
+    per summary date."""
+    if df is None or df.empty:
+        return _empty(line=False, title="Autonomic balance — no rows")
+    d = df.copy()
+    d["summary_date"] = pd.to_datetime(d["summary_date"], errors="coerce")
+    d = d.dropna(subset=["summary_date"])
+    cols = [c for c in ("sympathetic_pct", "parasympathetic_pct", "transition_pct")
+            if c in d.columns]
+    if not cols:
+        return _empty(line=False, title="Autonomic balance — no rows")
+    m = d.melt(
+        id_vars="summary_date", var_name="state", value_name="pct", value_vars=cols
+    )
+    m["state"] = m["state"].str.replace("_pct", "", regex=False)
+    m = m.dropna()
+    if m.empty:
+        return _empty(line=False, title="Autonomic balance — no rows")
+    return (
+        alt.Chart(m)
+        .mark_bar()
+        .encode(
+            x=alt.X("summary_date:T", title="date"),
+            y=alt.Y(
+                "pct:Q",
+                title="% of night windows",
+                stack=True,
+                scale=alt.Scale(domain=[0, 100]),
+            ),
+            color=alt.Color(
+                "state:N",
+                title="state",
+                scale=alt.Scale(
+                    domain=["sympathetic", "parasympathetic", "transition"],
+                    range=["#d62728", "#2ca02c", "#7f7f7f"],
+                ),
+            ),
+            tooltip=["summary_date", "state", "pct"],
+        )
+        .properties(
+            width=560, height=180,
+            title="Autonomic balance — % of night windows by state",
+        )
+    )
