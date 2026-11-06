@@ -6,18 +6,19 @@ from datetime import date, time, timedelta
 from datetime import datetime as _dt
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel, Field
+from pydantic import Field
 from sqlmodel import Session, col, select
 
-from newboom.boom.schemas import BoomResponse, DatePoint, TimePoint
-from newboom.config import READINESS_GRANULARITY
+from newboom.boom.schemas import BoomResponse, DatePoint, StaleFields, TimePoint
+from newboom.boom.staleness import locf, mark_stale
+from newboom.config import READINESS_GRANULARITY, STALE_WINDOW_DAYS
 from newboom.database import get_session
 from newboom.model import DailySummary, Device, HourlyStatus, WindowMetric
 
 router = APIRouter(tags=["状态"])
 
 
-class StatusData(BaseModel):
+class StatusData(StaleFields):
     totalStatus: int = Field(default=0, description="综合状态值 0-100")
     statusProgress: int = Field(default=0, description="状态进度百分比 0-100")
     hrv: int = Field(default=0, description="心率变异性 ms(夜间rmssd均值)")
@@ -76,7 +77,7 @@ async def get_status(
     """
     device = session.exec(select(Device).where(Device.mac == address)).first()
     if device is None:
-        return BoomResponse(code=0, data=StatusData())
+        return BoomResponse(code=0, data=StatusData(asOf=None, stale=True))
 
     if date:
         target = _parse_date(date)
@@ -92,8 +93,9 @@ async def get_status(
             .order_by(col(DailySummary.summary_date).desc())
         ).first()
     if summary is None:
-        return BoomResponse(code=0, data=StatusData())
+        return BoomResponse(code=0, data=StatusData(asOf=None, stale=True))
 
+    as_of, stale = mark_stale(summary.summary_date, device=device)
     total_status = (
         summary.status_current
         if summary.status_current is not None
@@ -116,6 +118,8 @@ async def get_status(
             hrv=hrv,
             restingHeartRate=rhr,
             hrvData=hrv_data,
+            asOf=as_of,
+            stale=stale,
         ),
     )
 
@@ -123,12 +127,14 @@ async def get_status(
 def _daily_readiness(
     session: Session, device_id: int, start: date, end: date
 ) -> list[DatePoint]:
-    """Per-day frozen status (``DailySummary.status_score``); days with no
-    summary or null status are omitted (no fallback)."""
+    """Per-day frozen status (``DailySummary.status_score``). Fetches from
+    ``start - STALE_WINDOW_DAYS`` so :func:`locf` can seed a leading carry; the
+    caller clips back to ``[start, end]``. Days with no summary or null status
+    contribute no real point."""
     rows = session.exec(
         select(DailySummary)
         .where(DailySummary.device_id == device_id)
-        .where(DailySummary.summary_date >= start)
+        .where(DailySummary.summary_date >= start - timedelta(days=STALE_WINDOW_DAYS))
         .where(DailySummary.summary_date <= end)
         .where(col(DailySummary.status_score).isnot(None))
         .order_by(col(DailySummary.summary_date).asc())
@@ -145,9 +151,11 @@ def _hourly_readiness(
     """Per-day max intraday hourly status (``HourlyStatus.current_status``).
 
     Each day's value is the highest status snapshot that day (boom §2.2 "取每天
-    最高的状态值"); days with no hourly snapshot are omitted (no fallback).
+    最高的状态值"). Fetches from ``start - STALE_WINDOW_DAYS`` so :func:`locf`
+    can seed a leading carry; the caller clips back to ``[start, end]``. Days
+    with no hourly snapshot contribute no real point.
     """
-    start_dt = _dt.combine(start, time.min)
+    start_dt = _dt.combine(start, time.min) - timedelta(days=STALE_WINDOW_DAYS)
     end_dt = _dt.combine(end, time.min) + timedelta(days=1)
     rows = session.exec(
         select(HourlyStatus)
@@ -180,8 +188,10 @@ async def get_readiness(
     The readiness chart substitutes the status value (boom §2.2 "取每天最高的状态
     值"). ``READINESS_GRANULARITY`` selects the per-day source: ``"hourly"``
     (default) takes each day's max intraday hourly status; ``"daily"`` takes
-    the frozen daily status. No fallback between sources — a day with no data
-    from the selected source is omitted.
+    the frozen daily status. No fallback *between* sources, but *within* the
+    selected source a day with no real value is carried from the last real
+    value across a gap <= ``STALE_WINDOW_DAYS`` (LOCF, marked ``carried``); a
+    larger gap is left as a real hole.
     """
     device = session.exec(select(Device).where(Device.mac == address)).first()
     if device is None:
@@ -200,4 +210,6 @@ async def get_readiness(
         points = _hourly_readiness(
             session, device.id if device.id is not None else -1, start, end
         )
-    return BoomResponse(code=0, data=points)
+    # LOCF: fill a day the source lacks with the last real value across a gap
+    # <= STALE_WINDOW_DAYS (marked ``carried``); a larger gap is left a real hole.
+    return BoomResponse(code=0, data=locf(points, start, end))

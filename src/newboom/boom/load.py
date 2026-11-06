@@ -8,12 +8,14 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 from sqlmodel import Session, col, select
 
-from newboom.boom.schemas import BoomResponse, DatePoint, TimePoint
+from newboom.boom.schemas import BoomResponse, DatePoint, StaleFields, TimePoint
+from newboom.boom.staleness import locf, mark_stale
 from newboom.config import (
     DEFAULT_HR_MAX,
     DEFAULT_HR_REST,
     LOAD_THRESHOLD_FRAC,
     NIGHT_START_HOUR,
+    STALE_WINDOW_DAYS,
 )
 from newboom.database import get_session
 from newboom.model import DailySummary, Device, MinuteMetric, Sleep
@@ -50,7 +52,7 @@ class HeartRateZoneItems(BaseModel):
     zone5: int = Field(default=0, description="Zone5 占比 %")
 
 
-class LoadStatusData(BaseModel):
+class LoadStatusData(StaleFields):
     totalLoad: int = Field(default=0, description="总负荷值 0-100")
     loadProgress: int = Field(default=0, description="负荷进度百分比 0-100")
     avgLoad: int = Field(default=0, description="平均负荷")
@@ -293,11 +295,13 @@ async def get_load_status(
     is the cumulative total load, ``heartRateZoneData`` the per-hour HR trend,
     ``heartRateZoneItems`` the zone distribution, ``loadZones`` the per-minute
     classification. ``avgLoad`` is the day's mean HR excluding the sleep phase.
-    A missing device / day yields a zeroed payload.
+    A missing device / day yields a zeroed payload with ``asOf=None`` /
+    ``stale=True``; with a summary, ``asOf`` is the day and ``stale`` True when
+    older than ``STALE_WINDOW_DAYS`` (device-local).
     """
     device = session.exec(select(Device).where(Device.mac == address)).first()
     if device is None:
-        return BoomResponse(code=0, data=LoadStatusData())
+        return BoomResponse(code=0, data=LoadStatusData(asOf=None, stale=True))
 
     if date:
         day = _parse_date(date)
@@ -308,57 +312,68 @@ async def get_load_status(
             .order_by(col(DailySummary.summary_date).desc())
         ).first()
         if latest is None:
-            return BoomResponse(code=0, data=LoadStatusData())
+            return BoomResponse(code=0, data=LoadStatusData(asOf=None, stale=True))
         day = latest.summary_date
 
     data = _load_status_data(session, device, day)
     if data is None:
-        return BoomResponse(code=0, data=LoadStatusData())
+        return BoomResponse(code=0, data=LoadStatusData(asOf=None, stale=True))
+    as_of, stale = mark_stale(day, device=device)
+    data.asOf = as_of
+    data.stale = stale
     return BoomResponse(code=0, data=data)
 
 
 def _load_trend(
     session: Session, device_id: int, start: date, end: date
 ) -> list[DatePoint]:
-    """Per-day total load (``DailySummary.total_load``); days without a
-    finalized value are omitted."""
+    """Per-day total load (``DailySummary.total_load``, LOCF-filled, marked
+    ``carried``). Fetches from ``start - STALE_WINDOW_DAYS`` so :func:`locf` can
+    seed a leading carry, then clips back to ``[start, end]``; a day without a
+    finalized value is carried from the last real one across a gap <= the
+    window, else omitted."""
     rows = session.exec(
         select(DailySummary)
         .where(DailySummary.device_id == device_id)
-        .where(DailySummary.summary_date >= start)
+        .where(DailySummary.summary_date >= start - timedelta(days=STALE_WINDOW_DAYS))
         .where(DailySummary.summary_date <= end)
         .where(col(DailySummary.total_load).isnot(None))
         .order_by(col(DailySummary.summary_date).asc())
     ).all()
-    return [
+    real = [
         DatePoint(
             date=r.summary_date.isoformat(),
             value=round(r.total_load) if r.total_load is not None else -1,
         )
         for r in rows
     ]
+    return locf(real, start, end)
 
 
 def _sport_trend(
     session: Session, device_id: int, start: date, end: date
 ) -> list[DatePoint]:
-    """Per-day sport load (``DailySummary.total_tss``); days without a
-    finalized value are omitted."""
+    """Per-day sport load (``DailySummary.total_tss``, LOCF-filled, marked
+    ``carried``). Fetches from ``start - STALE_WINDOW_DAYS`` so :func:`locf` can
+    seed a leading carry, then clips back to ``[start, end]``; a day without a
+    finalized value is carried from the last real one across a gap <= the
+    window, else omitted."""
     rows = session.exec(
         select(DailySummary)
         .where(DailySummary.device_id == device_id)
-        .where(DailySummary.summary_date >= start)
+        .where(DailySummary.summary_date >= start - timedelta(days=STALE_WINDOW_DAYS))
         .where(DailySummary.summary_date <= end)
         .where(col(DailySummary.total_tss).isnot(None))
         .order_by(col(DailySummary.summary_date).asc())
     ).all()
-    return [
+    real = [
         DatePoint(
             date=r.summary_date.isoformat(),
             value=round(r.total_tss) if r.total_tss is not None else -1,
         )
         for r in rows
     ]
+    return locf(real, start, end)
 
 
 @router.get(
@@ -373,7 +388,9 @@ async def get_load_trend(
     """5.2 获取负荷趋势数据（value = 当日 totalLoad）.
 
     Per-day total load over ``[startDate, endDate]``; a day without a finalized
-    ``total_load`` is omitted. A missing device yields ``[]``.
+    ``total_load`` is carried from the last real value across a gap <=
+    ``STALE_WINDOW_DAYS`` (marked ``carried``), else omitted. A missing device
+    yields ``[]``.
     """
     device = session.exec(select(Device).where(Device.mac == address)).first()
     if device is None:
@@ -403,7 +420,9 @@ async def get_sport_load(
     """5.3 获取运动负荷数据（value = 运动 tss）.
 
     Per-day sport load (``total_tss``) over ``[startDate, endDate]``; a day
-    without a finalized value is omitted. A missing device yields ``[]``.
+    without a finalized value is carried from the last real value across a gap
+    <= ``STALE_WINDOW_DAYS`` (marked ``carried``), else omitted. A missing
+    device yields ``[]``.
     """
     device = session.exec(select(Device).where(Device.mac == address)).first()
     if device is None:

@@ -6,7 +6,8 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlmodel import Session, col, select
 
-from newboom.boom.schemas import BoomResponse
+from newboom.boom.schemas import BoomResponse, StaleFields
+from newboom.boom.staleness import mark_stale
 from newboom.database import get_session
 from newboom.model import DailySummary, Device, MinuteMetric
 
@@ -33,7 +34,7 @@ class GoDetails(BaseModel):
     target: str = Field(default="", description="训练目标（可选）")
 
 
-class GoData(BaseModel):
+class GoData(StaleFields):
     healthStatus: HealthStatus = Field(default_factory=lambda d: HealthStatus(**d))
     boomGoText: str = Field(default="", description="BOOM GO 模块文案")
     energyPercentage: int = Field(default=0, description="储能环形图百分比 0-100")
@@ -114,17 +115,23 @@ async def get_home(
       ``training_suggestion`` / ``training_duration`` / ``training_target``).
 
     A missing device or a device with no ``DailySummary`` yields a zeroed
-    ``GoData`` (``BoomResponse`` carries no error field).
+    ``GoData`` (``BoomResponse`` carries no error field) with ``asOf=None`` /
+    ``stale=True`` so the client can tell "no data" from a real zero. With a
+    summary present, ``asOf`` is its ``summary_date`` and ``stale`` is True when
+    that day is older than ``STALE_WINDOW_DAYS`` (device-local).
     """
     device = session.exec(select(Device).where(Device.mac == address)).first()
     if device is None:
-        return BoomResponse(code=0, data=GoData())
+        return BoomResponse(code=0, data=GoData(asOf=None, stale=True))
 
     device_id = device.id if device.id is not None else -1
     summary = _latest_summary(session, device_id)
     if summary is None:
-        return BoomResponse(code=0, data=GoData())
+        # No data at all -> zeroed values, but mark it so the UI knows it is
+        # "no data" rather than a real zero.
+        return BoomResponse(code=0, data=GoData(asOf=None, stale=True))
 
+    as_of, stale = mark_stale(summary.summary_date, device=device)
     status = (
         summary.status_current
         if summary.status_current is not None
@@ -149,6 +156,8 @@ async def get_home(
                 load=summary.load_score or 0,
             ),
             boomGoText=summary.boom_go_text or "",
+            asOf=as_of,
+            stale=stale,
             energyPercentage=_energy_percentage(session, device_id, summary),
             healthCardValues=HealthCardValues(
                 heartRate=_latest_heart_rate(session, device_id),

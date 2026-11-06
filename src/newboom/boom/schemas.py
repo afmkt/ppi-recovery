@@ -40,8 +40,55 @@ class TimePoint(BaseModel):
     value: float = Field(..., description="指标值")
 
 
+class StaleFields(BaseModel):
+    """Shared fields on every *current-card* payload (``/go``, ``/status``,
+    ``/energy_status``, ``/load_status``, ``/superrecovery``, ``/body_metrics``).
+
+    ``asOf`` is the date the value came from (``None`` when the device has no
+    data at all); ``stale`` is True when that date is older than
+    ``STALE_WINDOW_DAYS`` (device-local) or when there is no data. The value is
+    always returned ("mark, don't cap") — the marker is what lets the UI dim or
+    label a value that may be days old. See :mod:`newboom.boom.staleness`."""
+
+    asOf: str | None = Field(
+        default=None,
+        description="数据日期 YYYY-MM-DD; null = 该设备尚无任何数据",
+    )
+    stale: bool = Field(
+        default=False,
+        description="True 当 asOf 超过陈旧窗口或无数据（值仍返回，仅标记）",
+    )
+
+
 class DatePoint(BaseModel):
-    """Daily trend point: ``YYYY-MM-DD`` -> numeric value."""
+    """Daily trend point: ``YYYY-MM-DD`` -> numeric value.
+
+    ``carried`` marks a LOCF-filled point: a day with no real value that is
+    filled by the last real value within ``STALE_WINDOW_DAYS`` (see
+    :mod:`newboom.boom.staleness`). A gap larger than the window is omitted
+    rather than fabricated, so a ``carried`` point is always a real, marked
+    backfill — never a silent zero.
+    """
 
     date: str = Field(..., description="日期 YYYY-MM-DD")
     value: float = Field(..., description="指标值")
+    carried: bool = Field(
+        default=False,
+        description="True when this day has no real value and is a LOCF backfill "
+        "of the last real value within the staleness window",
+    )
+
+
+class AtlCtlPoint(BaseModel):
+    """Daily ``atl``/``ctl`` pair trend point (``/atlctl``). ``carried`` marks a
+    LOCF backfill of the last real pair within the staleness window (both fields
+    are carried together), same contract as :class:`DatePoint.carried`."""
+
+    date: str = Field(..., description="日期 YYYY-MM-DD")
+    atl: int = Field(..., description="短期负荷值")
+    ctl: int = Field(..., description="长期负荷值")
+    carried: bool = Field(
+        default=False,
+        description="True when this day has no real atl/ctl and is a LOCF backfill "
+        "of the last real pair within the staleness window",
+    )

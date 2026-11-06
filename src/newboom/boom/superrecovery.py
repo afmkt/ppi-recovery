@@ -2,29 +2,25 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel, Field
+from pydantic import Field
 from sqlmodel import Session, col, select
 
-from newboom.boom.schemas import BoomResponse
+from newboom.boom.schemas import AtlCtlPoint, BoomResponse, StaleFields
+from newboom.boom.staleness import locf_atlctl, mark_stale
+from newboom.config import STALE_WINDOW_DAYS
 from newboom.database import get_session
 from newboom.model import DailySummary, Device
 
 router = APIRouter(tags=["超量恢复"])
 
 
-class SuperRecoveryData(BaseModel):
+class SuperRecoveryData(StaleFields):
     tsb: int = Field(default=0, description="TSB 训练状态值")
     atl: int = Field(default=0, description="短期负荷值")
     ctl: int = Field(default=0, description="长期负荷值")
-
-
-class AtlCtlPoint(BaseModel):
-    date: str = Field(..., description="日期 YYYY-MM-DD")
-    atl: int = Field(..., description="短期负荷值")
-    ctl: int = Field(..., description="长期负荷值")
 
 
 def _parse_date(value: str) -> date:
@@ -43,11 +39,13 @@ async def get_superrecovery(
     ``ctl`` are the 7-/42-day EMAs of daily total load and ``tsb = atl - ctl``
     (``boom_compute.finalize_*``, stored on ``DailySummary``). Only closed days
     carry these, so the latest row with a non-null ``atl`` is used; a missing
-    device / no finalized day yields a zeroed payload.
+    device / no finalized day yields a zeroed payload with ``asOf=None`` /
+    ``stale=True``. With a summary, ``asOf`` is its ``summary_date`` and
+    ``stale`` True when older than ``STALE_WINDOW_DAYS``.
     """
     device = session.exec(select(Device).where(Device.mac == address)).first()
     if device is None:
-        return BoomResponse(code=0, data=SuperRecoveryData())
+        return BoomResponse(code=0, data=SuperRecoveryData(asOf=None, stale=True))
 
     summary = session.exec(
         select(DailySummary)
@@ -56,14 +54,17 @@ async def get_superrecovery(
         .order_by(col(DailySummary.summary_date).desc())
     ).first()
     if summary is None:
-        return BoomResponse(code=0, data=SuperRecoveryData())
+        return BoomResponse(code=0, data=SuperRecoveryData(asOf=None, stale=True))
 
+    as_of, stale = mark_stale(summary.summary_date, device=device)
     return BoomResponse(
         code=0,
         data=SuperRecoveryData(
             tsb=round(summary.tsb or 0),
             atl=round(summary.atl or 0),
             ctl=round(summary.ctl or 0),
+            asOf=as_of,
+            stale=stale,
         ),
     )
 
@@ -71,17 +72,19 @@ async def get_superrecovery(
 def _atlctl_points(
     session: Session, device_id: int, start: date, end: date
 ) -> list[AtlCtlPoint]:
-    """Per-day ``atl`` / ``ctl`` over ``[start, end]``; days without a finalized
-    value (``atl`` null, i.e. not yet closed) are omitted."""
+    """Per-day ``atl`` / ``ctl`` (LOCF-filled, marked ``carried``). Fetches from
+    ``start - STALE_WINDOW_DAYS`` so :func:`locf_atlctl` can seed a leading
+    carry, then clips back to ``[start, end]``; a day without a finalized pair
+    is carried from the last real one across a gap <= the window, else omitted."""
     rows = session.exec(
         select(DailySummary)
         .where(DailySummary.device_id == device_id)
-        .where(DailySummary.summary_date >= start)
+        .where(DailySummary.summary_date >= start - timedelta(days=STALE_WINDOW_DAYS))
         .where(DailySummary.summary_date <= end)
         .where(col(DailySummary.atl).isnot(None))
         .order_by(col(DailySummary.summary_date).asc())
     ).all()
-    return [
+    real = [
         AtlCtlPoint(
             date=r.summary_date.isoformat(),
             atl=round(r.atl or 0),
@@ -89,6 +92,7 @@ def _atlctl_points(
         )
         for r in rows
     ]
+    return locf_atlctl(real, start, end)
 
 
 @router.get("/devices/{address}/atlctl", response_model=BoomResponse[list[AtlCtlPoint]])
@@ -100,8 +104,10 @@ async def get_atlctl(
 ) -> BoomResponse[list[AtlCtlPoint]]:
     """6.2 获取 ATL/CTL 趋势数据.
 
-    Per-day ``atl`` / ``ctl`` over ``[startDate, endDate]``; days without a
-    finalized value are omitted. A missing device yields ``[]``.
+    Per-day ``atl`` / ``ctl`` over ``[startDate, endDate]``; a day without a
+    finalized value is carried from the last real pair across a gap <=
+    ``STALE_WINDOW_DAYS`` (marked ``carried``), else omitted. A missing device
+    yields ``[]``.
     """
     device = session.exec(select(Device).where(Device.mac == address)).first()
     if device is None:

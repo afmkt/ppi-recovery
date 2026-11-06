@@ -120,6 +120,21 @@ NON_SPORT_STRATEGY = "threshold"
 # No fallback: a day with no data from the selected source is omitted.
 READINESS_GRANULARITY = "hourly"
 
+# Staleness window (boom carry-forward strategy, read-time only).
+#
+# A current-card value (``/go``, ``/status``, ``/energy_status``, ``/load_status``,
+# ``/superrecovery``, ``/body_metrics``) is flagged ``stale`` when the most recent
+# day it came from is older than this many days (device-local). The value is still
+# returned ("mark, don't cap"); the flag lets the UI dim/label it.
+#
+# A trend point (``/readiness``, ``/energy_trend``, ``/load_trend``, ``/sport_load``,
+# ``/atlctl``, ``/body_metrics`` trend) with no real value for a day carries the
+# last real value forward (LOCF) only across a gap <= this many days, marked
+# ``carried``; a gap larger than this is left as a real hole (never fabricated,
+# never zeroed). Both live at the read layer: no carried value is ever written
+# back into a DailySummary / baseline / energy recursion.
+STALE_WINDOW_DAYS = 7
+
 # 4x4 status weight grid (identical for the base-score §1 and sleep-score §2
 # lookups). Rows/cols are 1-indexed severity bands 1..4 (0-indexed here);
 # lower band = better = lower weight = higher score (50 / weight).

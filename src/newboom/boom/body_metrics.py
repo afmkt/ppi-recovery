@@ -2,20 +2,22 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel, Field
+from pydantic import Field
 from sqlmodel import Session, col, select
 
-from newboom.boom.schemas import BoomResponse, DatePoint
+from newboom.boom.schemas import BoomResponse, DatePoint, StaleFields
+from newboom.boom.staleness import locf, mark_stale
+from newboom.config import STALE_WINDOW_DAYS
 from newboom.database import get_session
 from newboom.model import DailySummary, Device, MinuteMetric
 
 router = APIRouter(tags=["身体指标"])
 
 
-class BodyMetricsData(BaseModel):
+class BodyMetricsData(StaleFields):
     currentData: str = Field(default="", description="当前数据值")
     normalRange: str = Field(default="", description="正常范围")
     trendData: list[DatePoint] = Field(default_factory=list, description="趋势数据列表")
@@ -57,34 +59,41 @@ def _summary_values(
     field: str,
     divisor: float,
 ) -> list[DatePoint]:
-    """Per-day value from a ``DailySummary`` float field over ``[start, end]``
-    (days with a null value omitted), divided by ``divisor`` and rounded."""
+    """Per-day value from a ``DailySummary`` float field (LOCF-filled, marked
+    ``carried``), divided by ``divisor`` and rounded. Fetches from
+    ``start - STALE_WINDOW_DAYS`` so :func:`locf` can seed a leading carry, then
+    clips back to ``[start, end]``; a day with a null value is carried from the
+    last real one across a gap <= the window, else omitted."""
     column = col(getattr(DailySummary, field))
     rows = session.exec(
         select(DailySummary)
         .where(DailySummary.device_id == device_id)
-        .where(DailySummary.summary_date >= start)
+        .where(DailySummary.summary_date >= start - timedelta(days=STALE_WINDOW_DAYS))
         .where(DailySummary.summary_date <= end)
         .where(column.isnot(None))
         .order_by(col(DailySummary.summary_date).asc())
     ).all()
-    return [
+    real = [
         DatePoint(
             date=r.summary_date.isoformat(), value=round(getattr(r, field) / divisor)
         )
         for r in rows
     ]
+    return locf(real, start, end)
 
 
 def _heart_rate_trend(
     session: Session, device_id: int, start: date, end: date
 ) -> list[DatePoint]:
     """Per-day mean heart rate (``MinuteMetric.heart_rate`` over each
-    ``night_date``); a day with no minutes is omitted."""
+    ``night_date``, LOCF-filled, marked ``carried``). Fetches minutes from
+    ``start - STALE_WINDOW_DAYS`` so :func:`locf` can seed a leading carry, then
+    clips back to ``[start, end]``; a day with no minutes is carried from the
+    last real mean across a gap <= the window, else omitted."""
     rows = session.exec(
         select(MinuteMetric)
         .where(MinuteMetric.device_id == device_id)
-        .where(MinuteMetric.night_date >= start)
+        .where(MinuteMetric.night_date >= start - timedelta(days=STALE_WINDOW_DAYS))
         .where(MinuteMetric.night_date <= end)
         .order_by(col(MinuteMetric.timestamp).asc())
     ).all()
@@ -93,16 +102,19 @@ def _heart_rate_trend(
         if m.heart_rate is None:
             continue
         by_day.setdefault(m.night_date, []).append(m.heart_rate)
-    return [
+    real = [
         DatePoint(date=d.isoformat(), value=round(sum(by_day[d]) / len(by_day[d])))
         for d in sorted(by_day)
     ]
+    return locf(real, start, end)
 
 
 def _latest_summary_value(
     session: Session, device_id: int, field: str, divisor: float
-) -> float | None:
-    """The most recent day's value from a ``DailySummary`` field, or ``None``."""
+) -> tuple[float | None, date | None]:
+    """The most recent day's value from a ``DailySummary`` field, or
+    ``(None, None)``. Returns the value *and* the ``summary_date`` it came from
+    (the ``asOf`` source for the staleness marker)."""
     row = session.exec(
         select(DailySummary)
         .where(DailySummary.device_id == device_id)
@@ -110,20 +122,23 @@ def _latest_summary_value(
         .order_by(col(DailySummary.summary_date).desc())
     ).first()
     if row is None:
-        return None
-    return getattr(row, field) / divisor
+        return None, None
+    return getattr(row, field) / divisor, row.summary_date
 
 
-def _latest_heart_rate(session: Session, device_id: int) -> float | None:
-    """The most recent ``MinuteMetric`` heart rate, or ``None``."""
+def _latest_heart_rate(
+    session: Session, device_id: int
+) -> tuple[float | None, date | None]:
+    """The most recent ``MinuteMetric`` heart rate *and* the date it came from,
+    or ``(None, None)``. The date is the ``asOf`` source for the marker."""
     row = session.exec(
         select(MinuteMetric)
         .where(MinuteMetric.device_id == device_id)
         .order_by(col(MinuteMetric.timestamp).desc())
     ).first()
     if row is None or row.heart_rate is None:
-        return None
-    return row.heart_rate
+        return None, None
+    return row.heart_rate, row.timestamp.date()
 
 
 def _analysis_text(session: Session, device_id: int) -> str:
@@ -164,15 +179,18 @@ async def get_body_metrics(
     ``heartRate`` is the per-day mean of ``MinuteMetric.heart_rate`` (no
     per-day field exists). ``currentData`` is the latest available value for the
     metric (formatted with its unit); ``analysisText`` is the latest day's
-    ``boom_go_text``.
+    ``boom_go_text``. ``trendData`` is LOCF-filled (a missing day carried from
+    the last real value across a gap <= ``STALE_WINDOW_DAYS``, marked
+    ``carried``). ``asOf`` / ``stale`` mark when the ``currentData`` came from
+    and whether it is older than the staleness window.
 
     ``normalRange`` and ``updateTime`` have no source in the spec, model, or
     calc docs, so they are left empty (pending). A missing device or an unknown
-    ``metric`` yields an empty payload.
+    ``metric`` yields an empty payload with ``asOf=None`` / ``stale=True``.
     """
     device = session.exec(select(Device).where(Device.mac == address)).first()
     if device is None:
-        return BoomResponse(code=0, data=BodyMetricsData())
+        return BoomResponse(code=0, data=BodyMetricsData(asOf=None, stale=True))
 
     start = _parse_date(startDate)
     end = _parse_date(endDate)
@@ -183,7 +201,7 @@ async def get_body_metrics(
         trend = _heart_rate_trend(
             session, device.id if device.id is not None else -1, start, end
         )
-        current = _latest_heart_rate(
+        current, source = _latest_heart_rate(
             session, device.id if device.id is not None else -1
         )
     elif metric in _SUMMARY_METRICS:
@@ -196,12 +214,13 @@ async def get_body_metrics(
             field,
             divisor,
         )
-        current = _latest_summary_value(
+        current, source = _latest_summary_value(
             session, device.id if device.id is not None else -1, field, divisor
         )
     else:
-        return BoomResponse(code=0, data=BodyMetricsData())
+        return BoomResponse(code=0, data=BodyMetricsData(asOf=None, stale=True))
 
+    as_of, stale = mark_stale(source, device=device)
     return BoomResponse(
         code=0,
         data=BodyMetricsData(
@@ -210,5 +229,7 @@ async def get_body_metrics(
             analysisText=_analysis_text(
                 session, device.id if device.id is not None else -1
             ),
+            asOf=as_of,
+            stale=stale,
         ),
     )

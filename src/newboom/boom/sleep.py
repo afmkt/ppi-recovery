@@ -12,7 +12,8 @@ from pydantic import BaseModel, Field
 from sqlmodel import Session, col, select
 
 from newboom.boom.schemas import BoomResponse, DatePoint, TimePoint
-from newboom.config import NIGHT_START_HOUR
+from newboom.boom.staleness import locf
+from newboom.config import NIGHT_START_HOUR, STALE_WINDOW_DAYS
 from newboom.database import get_session
 from newboom.model import PPI, DailySummary, Device, MinuteMetric, Sleep, WindowMetric
 
@@ -236,16 +237,22 @@ def _sleep_metric_points(
 def _sleep_trend(
     session: Session, device_id: int, start: date, end: date
 ) -> list[DatePoint]:
-    """Per-day sleep duration in hours (``DatePoint.value``); a night with no
-    ``Sleep`` record in the range is omitted."""
-    recs = _night_sleep_records(session, device_id, start, end)
-    return [
+    """Per-day sleep duration in hours (LOCF-filled, marked ``carried``).
+    Fetches nights from ``start - STALE_WINDOW_DAYS`` so :func:`locf` can seed a
+    leading carry, then clips back to ``[start, end]``; a night with no
+    ``Sleep`` record is carried from the last real one across a gap <= the
+    window, else omitted."""
+    recs = _night_sleep_records(
+        session, device_id, start - timedelta(days=STALE_WINDOW_DAYS), end
+    )
+    real = [
         DatePoint(
             date=night.isoformat(),
             value=round(_sleep_duration_hours(recs[night]), 1),
         )
         for night in sorted(recs)
     ]
+    return locf(real, start, end)
 
 
 # --- endpoints -------------------------------------------------------------
@@ -394,7 +401,9 @@ async def get_sleep_trend(
     """3.3 获取睡眠时长趋势数据（value 为小时数）.
 
     Per-day total sleep in hours over ``[startDate, endDate]``; a night with no
-    ``Sleep`` record is omitted. A missing device yields ``[]``.
+    ``Sleep`` record is carried from the last real value across a gap <=
+    ``STALE_WINDOW_DAYS`` (marked ``carried``), else omitted. A missing device
+    yields ``[]``.
     """
     device = session.exec(select(Device).where(Device.mac == address)).first()
     if device is None:

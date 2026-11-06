@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel, Field
+from pydantic import Field
 from sqlmodel import Session, col, select
 
-from newboom.boom.schemas import BoomResponse, DatePoint, TimePoint
-from newboom.config import FIRST_ENERGY
+from newboom.boom.schemas import BoomResponse, DatePoint, StaleFields, TimePoint
+from newboom.boom.staleness import locf, mark_stale
+from newboom.config import FIRST_ENERGY, STALE_WINDOW_DAYS
 from newboom.database import get_session
 from newboom.model import DailySummary, Device, MinuteMetric
 
@@ -20,7 +21,7 @@ def _parse_date(value: str) -> date:
     return datetime.strptime(value, "%Y-%m-%d").date()
 
 
-class EnergyStatusData(BaseModel):
+class EnergyStatusData(StaleFields):
     totalEnergy: int = Field(default=0, description="总储能值 0-100")
     energyProgress: int = Field(default=0, description="储能进度百分比 0-100")
     totalCharge: int = Field(default=0, description="总充能值")
@@ -81,11 +82,13 @@ async def get_energy_status(
     retains the last valid minute energy (spec §8 "保留最近一次有效
     totalEnergy"). ``totalCharge`` / ``totalConsume`` come from
     :func:`_charge_consume`; ``energyChartData`` is the day's per-minute
-    energy curve. A missing device / day yields a zeroed payload.
+    energy curve. A missing device / day yields a zeroed payload with
+    ``asOf=None`` / ``stale=True``. With a summary, ``asOf`` is its
+    ``summary_date`` and ``stale`` True when older than ``STALE_WINDOW_DAYS``.
     """
     device = session.exec(select(Device).where(Device.mac == address)).first()
     if device is None:
-        return BoomResponse(code=0, data=EnergyStatusData())
+        return BoomResponse(code=0, data=EnergyStatusData(asOf=None, stale=True))
 
     if date:
         target = _parse_date(date)
@@ -101,8 +104,9 @@ async def get_energy_status(
             .order_by(col(DailySummary.summary_date).desc())
         ).first()
     if summary is None:
-        return BoomResponse(code=0, data=EnergyStatusData())
+        return BoomResponse(code=0, data=EnergyStatusData(asOf=None, stale=True))
 
+    as_of, stale = mark_stale(summary.summary_date, device=device)
     chart = _energy_chart_data(
         session, device.id if device.id else -1, summary.summary_date
     )
@@ -121,6 +125,8 @@ async def get_energy_status(
             totalCharge=charge,
             totalConsume=consume,
             energyChartData=chart,
+            asOf=as_of,
+            stale=stale,
         ),
     )
 
@@ -128,17 +134,19 @@ async def get_energy_status(
 def _energy_trend(
     session: Session, device_id: int, start: date, end: date
 ) -> list[DatePoint]:
-    """Per-day body energy ``F_d``; days without a finalized ``energy_end_f``
-    are omitted."""
+    """Per-day body energy ``F_d`` (LOCF-filled, marked ``carried``). Fetches
+    from ``start - STALE_WINDOW_DAYS`` so :func:`locf` can seed a leading carry,
+    then clips back to ``[start, end]``; a day the source lacks is carried from
+    the last real ``energy_end_f`` across a gap <= the window, else omitted."""
     rows = session.exec(
         select(DailySummary)
         .where(DailySummary.device_id == device_id)
-        .where(DailySummary.summary_date >= start)
+        .where(DailySummary.summary_date >= start - timedelta(days=STALE_WINDOW_DAYS))
         .where(DailySummary.summary_date <= end)
         .where(col(DailySummary.energy_end_f).isnot(None))
         .order_by(col(DailySummary.summary_date).asc())
     ).all()
-    return [
+    real = [
         DatePoint(
             date=r.summary_date.isoformat(),
             value=round(
@@ -150,6 +158,7 @@ def _energy_trend(
         )
         for r in rows
     ]
+    return locf(real, start, end)
 
 
 @router.get(
@@ -165,7 +174,9 @@ async def get_energy_trend(
     """4.2 获取身体储能趋势数据.
 
     Per-day body energy value (``F_d`` = ``energy_end_f``, 0-100) over
-    ``[startDate, endDate]``; days without a finalized energy are omitted.
+    ``[startDate, endDate]``; a day without a finalized energy is carried from
+    the last real value across a gap <= ``STALE_WINDOW_DAYS`` (marked
+    ``carried``), else omitted. A missing device yields ``[]``.
     """
     device = session.exec(select(Device).where(Device.mac == address)).first()
     if device is None:
