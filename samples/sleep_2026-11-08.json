@@ -1,0 +1,16 @@
+{
+  "device": "BOOM-0001",
+  "address": "AA:BB:CC:DD:EE:FF",
+  "timezone": "08:00",
+  "datas": [
+    {
+      "time": "2026-11-08 08:30:00",
+      "sleepOnsetTime": 30600,
+      "awakeTime": 57600,
+      "lightSleepPeriod": 14400,
+      "deepSleepPeriod": 7200,
+      "otherSleepPeriod": 7200,
+      "heartRateRest": 45
+    }
+  ]
+}
