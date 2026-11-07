@@ -4,14 +4,14 @@ The §10 request shapes are superseded by ``docs/new-interface.md``:
 ``/upload/ppi`` carries the per-second sleep detail (``activity``) plus
 ``hr`` / ``spo2`` / ``ppi``; ``/upload/sleep`` carries the one-per-night
 summary (onset/awake + three stage durations + resting HR). ``spo2`` is the
-device raw value (×10); ``spo2 == 0`` means the device gave no sample that
+device raw value (x10); ``spo2 == 0`` means the device gave no sample that
 second (the per-second history has no spo2 field, only the broadcast does).
 
 The write logic mirrors :mod:`newboom.upload` (the legacy router mounted at
 ``/api/upload``); only the envelope differs here — writes return
 ``BoomMessage`` (``{code, msg}``), the retrieval GETs return
 ``BoomResponse[list[…]]``. ``spo2`` is stored/uploaded as the device raw
-value (×10); only the UI folds it back to a percentage on display.
+value (x10); only the UI folds it back to a percentage on display.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from sqlalchemy.dialects.sqlite import insert
 from sqlmodel import Session, col, select
 
 from newboom.boom.schemas import BoomMessage, BoomResponse
-from newboom.database import get_session
+from newboom.database import get_session, run_write
 from newboom.model import PPI, Device, Sleep
 from newboom.storage import save_data_to_file
 from newboom.upload import (
@@ -106,33 +106,42 @@ async def upload_ppi(
     new-interface.md §3.1: ``spo2`` 为设备原始值(x10)，落库/上传均用原始值，
     仅界面展示时折算百分比；``spo2=0`` 表示该秒设备未给血氧。
     """
-    device = _upsert_device(session, req.device, req.address, req.timezone)
+    # The file write is idempotent (hash-named) and independent of the DB, so it
+    # happens once, outside the retried unit.
     save_data_to_file(req.model_dump(), "ppi", req.device)
-    for row in req.datas:
-        local_time = datetime.strptime(row.time, _TIME_FMT)
-        stmt = (
-            insert(PPI)
-            .values(
-                time=local_time,
-                hr=row.hr,
-                spo2=row.spo2,
-                ppi=row.ppi,
-                activity=row.activity,
-                device_id=device.id or 0,
+
+    # One atomic, retryable unit: the device upsert and the PPI upserts commit
+    # together. PPI inserts are upserts on (device_id, time), so a retry after a
+    # transient lock neither duplicates nor loses rows.
+    def _upsert(s: Session) -> None:
+        device = _upsert_device(s, req.device, req.address, req.timezone)
+        for row in req.datas:
+            local_time = datetime.strptime(row.time, _TIME_FMT)
+            stmt = (
+                insert(PPI)
+                .values(
+                    time=local_time,
+                    hr=row.hr,
+                    spo2=row.spo2,
+                    ppi=row.ppi,
+                    activity=row.activity,
+                    device_id=device.id or 0,
+                )
+                .on_conflict_do_update(
+                    index_elements=["device_id", "time"],
+                    set_={
+                        "hr": row.hr,
+                        "spo2": row.spo2,
+                        "ppi": row.ppi,
+                        "activity": row.activity,
+                        "fresh": True,
+                    },
+                )
             )
-            .on_conflict_do_update(
-                index_elements=["device_id", "time"],
-                set_={
-                    "hr": row.hr,
-                    "spo2": row.spo2,
-                    "ppi": row.ppi,
-                    "activity": row.activity,
-                    "fresh": True,
-                },
-            )
-        )
-        session.execute(stmt)
-    session.commit()
+            s.execute(stmt)
+        s.commit()
+
+    run_write(session, _upsert)
     return BoomMessage(code=0, msg="")
 
 
@@ -185,37 +194,46 @@ async def upload_sleep(
     new-interface.md §2: 入睡/醒来及三段时长均为设备原样秒数，画不出逐秒
     曲线，曲线由 ``/upload/ppi`` 提供。
     """
-    device = _upsert_device(session, req.device, req.address, req.timezone)
+    # The file write is idempotent (hash-named) and independent of the DB, so it
+    # happens once, outside the retried unit.
     save_data_to_file(req.model_dump(), "sleep", req.device)
-    for row in req.datas:
-        local_time = datetime.strptime(row.time, _TIME_FMT)
-        stmt = (
-            insert(Sleep)
-            .values(
-                time=local_time,
-                timezone=req.timezone,
-                sleep_onset_time=row.sleepOnsetTime,
-                awake_time=row.awakeTime,
-                light_sleep_period=row.lightSleepPeriod,
-                deep_sleep_period=row.deepSleepPeriod,
-                other_sleep_period=row.otherSleepPeriod,
-                heart_rate_rest=row.heartRateRest,
-                device_id=device.id or 0,
+
+    # One atomic, retryable unit: the device upsert and the Sleep upserts commit
+    # together. Sleep inserts are upserts on (device_id, time), so a retry after a
+    # transient lock neither duplicates nor loses rows.
+    def _upsert(s: Session) -> None:
+        device = _upsert_device(s, req.device, req.address, req.timezone)
+        for row in req.datas:
+            local_time = datetime.strptime(row.time, _TIME_FMT)
+            stmt = (
+                insert(Sleep)
+                .values(
+                    time=local_time,
+                    timezone=req.timezone,
+                    sleep_onset_time=row.sleepOnsetTime,
+                    awake_time=row.awakeTime,
+                    light_sleep_period=row.lightSleepPeriod,
+                    deep_sleep_period=row.deepSleepPeriod,
+                    other_sleep_period=row.otherSleepPeriod,
+                    heart_rate_rest=row.heartRateRest,
+                    device_id=device.id or 0,
+                )
+                .on_conflict_do_update(
+                    index_elements=["device_id", "time"],
+                    set_={
+                        "timezone": req.timezone,
+                        "sleep_onset_time": row.sleepOnsetTime,
+                        "awake_time": row.awakeTime,
+                        "light_sleep_period": row.lightSleepPeriod,
+                        "deep_sleep_period": row.deepSleepPeriod,
+                        "other_sleep_period": row.otherSleepPeriod,
+                        "heart_rate_rest": row.heartRateRest,
+                        "fresh": True,
+                    },
+                )
             )
-            .on_conflict_do_update(
-                index_elements=["device_id", "time"],
-                set_={
-                    "timezone": req.timezone,
-                    "sleep_onset_time": row.sleepOnsetTime,
-                    "awake_time": row.awakeTime,
-                    "light_sleep_period": row.lightSleepPeriod,
-                    "deep_sleep_period": row.deepSleepPeriod,
-                    "other_sleep_period": row.otherSleepPeriod,
-                    "heart_rate_rest": row.heartRateRest,
-                    "fresh": True,
-                },
-            )
-        )
-        session.execute(stmt)
-    session.commit()
+            s.execute(stmt)
+        s.commit()
+
+    run_write(session, _upsert)
     return BoomMessage(code=0, msg="")

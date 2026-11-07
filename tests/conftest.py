@@ -35,8 +35,9 @@ from newboom.model import (  # noqa: E402
 
 create_db_and_tables()
 
-# Insert order is irrelevant: the test engine does not enable FK enforcement,
-# so plain DELETE per table is enough for isolation.
+# FK enforcement is ON (database._configure_sqlite runs PRAGMA foreign_keys=ON),
+# so a parent cannot be deleted while child rows remain. _TABLES lists parents
+# first; clean_db deletes in reverse so every child row is gone before its parent.
 _TABLES = [
     Device,
     PPI,
@@ -58,8 +59,13 @@ _TABLES = [
 
 @pytest.fixture(autouse=True)
 def clean_db():
-    """Empty every table before each test."""
+    """Empty every table before each test.
+
+    Children are deleted before parents (``reversed``) because the engine enforces
+    foreign keys; deleting a parent while its child rows remain raises an
+    IntegrityError.
+    """
     with engine.begin() as conn:
-        for table in _TABLES:
+        for table in reversed(_TABLES):
             conn.execute(text(f"DELETE FROM {table.__tablename__}"))
     yield

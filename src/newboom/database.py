@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import os
+import random
+import time
 
 from dotenv import load_dotenv
 from sqlalchemy import event, text
+from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, SQLModel, create_engine
 
 load_dotenv()
@@ -13,16 +16,10 @@ sqlite_url = os.getenv("DATABASE_URL", "sqlite:///data/newboom.db")
 # One shared engine. It is used by both the async event-loop thread (FastAPI
 # request sessions via get_session) and the off-loop worker thread
 # (asyncio.to_thread), so the pool's connections must be allowed to cross thread
-# boundaries (check_same_thread=False). The connect_args timeout is the
-# busy-handler wait: while the worker holds the single SQLite writer lock for a
-# multi-second cycle, a concurrent API writer blocks up to this many seconds
-# instead of failing instantly with "database is locked". Env-tunable like the
-# worker cadence so a slow box can widen the grace without a code change.
-_busy_timeout_s = float(os.getenv("SQLITE_BUSY_TIMEOUT_S", "30"))
-engine = create_engine(
-    sqlite_url,
-    connect_args={"check_same_thread": False, "timeout": _busy_timeout_s},
-)
+# boundaries (check_same_thread=False). The per-connection busy-wait lives in the
+# connect listener below (PRAGMA busy_timeout) — the only thing connect_args still
+# needs is check_same_thread, which the listener cannot set.
+engine = create_engine(sqlite_url, connect_args={"check_same_thread": False})
 
 
 @event.listens_for(engine, "connect")
@@ -46,6 +43,78 @@ def _configure_sqlite(dbapi_connection, _record):
         cursor.execute("PRAGMA foreign_keys=ON")
     finally:
         cursor.close()
+
+
+# --- Concurrency retry -------------------------------------------------------
+#
+# WAL plus the connect_args busy-timeout above are the first line of defence
+# against the worker and the API contending for SQLite's single writer lock. A
+# transient lock that outlives the busy-wait surfaces as OperationalError
+# ("database is locked"/"database is busy"); the helpers below retry such a unit.
+# A retry is safe only because a SQLite commit is atomic: a failed attempt wrote
+# nothing, so re-running an idempotent unit (upserts, watermark-guarded stages,
+# idempotent file writes) neither duplicates nor loses data.
+
+
+def is_transient_lock(exc: BaseException) -> bool:
+    """True for a transient SQLite contention error worth retrying.
+
+    Only the busy-handler timing out under concurrent writers is retried. Other
+    OperationalErrors — "no such table", "database is corrupt", constraint
+    violations — are permanent and must propagate, not be retried.
+    """
+    if not isinstance(exc, OperationalError):
+        return False
+    msg = " ".join(str(a).lower() for a in getattr(exc, "args", ()))
+    return "locked" in msg or "busy" in msg
+
+
+def retry(work, *, attempts: int = 5, base_delay: float = 0.05, max_delay: float = 1.0):
+    """Run the re-runnable ``work()`` callback, retrying on a transient SQLite
+    lock/timeout with exponential backoff + jitter.
+
+    ``work`` must be idempotent (see the module note): re-running it after a
+    failed commit is safe. Returns ``work``'s value; re-raises the final error
+    or any non-transient error. Use this for callbacks that open their own
+    Session(s); for a caller-supplied session use :func:`run_write`.
+    """
+    delay = base_delay
+    for attempt in range(attempts):
+        try:
+            return work()
+        except OperationalError as exc:
+            if is_transient_lock(exc) and attempt < attempts - 1:
+                time.sleep(min(random.uniform(0, delay), max_delay))
+                delay = min(delay * 2, max_delay)
+                continue
+            raise
+
+
+def run_write(
+    session: Session,
+    work,
+    *,
+    attempts: int = 5,
+    base_delay: float = 0.05,
+    max_delay: float = 1.0,
+):
+    """Run ``work(session)`` — which performs its own add/execute/commit — and
+    retry the whole unit on a transient SQLite lock/timeout.
+
+    ``work`` must be re-runnable (idempotent inserts, idempotent side effects);
+    a failed SQLite commit wrote nothing, so a retry neither duplicates nor loses
+    data. The supplied ``session`` is rolled back between attempts. Returns
+    ``work``'s value.
+    """
+
+    def _unit():
+        try:
+            return work(session)
+        except OperationalError:
+            session.rollback()
+            raise
+
+    return retry(_unit, attempts=attempts, base_delay=base_delay, max_delay=max_delay)
 
 
 def create_db_and_tables():

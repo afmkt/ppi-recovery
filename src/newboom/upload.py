@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from sqlalchemy.dialects.sqlite import insert
 from sqlmodel import Session, col, select
 
-from newboom.database import get_session
+from newboom.database import get_session, run_write
 from newboom.model import PPI, ActivityState, Device, Sleep
 from newboom.schema import ApiResponse
 from newboom.storage import list_uploaded_files, load_data_from_file, save_data_to_file
@@ -94,53 +94,59 @@ async def get_ppi(
 async def upload_ppi(
     ppi_data: PPIUploadRequest, session: Session = Depends(get_session)
 ):
-    # Check if the device exists, if not, create it
-    device = session.exec(select(Device).where(Device.mac == ppi_data.address)).first()
-    if not device:
-        device = Device(name=ppi_data.device, mac=ppi_data.address, tz=ppi_data.timezone)
-        session.add(device)
-        session.commit()
-        session.refresh(device)
-    elif device.tz != ppi_data.timezone:
-        device.tz = ppi_data.timezone
-        session.add(device)
-        session.commit()
-        session.refresh(device)
-
-    # Save data to file
+    # The file write is idempotent (hash-named) and independent of the DB, so it
+    # happens once, outside the retried unit.
     filename = save_data_to_file(ppi_data.model_dump(), "ppi", ppi_data.device)
 
-    # Insert PPI data
-    for row in ppi_data.datas:
-        local_time = datetime.strptime(row.time, "%Y-%m-%d %H:%M:%S")
-        stmt = (
-            insert(PPI)
-            .values(
-                time=local_time,
-                hr=row.hr,
-                spo2=row.spo2,
-                ppi=row.ppi,
-                activity=row.activity,
-                device_id=device.id or 0,
+    # One atomic, retryable unit: the device create/update and the PPI upserts
+    # commit together. PPI inserts are upserts on (device_id, time), so a retry
+    # after a transient lock neither duplicates nor loses rows.
+    def _upsert(s: Session) -> int:
+        device = s.exec(select(Device).where(Device.mac == ppi_data.address)).first()
+        if not device:
+            device = Device(
+                name=ppi_data.device, mac=ppi_data.address, tz=ppi_data.timezone
             )
-            .on_conflict_do_update(
-                index_elements=["device_id", "time"],
-                set_={
-                    "hr": row.hr,
-                    "spo2": row.spo2,
-                    "ppi": row.ppi,
-                    "activity": row.activity,
-                    "fresh": True,
-                },
+            s.add(device)
+        elif device.tz != ppi_data.timezone:
+            device.tz = ppi_data.timezone
+            s.add(device)
+        s.flush()  # assign device.id for the upserts below
+        assert device.id is not None
+        device_id = device.id
+        for row in ppi_data.datas:
+            local_time = datetime.strptime(row.time, "%Y-%m-%d %H:%M:%S")
+            stmt = (
+                insert(PPI)
+                .values(
+                    time=local_time,
+                    hr=row.hr,
+                    spo2=row.spo2,
+                    ppi=row.ppi,
+                    activity=row.activity,
+                    device_id=device_id,
+                )
+                .on_conflict_do_update(
+                    index_elements=["device_id", "time"],
+                    set_={
+                        "hr": row.hr,
+                        "spo2": row.spo2,
+                        "ppi": row.ppi,
+                        "activity": row.activity,
+                        "fresh": True,
+                    },
+                )
             )
-        )
-        session.execute(stmt)
-    session.commit()
+            s.execute(stmt)
+        s.commit()
+        return device_id
+
+    device_id = run_write(session, _upsert)
     return ApiResponse(
         ok=True,
         message="PPI data uploaded successfully",
         file=filename,
-        device_id=device.id,
+        device_id=device_id,
         processed=len(ppi_data.datas),
     )
 
@@ -221,61 +227,65 @@ async def get_sleep(
 async def upload_sleep(
     sleep_data: SleepUploadRequest, session: Session = Depends(get_session)
 ):
-    # Check if the device exists, if not, create it
-    device = session.exec(
-        select(Device).where(Device.mac == sleep_data.address)
-    ).first()
-    if not device:
-        device = Device(name=sleep_data.device, mac=sleep_data.address, tz=sleep_data.timezone)
-        session.add(device)
-        session.commit()
-        session.refresh(device)
-    elif device.tz != sleep_data.timezone:
-        device.tz = sleep_data.timezone
-        session.add(device)
-        session.commit()
-        session.refresh(device)
-
-    # Save data to file
+    # The file write is idempotent (hash-named) and independent of the DB, so it
+    # happens once, outside the retried unit.
     filename = save_data_to_file(sleep_data.model_dump(), "sleep", sleep_data.device)
 
-    # Insert Sleep data
-    for row in sleep_data.datas:
-        local_time = datetime.strptime(row.time, "%Y-%m-%d %H:%M:%S")
-        stmt = (
-            insert(Sleep)
-            .values(
-                time=local_time,
-                timezone=sleep_data.timezone,
-                sleep_onset_time=row.sleepOnsetTime,
-                awake_time=row.awakeTime,
-                light_sleep_period=row.lightSleepPeriod,
-                deep_sleep_period=row.deepSleepPeriod,
-                other_sleep_period=row.otherSleepPeriod,
-                heart_rate_rest=row.heartRateRest,
-                device_id=device.id or 0,
+    # One atomic, retryable unit: the device create/update and the Sleep upserts
+    # commit together. Sleep inserts are upserts on (device_id, time), so a retry
+    # after a transient lock neither duplicates nor loses rows.
+    def _upsert(s: Session) -> int:
+        device = s.exec(select(Device).where(Device.mac == sleep_data.address)).first()
+        if not device:
+            device = Device(
+                name=sleep_data.device, mac=sleep_data.address, tz=sleep_data.timezone
             )
-            .on_conflict_do_update(
-                index_elements=["device_id", "time"],
-                set_={
-                    "timezone": sleep_data.timezone,
-                    "sleep_onset_time": row.sleepOnsetTime,
-                    "awake_time": row.awakeTime,
-                    "light_sleep_period": row.lightSleepPeriod,
-                    "deep_sleep_period": row.deepSleepPeriod,
-                    "other_sleep_period": row.otherSleepPeriod,
-                    "heart_rate_rest": row.heartRateRest,
-                    "fresh": True,
-                },
+            s.add(device)
+        elif device.tz != sleep_data.timezone:
+            device.tz = sleep_data.timezone
+            s.add(device)
+        s.flush()  # assign device.id for the upserts below
+        assert device.id is not None
+        device_id = device.id
+        for row in sleep_data.datas:
+            local_time = datetime.strptime(row.time, "%Y-%m-%d %H:%M:%S")
+            stmt = (
+                insert(Sleep)
+                .values(
+                    time=local_time,
+                    timezone=sleep_data.timezone,
+                    sleep_onset_time=row.sleepOnsetTime,
+                    awake_time=row.awakeTime,
+                    light_sleep_period=row.lightSleepPeriod,
+                    deep_sleep_period=row.deepSleepPeriod,
+                    other_sleep_period=row.otherSleepPeriod,
+                    heart_rate_rest=row.heartRateRest,
+                    device_id=device_id,
+                )
+                .on_conflict_do_update(
+                    index_elements=["device_id", "time"],
+                    set_={
+                        "timezone": sleep_data.timezone,
+                        "sleep_onset_time": row.sleepOnsetTime,
+                        "awake_time": row.awakeTime,
+                        "light_sleep_period": row.lightSleepPeriod,
+                        "deep_sleep_period": row.deepSleepPeriod,
+                        "other_sleep_period": row.otherSleepPeriod,
+                        "heart_rate_rest": row.heartRateRest,
+                        "fresh": True,
+                    },
+                )
             )
-        )
-        session.execute(stmt)
+            s.execute(stmt)
+        s.commit()
 
-    session.commit()
+        return device_id
+
+    device_id = run_write(session, _upsert)
     return ApiResponse(
         ok=True,
         message="Sleep data uploaded successfully",
-        device_id=device.id,
+        device_id=device_id,
         processed=len(sleep_data.datas),
         file=filename,
     )

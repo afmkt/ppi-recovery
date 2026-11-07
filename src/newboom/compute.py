@@ -16,7 +16,7 @@ from newboom.boom_compute import (
     process_minute_metric,
 )
 from newboom.config import CLEAN_CONTEXT, NIGHT_START_HOUR, night_key
-from newboom.database import engine
+from newboom.database import engine, retry
 from newboom.model import (
     PPI,
     ActivityState,
@@ -952,9 +952,42 @@ def record_diagnostics(device_id: int) -> None:
         session.commit()
 
 
-def process_pipeline(
-    all_devices: list[Device], run_diagnostics: bool = True
-) -> None:
+def _process_one_device(device: Device, run_diagnostics: bool) -> None:
+    """Run every processing stage for one device — the retryable pipeline unit.
+
+    Each stage is idempotent: upserts and the ``progress`` watermark guards mean
+    re-running a device after a transient lock neither duplicates nor skips work,
+    which is what makes the per-device :func:`newboom.database.retry` safe.
+    """
+    assert device.id is not None
+    count = process_window_metrics(device.id)
+    print(f"Processed {count} window metrics for device {device.id}")
+    seg_count = process_rmssd_segments(device.id)
+    if seg_count > 0:
+        print(f"Generated {seg_count} RMSSD macro-segments for device {device.id}")
+    min_count = process_minute_metric(device.id)
+    if min_count > 0:
+        print(
+            f"Computed {min_count} minutely metrics and energy states for device {device.id}"
+        )
+    summary_count = process_daily_summary_pipeline(device.id)
+    if summary_count > 0:
+        print(f"Generated {summary_count} daily summaries for device {device.id}")
+    hourly_count = process_hourly_status(device.id)
+    if hourly_count > 0:
+        print(f"Updated hourly dynamic status for device {device.id}")
+    # Q1–Q6 reporting read-models — diagnostic, best-effort: a failure here must
+    # never abort the pipeline (they are reports, not processing). Throttled by
+    # the worker via run_diagnostics so a fully-idle cycle skips the always-on
+    # reporting work.
+    if run_diagnostics:
+        try:
+            record_diagnostics(device.id)
+        except Exception as e:  # noqa: BLE001
+            print(f"record_diagnostics failed for device {device.id}: {e}")
+
+
+def process_pipeline(all_devices: list[Device], run_diagnostics: bool = True) -> None:
     """Run one pipeline pass over ``all_devices``.
 
     ``run_diagnostics`` gates the best-effort Q1–Q6 reporting read-models
@@ -964,33 +997,10 @@ def process_pipeline(
     """
     clean_ppi(all_devices)
     for device in all_devices:
-        if device.id is not None:
-            count = process_window_metrics(device.id)
-            print(f"Processed {count} window metrics for device {device.id}")
-            seg_count = process_rmssd_segments(device.id)
-            if seg_count > 0:
-                print(
-                    f"Generated {seg_count} RMSSD macro-segments for device {device.id}"
-                )
-            min_count = process_minute_metric(device.id)
-            if min_count > 0:
-                print(
-                    f"Computed {min_count} minutely metrics and energy states for device {device.id}"
-                )
-            summary_count = process_daily_summary_pipeline(device.id)
-            if summary_count > 0:
-                print(
-                    f"Generated {summary_count} daily summaries for device {device.id}"
-                )
-            hourly_count = process_hourly_status(device.id)
-            if hourly_count > 0:
-                print(f"Updated hourly dynamic status for device {device.id}")
-            # Q1–Q6 reporting read-models — diagnostic, best-effort: a failure
-            # here must never abort the pipeline (they are reports, not
-            # processing). Throttled by the worker via run_diagnostics so a
-            # fully-idle cycle skips the always-on reporting work.
-            if run_diagnostics:
-                try:
-                    record_diagnostics(device.id)
-                except Exception as e:  # noqa: BLE001
-                    print(f"record_diagnostics failed for device {device.id}: {e}")
+        if device.id is None:
+            continue
+        # Each device's stages are idempotent (upserts + watermark guards), so a
+        # transient lock mid-device is retried instead of skipping to the next
+        # ~10s cycle; a device that fails all attempts still aborts the cycle and
+        # the worker's per-cycle handler reprocesses it next cycle.
+        retry(lambda d=device: _process_one_device(d, run_diagnostics))
