@@ -3,14 +3,49 @@ from __future__ import annotations
 import os
 
 from dotenv import load_dotenv
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlmodel import Session, SQLModel, create_engine
 
 load_dotenv()
 sqlite_url = os.getenv("DATABASE_URL", "sqlite:///data/newboom.db")
 
 
-engine = create_engine(sqlite_url, connect_args={"check_same_thread": False})
+# One shared engine. It is used by both the async event-loop thread (FastAPI
+# request sessions via get_session) and the off-loop worker thread
+# (asyncio.to_thread), so the pool's connections must be allowed to cross thread
+# boundaries (check_same_thread=False). The connect_args timeout is the
+# busy-handler wait: while the worker holds the single SQLite writer lock for a
+# multi-second cycle, a concurrent API writer blocks up to this many seconds
+# instead of failing instantly with "database is locked". Env-tunable like the
+# worker cadence so a slow box can widen the grace without a code change.
+_busy_timeout_s = float(os.getenv("SQLITE_BUSY_TIMEOUT_S", "30"))
+engine = create_engine(
+    sqlite_url,
+    connect_args={"check_same_thread": False, "timeout": _busy_timeout_s},
+)
+
+
+@event.listens_for(engine, "connect")
+def _configure_sqlite(dbapi_connection, _record):
+    """Put every new connection into WAL mode at a crash-safe sync level.
+
+    WAL (write-ahead logging) is the fix for the worker/API contention: a writer
+    runs alongside readers and, crucially, a reader never blocks a writer. WAL is
+    a persistent property of the .db file, so one connection setting it is enough,
+    but the connect listener guarantees it on every new connection regardless of
+    which one touches the database first. synchronous=NORMAL is the crash-safe
+    level *with* WAL; do not use it in rollback-journal mode, where it risks
+    corruption on power loss. Requires the file to live on a local,
+    mmap-capable filesystem (not NFS/SMB).
+    """
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")  # good tradeoff with WAL
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA foreign_keys=ON")
+    finally:
+        cursor.close()
 
 
 def create_db_and_tables():

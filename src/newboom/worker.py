@@ -52,9 +52,14 @@ async def background_worker_loop() -> None:
 
 def _run_pipeline_cycle(run_diagnostics: bool) -> None:
     """One worker cycle, executed off the event loop by ``to_thread``."""
+    # Read the device list in its own short-lived session and close it *before*
+    # the pipeline runs: process_pipeline opens its own per-stage sessions, and
+    # leaving this session open for the whole multi-second cycle would hold a
+    # connection (and an idle transaction) that can self-block a write from the
+    # pipeline's own connection under a rollback journal.
     with Session(engine) as session:
-        all_devices = session.exec(select(Device)).all()
-        process_pipeline(list(all_devices), run_diagnostics=run_diagnostics)
+        all_devices = list(session.exec(select(Device)).all())
+    process_pipeline(all_devices, run_diagnostics=run_diagnostics)
 
 
 @asynccontextmanager
