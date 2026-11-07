@@ -17,7 +17,7 @@ def device_sidebar(mo, sql, devices):
         btn = mo.ui.button(
             label=label,
             on_click=lambda _, dv=row: set_device(dv),
-            kind="primary" if is_selected else "neutral",
+            kind="info" if is_selected else "neutral",
         )
         buttons.append(btn)
 
@@ -362,7 +362,7 @@ def upload_view(mo, uploader):
         res = uploader.post_upload(base, prefix, dtype, rec.contents)
         set_status(res.as_markdown())
 
-    upload_btn = mo.ui.button(label="Upload", on_click=on_upload, kind="primary")
+    upload_btn = mo.ui.button(label="Upload", on_click=on_upload, kind="neutral")
     hint = mo.md(
         f"POSTs the file verbatim to `{prefix}/{{ppi,sleep}}` on `{base}` — "
         "the same endpoint a device / `newboom_sync.py` uses (validates, writes "
