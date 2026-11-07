@@ -368,6 +368,34 @@ def test_charts_render_placeholder_on_empty_data(cols, helper):
     assert isinstance(json, str) and len(json) > 0
 
 
+def test_window_ribbon_chart_normalizes_state_case():
+    # Regression: the DB stores WindowState as the enum *name* (uppercase, e.g.
+    # "PARASYMPATHETIC") — SQLModel's Enum column persists the name and the
+    # dashboard reads the raw VARCHAR via pandas, bypassing the enum — while the
+    # ribbon's color scale fixes a lowercase domain (the enum *values*). Without
+    # normalizing the state, no plotted point maps to a color and Vega renders an
+    # empty ribbon even though the window is full of lf_hf windows.
+    df = pd.DataFrame(
+        {
+            "window_mid_h": [1.0, 2.0, 3.0],
+            "lf_hf": [0.5, 0.6, 0.55],
+            "state": ["PARASYMPATHETIC", "TRANSITION", "SYMPATHETIC"],
+        }
+    )
+    chart = m.window_ribbon_chart(df)
+    spec = chart.to_dict()
+    domain = set(spec["encoding"]["color"]["scale"]["domain"])
+    states = [
+        row["state"]
+        for rows in spec.get("datasets", {}).values()
+        if isinstance(rows, list) and rows and "state" in rows[0]
+        for row in rows
+    ]
+    assert states, "lf_hf windows did not survive into the chart data"
+    # every plotted state must map to a color in the fixed lowercase domain
+    assert all(s in domain for s in states)
+
+
 # --- last_lfhf_time / window_ribbon caption (self-explaining empty chart) ----
 
 

@@ -774,6 +774,14 @@ def window_ribbon_chart(df: pd.DataFrame) -> alt.Chart:
     if "lf_hf" not in d.columns or not d["lf_hf"].notna().any():
         return _empty(line=True, title="Window ribbon — no LF/HF rows")
     d = d[d["lf_hf"].notna()]
+    # The color scale below fixes a lowercase domain (the WindowState enum
+    # *values*), but the DB stores ``state`` as the enum *name* (uppercase —
+    # SQLModel's Enum column persists the name, and the dashboard reads the raw
+    # VARCHAR via pandas, bypassing the enum). Lowercase it so every plotted
+    # state maps to a color; otherwise no point gets a stroke and the ribbon
+    # renders empty even though the window is full of LF/HF windows.
+    if "state" in d.columns:
+        d["state"] = d["state"].astype("string").str.lower()
     return (
         alt.Chart(d)
         .mark_line(point=False)
