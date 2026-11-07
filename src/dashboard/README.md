@@ -3,7 +3,7 @@ Accessed at **`/dashboard/`** when the API runs (`uvicorn newboom.api:app` /
 `newboom.dashboard`, alongside the API and the ingestion worker. It reads
 `data/newboom.db` read-only, so it works both live and from a historical DB.
 
-The left sidebar selects a device. The main area has two tabs.
+The left sidebar selects a device. The main area has three tabs.
 
 ## Overview tab
 
@@ -42,6 +42,36 @@ windows. The caption then says "0 with LF/HF · most recent LF/HF was
 `<time>` `<gap>` before this window" (or "this device has no LF/HF windows at
 all"), and the table below shows the (invalid) windows so the reason is visible.
 
+## Upload tab
+
+Upload a device `ppi` / `sleep` JSON capture to the running server — the same
+payload a device or `tools/newboom_sync.py` sends. A type dropdown (PPI / Sleep)
+and a file picker (`.json`); **Upload** POSTs the file's bytes to the server's
+upload endpoint and shows the result inline (rows processed, device id, saved
+filename, or the error).
+
+The tab does **not** re-implement persistence: the marimo kernel POSTs to the
+very endpoint that owns the write, so request validation, the hash-named file
+write, and the idempotent `(device_id, time)` upsert all happen in the API — the
+UI only moves bytes. The client lives in `dashboard.uploader` (pure stdlib,
+marimo-free, tested in `tests/test_dashboard_upload.py`); the UI in `vis.py`
+wires the widgets.
+
+Target and prefix are env-overridable (defaults match this in-process
+deployment):
+
+- `DASHBOARD_API_BASE` — server base URL, default `http://127.0.0.1:$PORT`
+  (the in-process server; `PORT` defaults to `8000`).
+- `DASHBOARD_UPLOAD_PREFIX` — default `/api/upload` (returns `ApiResponse` with a
+  processed count / device id / saved filename). Set to `/upload` to use the
+  `BoomMessage` endpoint instead; both persist identically.
+- `DASHBOARD_UPLOAD_TIMEOUT` — per-request deadline in seconds, default `120`
+  (a per-second PPI capture can be several MB).
+
+Two caveats: a large PPI file makes the button briefly block the kernel while it
+round-trips; and a **newly uploaded device** shows in the left sidebar only after
+a reload — the device list is read once at connect.
+
 ## Data model
 
 The builders live in `dashboard.metrics` and take a `query` callable
@@ -55,4 +85,5 @@ The builders live in `dashboard.metrics` and take a `query` callable
 | Daily | `dailysummary` | `summary_date` | sympathetic/parasympathetic/transition stacked bars |
 
 Tests for the builders, the time-window anchoring, and the empty-ribbon
-explanation live in `tests/test_dashboard_tables.py`.
+explanation live in `tests/test_dashboard_tables.py`; the Upload-tab client
+(`dashboard.uploader`) in `tests/test_dashboard_upload.py`.

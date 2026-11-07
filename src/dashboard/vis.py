@@ -324,9 +324,82 @@ def tables_view(mo, get_device, ppi_panel, window_panel, minute_panel, daily_pan
 
 
 @app.cell
-def _(mo, sidebar, overview_view, tables_view):
+def uploader_mod():
+    from dashboard import uploader as uploader
+
+    return (uploader,)
+
+
+@app.cell
+def upload_view(mo, uploader):
+    # The dashboard runs in-process in the FastAPI app, so it POSTs to the same
+    # server that owns /api/upload/{ppi,sleep}. The endpoint validates the body,
+    # writes the hash-named file and upserts by (device_id, time) — the UI only
+    # moves bytes. Target + prefix come from the module (env-overridable).
+    base = uploader.DEFAULT_BASE
+    prefix = uploader.DEFAULT_PREFIX
+    status, set_status = mo.state("")
+    type_dd = mo.ui.dropdown(["PPI", "Sleep"], value="PPI", label="Type")
+    file_in = mo.ui.file(
+        filetypes=[".json"],
+        kind="area",
+        label="Drop or pick a ppi / sleep JSON file",
+    )
+
+    def on_upload(_):
+        results = file_in.value
+        if not results:
+            set_status("⚠ Pick a file first.")
+            return
+        rec = results[0]
+        dtype = type_dd.value.lower()
+        # Fail fast on malformed JSON instead of a cryptic 422 from the API.
+        try:
+            uploader.parse_payload(rec.contents)
+        except (ValueError, TypeError) as e:
+            set_status(f"⚠ {e}")
+            return
+        res = uploader.post_upload(base, prefix, dtype, rec.contents)
+        set_status(res.as_markdown())
+
+    upload_btn = mo.ui.button(label="Upload", on_click=on_upload, kind="primary")
+    hint = mo.md(
+        f"POSTs the file verbatim to `{prefix}/{{ppi,sleep}}` on `{base}` — "
+        "the same endpoint a device / `newboom_sync.py` uses (validates, writes "
+        "the hash-named file, upserts by device+time; idempotent). A **newly "
+        "uploaded device** shows in the left panel after a reload (the device "
+        "list is read once at connect)."
+    )
+    _status = status()
+    status_md = (
+        mo.md(_status)
+        if _status
+        else mo.md("_Idle — pick a type, choose a file, then Upload._")
+    )
+    upload_view = mo.vstack(
+        [
+            mo.md("## Upload ppi / sleep JSON"),
+            mo.hstack([type_dd, file_in, upload_btn], gap=0.5),
+            status_md,
+            hint,
+        ]
+    )
+    return (upload_view,)
+
+
+@app.cell
+def _(mo, sidebar, overview_view, tables_view, upload_view):
     mo.hstack(
-        [sidebar, mo.ui.tabs({"Overview": overview_view, "Tables": tables_view})],
+        [
+            sidebar,
+            mo.ui.tabs(
+                {
+                    "Overview": overview_view,
+                    "Tables": tables_view,
+                    "Upload": upload_view,
+                }
+            ),
+        ],
         gap=0.5,
     )
 
