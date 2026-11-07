@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import glob
+import logging
 import os
 import random
+import shutil
 import time
 
 from dotenv import load_dotenv
 from sqlalchemy import event, text
 from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, SQLModel, create_engine
+
+logger = logging.getLogger("newboom.database")
 
 load_dotenv()
 sqlite_url = os.getenv("DATABASE_URL", "sqlite:///data/newboom.db")
@@ -30,15 +35,18 @@ def _configure_sqlite(dbapi_connection, _record):
     runs alongside readers and, crucially, a reader never blocks a writer. WAL is
     a persistent property of the .db file, so one connection setting it is enough,
     but the connect listener guarantees it on every new connection regardless of
-    which one touches the database first. synchronous=NORMAL is the crash-safe
-    level *with* WAL; do not use it in rollback-journal mode, where it risks
+    which one touches the database first. synchronous=FULL fsyncs after every
+    commit — the strongest crash-safety level, chosen after the 2026-11-07 ppi
+    auto-index corruption: the file lives on a macOS Docker bind mount whose
+    virtualized FS makes the NORMAL tradeoff unsafe here. FULL costs write
+    throughput; do not use NORMAL in rollback-journal mode, where it risks
     corruption on power loss. Requires the file to live on a local,
     mmap-capable filesystem (not NFS/SMB).
     """
     cursor = dbapi_connection.cursor()
     try:
         cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA synchronous=NORMAL")  # good tradeoff with WAL
+        cursor.execute("PRAGMA synchronous=FULL")  # max crash safety
         cursor.execute("PRAGMA busy_timeout=30000")
         cursor.execute("PRAGMA foreign_keys=ON")
     finally:
@@ -117,7 +125,145 @@ def run_write(
     return retry(_unit, attempts=attempts, base_delay=base_delay, max_delay=max_delay)
 
 
+# --- Startup integrity gate --------------------------------------------------
+#
+# A corrupted database (the 2026-11-07 ppi auto-index damage) starts the server
+# fine but fails every query. Catch it on boot: verify the file, and if corrupt
+# replace it with the newest good backup, then re-verify. This runs at the very
+# start of create_db_and_tables(), before any query or worker cycle and before
+# the server accepts traffic.
+#
+# Env:
+#   DB_INTEGRITY_CHECK   0/false/off disables the gate (default on).
+#   INTEGRITY_CHECK_MODE  quick (default, ~0.2s, catches page/btree damage) or
+#                        full (~1s, also verifies row content / foreign keys).
+#   BACKUP_DIR           where good backups live (default: <db_dir>/backups).
+#
+# A corrupt db with no valid backup is fatal: the gate raises so the app refuses
+# to serve bad data instead of silently failing on the first query.
+
+def _integrity_ok(db_path: str, mode: str = "quick") -> bool:
+    """True iff ``db_path`` is a sound SQLite database. Any failure → False.
+
+    Opens a raw connection (bypassing the engine's WAL pragma, which is unsafe
+    on a possibly-corrupt file) and runs the requested check. ``quick_check``
+    catches the page/btree damage that actually happens and can't false-positive
+    on content; ``integrity_check`` additionally verifies rows / foreign keys.
+    """
+    import sqlite3
+
+    pragma = "PRAGMA integrity_check" if mode == "full" else "PRAGMA quick_check"
+    try:
+        con = sqlite3.connect(db_path)
+        try:
+            row = con.execute(pragma).fetchone()
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError):
+        # A corrupt file, an unreadable path, or a failed check all mean "not
+        # sound"; degrade to False so the gate can restore rather than crash
+        # startup. Truly unexpected errors (not file/db errors) propagate so a
+        # real bug surfaces loudly instead of being swallowed.
+        return False
+    return bool(row) and str(row[0]).strip().lower() == "ok"
+
+
+def _newest_good_backup(backup_dir: str, db_path: str) -> str | None:
+    """Newest ``*.bak`` in ``backup_dir`` that passes integrity_check, else None.
+
+    Candidates are taken newest-first by mtime and each is verified, so a corrupt
+    backup is skipped rather than trusted. The live file is never chosen as its
+    own backup.
+    """
+    self_path = os.path.abspath(db_path)
+    for cand in sorted(
+        glob.glob(os.path.join(backup_dir, "*.bak")),
+        key=os.path.getmtime,
+        reverse=True,
+    ):
+        if os.path.abspath(cand) == self_path:
+            continue
+        if _integrity_ok(cand, "quick"):
+            return cand
+    return None
+
+
+def _restore(backup: str, db_path: str) -> None:
+    """Atomically replace ``db_path`` with a verified copy of ``backup``."""
+    tmp = f"{db_path}.restore-tmp"
+    shutil.copyfile(backup, tmp)
+    if not _integrity_ok(tmp, "quick"):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise RuntimeError(f"backup {backup} failed integrity check after copy")
+    # The corrupt db's WAL sidecars belong to the old file; drop them so the
+    # restored file stands alone and the next open can't recover a stale journal
+    # against a brand-new main db.
+    for side in (f"{db_path}-wal", f"{db_path}-shm"):
+        try:
+            os.remove(side)
+        except OSError:
+            pass
+    os.replace(tmp, db_path)  # atomic on POSIX
+    logger.warning("startup integrity gate: restored %s from %s", db_path, backup)
+
+
+def ensure_db_integrity() -> None:
+    """Startup gate. SQLite files only.
+
+    Verifies the live db; on corruption, restores the newest good backup and
+    re-verifies. Raises (refusing to start) if the db can't be made sound.
+    """
+    if os.getenv("DB_INTEGRITY_CHECK", "1").strip().lower() in ("0", "false", "off", "no", ""):
+        return
+    if engine.url.get_backend_name() != "sqlite":
+        return
+    db_path = engine.url.database
+    if not db_path:
+        return
+    mode = os.getenv("INTEGRITY_CHECK_MODE", "quick").strip().lower()
+    if _integrity_ok(db_path, mode):
+        return  # healthy: nothing to do
+    logger.warning("startup integrity gate: %s failed %s; seeking a good backup", db_path, mode)
+    backup_dir = os.getenv("BACKUP_DIR") or os.path.join(
+        os.path.dirname(os.path.abspath(db_path)), "backups"
+    )
+    backup = _newest_good_backup(backup_dir, db_path)
+    if backup is None:
+        raise RuntimeError(
+            f"startup integrity gate: {db_path} is corrupt and no valid backup in "
+            f"{backup_dir}; refusing to start "
+            f"(drop a good newboom.db.*.bak there and restart to recover)"
+        )
+    _restore(backup, db_path)
+    if not _integrity_ok(db_path, mode):
+        raise RuntimeError(
+            f"startup integrity gate: {db_path} still corrupt after restore from {backup}"
+        )
+    # The restored db only knows up to the backup's mtime; ppi/sleep that arrived
+    # after it are durable in UPLOAD_DIR, so re-apply them to close the gap.
+    # conversation/message/questionnaireanswer have no upload copy and stay as-of
+    # the backup.
+    from newboom.boom.upload import reingest_uploads_after  # lazy: avoid import cycle
+    uploads_dir = os.getenv("UPLOAD_DIR", "data/uploads")
+    ppi, sleep, skipped = reingest_uploads_after(engine, uploads_dir, os.stat(backup).st_mtime)
+    # Drop the connection the re-ingest opened so create_all/worker start fresh.
+    engine.dispose()
+    logger.warning(
+        "startup integrity gate: %s recovered from %s; re-ingested %d ppi + %d "
+        "sleep (%d skipped)",
+        db_path,
+        backup,
+        ppi,
+        sleep,
+        skipped,
+    )
+
+
 def create_db_and_tables():
+    ensure_db_integrity()
     import newboom.model  # noqa: F401  register table metadata before create_all
 
     SQLModel.metadata.create_all(engine)

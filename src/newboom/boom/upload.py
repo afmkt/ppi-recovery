@@ -16,9 +16,13 @@ value (x10); only the UI folds it back to a percentage on display.
 
 from __future__ import annotations
 
+import json
+import logging
 from datetime import datetime
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import Engine
 from sqlalchemy.dialects.sqlite import insert
 from sqlmodel import Session, col, select
 
@@ -33,6 +37,8 @@ from newboom.upload import (
     SleepUploadRequest,
     midnight_days_ago,
 )
+
+logger = logging.getLogger("newboom.boom.upload")
 
 router = APIRouter(prefix="/upload", tags=["蓝牙上传"])
 
@@ -57,6 +63,80 @@ def _upsert_device(session: Session, name: str, address: str, timezone: str) -> 
         session.commit()
         session.refresh(device)
     return device
+
+
+def apply_ppi_upload(session: Session, req: PPIUploadRequest) -> None:
+    """Upsert the device + PPI rows for one ppi upload, as one atomic commit.
+
+    PPI inserts are upserts on ``(device_id, time)``, so re-applying an upload
+    (e.g. after a DB restore) neither duplicates nor loses rows.
+    """
+    device = _upsert_device(session, req.device, req.address, req.timezone)
+    for row in req.datas:
+        local_time = datetime.strptime(row.time, _TIME_FMT)
+        stmt = (
+            insert(PPI)
+            .values(
+                time=local_time,
+                hr=row.hr,
+                spo2=row.spo2,
+                ppi=row.ppi,
+                activity=row.activity,
+                device_id=device.id or 0,
+            )
+            .on_conflict_do_update(
+                index_elements=["device_id", "time"],
+                set_={
+                    "hr": row.hr,
+                    "spo2": row.spo2,
+                    "ppi": row.ppi,
+                    "activity": row.activity,
+                    "fresh": True,
+                },
+            )
+        )
+        session.execute(stmt)
+    session.commit()
+
+
+def apply_sleep_upload(session: Session, req: SleepUploadRequest) -> None:
+    """Upsert the device + Sleep rows for one sleep upload, as one atomic commit.
+
+    Sleep inserts are upserts on ``(device_id, time)``, so re-applying an upload
+    (e.g. after a DB restore) is idempotent.
+    """
+    device = _upsert_device(session, req.device, req.address, req.timezone)
+    for row in req.datas:
+        local_time = datetime.strptime(row.time, _TIME_FMT)
+        stmt = (
+            insert(Sleep)
+            .values(
+                time=local_time,
+                timezone=req.timezone,
+                sleep_onset_time=row.sleepOnsetTime,
+                awake_time=row.awakeTime,
+                light_sleep_period=row.lightSleepPeriod,
+                deep_sleep_period=row.deepSleepPeriod,
+                other_sleep_period=row.otherSleepPeriod,
+                heart_rate_rest=row.heartRateRest,
+                device_id=device.id or 0,
+            )
+            .on_conflict_do_update(
+                index_elements=["device_id", "time"],
+                set_={
+                    "timezone": req.timezone,
+                    "sleep_onset_time": row.sleepOnsetTime,
+                    "awake_time": row.awakeTime,
+                    "light_sleep_period": row.lightSleepPeriod,
+                    "deep_sleep_period": row.deepSleepPeriod,
+                    "other_sleep_period": row.otherSleepPeriod,
+                    "heart_rate_rest": row.heartRateRest,
+                    "fresh": True,
+                },
+            )
+        )
+        session.execute(stmt)
+    session.commit()
 
 
 # --- 10.1 上传心率数据（逐秒分期曲线 + 心率/血氧/PPI）---
@@ -110,36 +190,11 @@ async def upload_ppi(
     # happens once, outside the retried unit.
     save_data_to_file(req.model_dump(), "ppi", req.device)
 
-    # One atomic, retryable unit: the device upsert and the PPI upserts commit
-    # together. PPI inserts are upserts on (device_id, time), so a retry after a
-    # transient lock neither duplicates nor loses rows.
+    # One atomic, retryable unit: device + PPI upserts commit together; PPI
+    # upserts on (device_id, time), so a retry after a transient lock neither
+    # duplicates nor loses rows.
     def _upsert(s: Session) -> None:
-        device = _upsert_device(s, req.device, req.address, req.timezone)
-        for row in req.datas:
-            local_time = datetime.strptime(row.time, _TIME_FMT)
-            stmt = (
-                insert(PPI)
-                .values(
-                    time=local_time,
-                    hr=row.hr,
-                    spo2=row.spo2,
-                    ppi=row.ppi,
-                    activity=row.activity,
-                    device_id=device.id or 0,
-                )
-                .on_conflict_do_update(
-                    index_elements=["device_id", "time"],
-                    set_={
-                        "hr": row.hr,
-                        "spo2": row.spo2,
-                        "ppi": row.ppi,
-                        "activity": row.activity,
-                        "fresh": True,
-                    },
-                )
-            )
-            s.execute(stmt)
-        s.commit()
+        apply_ppi_upload(s, req)
 
     run_write(session, _upsert)
     return BoomMessage(code=0, msg="")
@@ -198,42 +253,69 @@ async def upload_sleep(
     # happens once, outside the retried unit.
     save_data_to_file(req.model_dump(), "sleep", req.device)
 
-    # One atomic, retryable unit: the device upsert and the Sleep upserts commit
-    # together. Sleep inserts are upserts on (device_id, time), so a retry after a
-    # transient lock neither duplicates nor loses rows.
+    # One atomic, retryable unit: device + Sleep upserts commit together; Sleep
+    # upserts on (device_id, time), so a retry after a transient lock neither
+    # duplicates nor loses rows.
     def _upsert(s: Session) -> None:
-        device = _upsert_device(s, req.device, req.address, req.timezone)
-        for row in req.datas:
-            local_time = datetime.strptime(row.time, _TIME_FMT)
-            stmt = (
-                insert(Sleep)
-                .values(
-                    time=local_time,
-                    timezone=req.timezone,
-                    sleep_onset_time=row.sleepOnsetTime,
-                    awake_time=row.awakeTime,
-                    light_sleep_period=row.lightSleepPeriod,
-                    deep_sleep_period=row.deepSleepPeriod,
-                    other_sleep_period=row.otherSleepPeriod,
-                    heart_rate_rest=row.heartRateRest,
-                    device_id=device.id or 0,
-                )
-                .on_conflict_do_update(
-                    index_elements=["device_id", "time"],
-                    set_={
-                        "timezone": req.timezone,
-                        "sleep_onset_time": row.sleepOnsetTime,
-                        "awake_time": row.awakeTime,
-                        "light_sleep_period": row.lightSleepPeriod,
-                        "deep_sleep_period": row.deepSleepPeriod,
-                        "other_sleep_period": row.otherSleepPeriod,
-                        "heart_rate_rest": row.heartRateRest,
-                        "fresh": True,
-                    },
-                )
-            )
-            s.execute(stmt)
-        s.commit()
+        apply_sleep_upload(s, req)
 
     run_write(session, _upsert)
     return BoomMessage(code=0, msg="")
+
+
+def reingest_uploads_after(
+    engine: Engine, uploads_dir: str | Path, backup_mtime: float
+) -> tuple[int, int, int]:
+    """Re-apply ppi/sleep uploads newer than a restored backup (recovery).
+
+    After a corrupt db is restored from a backup, ppi/sleep data that arrived
+    *after* the backup is absent from the restored db — but it is durable in
+    ``UPLOAD_DIR`` (each upload is written to a hash-named JSON file before it is
+    upserted). Re-applying those uploads, idempotent on ``(device_id, time)``,
+    closes the gap between the backup and "now". ``conversation`` /
+    ``message`` / ``questionnaireanswer`` have no durable upload copy, so they
+    stay as-of the backup (the daily backup is the recovery source for them).
+
+    Best-effort: an unreadable or malformed file is logged and skipped, never
+    aborting the recovery of the rest. Returns ``(ppi, sleep, skipped)`` counts.
+    """
+    base = Path(uploads_dir)
+    if not base.exists():
+        return 0, 0, 0
+    # mtime ascending so the logs read chronologically; ``>=`` re-applies the
+    # backup-boundary file too, which is harmless (the upserts are idempotent).
+    files = sorted(
+        list(base.glob("*.ppi.json")) + list(base.glob("*.sleep.json")),
+        key=lambda p: p.stat().st_mtime,
+    )
+    ppi = sleep = skipped = 0
+    with Session(engine) as session:
+        for path in files:
+            if path.stat().st_mtime < backup_mtime:
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as e:
+                logger.warning("recovery: skipping unreadable upload %s: %s", path, e)
+                skipped += 1
+                session.rollback()
+                continue
+            try:
+                if path.name.endswith(".ppi.json"):
+                    apply_ppi_upload(session, PPIUploadRequest.model_validate(data))
+                    ppi += 1
+                else:
+                    apply_sleep_upload(session, SleepUploadRequest.model_validate(data))
+                    sleep += 1
+            except Exception as e:  # noqa: BLE001 - a bad file must not abort recovery
+                logger.warning("recovery: skipping malformed upload %s: %s", path, e)
+                skipped += 1
+                session.rollback()
+    logger.info(
+        "recovery: re-ingested %d ppi + %d sleep upload(s) newer than the backup "
+        "(%d skipped)",
+        ppi,
+        sleep,
+        skipped,
+    )
+    return ppi, sleep, skipped
