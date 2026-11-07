@@ -69,12 +69,21 @@ async def lifespan(app: FastAPI):
     # lifespan= to FastAPI replaces Starlette's default startup, so on_event
     # handlers never fire and the tables were previously never created.
     create_db_and_tables()
-    # Start the background worker task when the app starts
+    # Start the background worker task when the app starts.
     worker_task = asyncio.create_task(background_worker_loop())
-    yield
-    # Cancel the task gracefully when the app shuts down
-    worker_task.cancel()
     try:
-        await worker_task
-    except asyncio.CancelledError:
-        pass
+        yield
+    finally:
+        # Stop the worker and wait for it to finish *before* disposing the pool:
+        # a cycle in flight holds a pooled connection, and disposing while it is
+        # mid-write would drop that connection mid-transaction.
+        worker_task.cancel()
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
+        # Fold the WAL back into the main DB and release the pooled connections,
+        # so the -wal/-shm sidecars are checkpointed on a clean stop instead of
+        # being left for the next start to recover. The worker is cancelled above
+        # so no cycle is mid-write when the connections close.
+        engine.dispose()
