@@ -7,8 +7,9 @@
 #   - Aliyun ACR — reliable pulls from mainland China. Requires repo secrets
 #     ALIYUN_USERNAME / ALIYUN_PASSWORD (ACR fixed password).
 #
-# Triggered by version tags (v1.2.3); workflow_dispatch pushes `latest` +
-# short-SHA tags without a version tag.
+# Triggered by pushes to `main` (every commit), by version tags (v1.2.3), and
+# by workflow_dispatch; non-tag runs push `latest` + short-SHA tags without a
+# version tag.
 #
 # NOTE: the first time this pushes, GHCR creates the package as PRIVATE. Make it
 # public once:
@@ -20,6 +21,7 @@ name: Release Docker
 
 on:
   push:
+    branches: ["main"]
     tags: ["v*"]
   workflow_dispatch:
 
