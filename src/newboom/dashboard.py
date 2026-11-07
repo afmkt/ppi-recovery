@@ -59,11 +59,18 @@ def build_dashboard() -> Starlette:
 
 
 def mount_dashboard(app: FastAPI) -> Starlette:
-    """Attach the dashboard at ``/dashboard`` (with a ``/`` -> ``/``/ redirect)."""
+    """Attach the dashboard at ``/dashboard`` (with a ``/`` -> ``/dashboard/`` redirect)."""
     sub = build_dashboard()
     app.mount("/dashboard", sub)
     app.add_route(
         "/dashboard",
+        lambda _: RedirectResponse(url="/dashboard/", status_code=307),
+    )
+    # Bare host (e.g. :8000) -> dashboard, so a user hitting the root lands on it.
+    # Target the canonical ``/dashboard/`` (with slash, what marimo serves) so the
+    # browser reaches the dashboard in one hop instead of /dashboard -> /dashboard/.
+    app.add_route(
+        "/",
         lambda _: RedirectResponse(url="/dashboard/", status_code=307),
     )
     return sub
