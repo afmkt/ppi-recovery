@@ -85,6 +85,11 @@ def controls(mo):
     )
     win_sleep_only = mo.ui.switch(value=False, label="sleep windows only")
     win_min_valid = mo.ui.slider(0.0, 1.0, value=0.0, step=0.05, label="min valid_ratio")
+    # The Load & Energy figure spans two days, so it gets its own window control
+    # defaulting to 48h (window_dd above defaults to 1h and has no 48h option).
+    rec_window = mo.ui.dropdown(
+        ["12h", "24h", "48h", "7d", "30d", "All"], value="48h", label="Time window"
+    )
     return (
         window_dd,
         row_cap,
@@ -93,6 +98,7 @@ def controls(mo):
         win_states,
         win_sleep_only,
         win_min_valid,
+        rec_window,
     )
 
 
@@ -388,14 +394,11 @@ def upload_view(mo, uploader):
 
 
 @app.cell
-def recovery_view(mo, query, get_device, m):
+def recovery_view(mo, query, get_device, m, rec_window):
     _dv = get_device()
-    # Its own window control: the shared ``window_dd``/``row_cap`` are headless in
-    # the Tables panels (never embedded), so this figure carries its own —
-    # defaulting to 48h to match the reference view (心率/负荷/储能 over two days).
-    rec_window = mo.ui.dropdown(
-        ["12h", "24h", "48h", "7d", "30d", "All"], value="48h", label="Time window"
-    )
+    # ``rec_window`` (its own 48h-default control, created in ``controls``) is
+    # passed in so its value is read in a cell other than the one that created
+    # it — marimo forbids reading a UIElement's value in its own cell.
     if _dv is None:
         recovery_view = mo.md("*select a device*")
     else:
