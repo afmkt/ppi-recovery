@@ -42,6 +42,29 @@ windows. The caption then says "0 with LF/HF · most recent LF/HF was
 `<time>` `<gap>` before this window" (or "this device has no LF/HF windows at
 all"), and the table below shows the (invalid) windows so the reason is visible.
 
+## Load & Energy tab
+
+The 48h reference view: three stacked panels that **share the time axis with
+independent y-axes** (a single figure, three subplots), matching
+`samples/test_hr_ppi_48h_20261107.png`:
+
+- **Heart rate** — per-minute `heart_rate` plus a 5-minute smoothed series
+  (the reference's 分钟均值 / 5分钟平滑).
+- **Intraday cumulative load** — `total_load` (S1 + tss, the `docs/boom.calculation.md`
+  §7 load), drawn **one line per night session** so the daily reset reads as a
+  sawtooth break rather than a false plunge (the data already resets each night;
+  per-session grouping keeps the JSON NaN-free).
+- **Energy reserve** — `total_energy` (0-100), continuous: it drains under load
+  and recovers overnight.
+
+All three series live in `minutemetric`, so one bounded query
+(`dashboard.metrics.hr_load_energy_table`) feeds the whole figure
+(`dashboard.metrics.hr_load_energy_chart`); a paginated table sits below. The
+tab carries its **own** `Time window` dropdown (default `48h` — the reference
+span) because the `window_dd` / `row_cap` shared by the Tables sub-tabs are
+headless (never embedded), so a figure that needs a long window can't rely on
+them. Builders are tested in `tests/test_dashboard_tables.py`.
+
 ## Upload tab
 
 Upload a device `ppi` / `sleep` JSON capture to the running server — the same

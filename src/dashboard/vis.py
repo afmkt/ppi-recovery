@@ -388,7 +388,41 @@ def upload_view(mo, uploader):
 
 
 @app.cell
-def _(mo, sidebar, overview_view, tables_view, upload_view):
+def recovery_view(mo, query, get_device, m):
+    _dv = get_device()
+    # Its own window control: the shared ``window_dd``/``row_cap`` are headless in
+    # the Tables panels (never embedded), so this figure carries its own —
+    # defaulting to 48h to match the reference view (心率/负荷/储能 over two days).
+    rec_window = mo.ui.dropdown(
+        ["12h", "24h", "48h", "7d", "30d", "All"], value="48h", label="Time window"
+    )
+    if _dv is None:
+        recovery_view = mo.md("*select a device*")
+    else:
+        _id = int(_dv["id"])
+        _anchor = m.last_data_time(query, _id, "minutemetric", "timestamp")
+        _cutoff = m.window_cutoff(rec_window.value, anchor=_anchor)
+        _cap = 50000
+        _df = m.hr_load_energy_table(query, _id, cutoff=_cutoff, cap=_cap)
+        _capped = " · *capped — widen window or raise cap to see more*" if len(_df) >= _cap else ""
+        _caption = mo.md(
+            f"**{len(_df):,} rows** · window {rec_window.value} · "
+            "heart rate · intraday load · energy reserve" + _capped
+        )
+        _chart = m.hr_load_energy_chart(_df)
+        _table = mo.ui.table(
+            _df,
+            page_size=100,
+            show_search=True,
+            show_download=True,
+            freeze_columns_left=["timestamp"],
+        )
+        recovery_view = mo.vstack([_caption, rec_window, _chart, _table])
+    return (recovery_view,)
+
+
+@app.cell
+def _(mo, sidebar, overview_view, tables_view, recovery_view, upload_view):
     mo.hstack(
         [
             sidebar,
@@ -396,6 +430,7 @@ def _(mo, sidebar, overview_view, tables_view, upload_view):
                 {
                     "Overview": overview_view,
                     "Tables": tables_view,
+                    "Load & Energy": recovery_view,
                     "Upload": upload_view,
                 }
             ),

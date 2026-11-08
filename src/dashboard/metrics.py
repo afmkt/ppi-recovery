@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime
+from typing import Any
 
 import altair as alt
 import pandas as pd
@@ -553,9 +554,11 @@ def coverage_chart(daily: pd.DataFrame, full_day_s: float = FULL_DAY_S) -> alt.C
 # Per-second window presets for the time-series tables. ``None`` = no lower
 # bound ("All"). Values are in seconds.
 _WINDOW_PRESETS = {
+    "12h": 12 * 3600.0,
     "1h": 3600.0,
     "6h": 6 * 3600.0,
     "24h": 24 * 3600.0,
+    "48h": 48 * 3600.0,
     "7d": 7 * 86400.0,
     "30d": 30 * 86400.0,
     "All": None,
@@ -695,6 +698,28 @@ def minute_table(query, device_id, cutoff=None, cap=5000) -> pd.DataFrame:
     sql = (
         "select timestamp, night_date, heart_rate, s1_load, tss_load, "
         "total_load, heart_rate_zone, steps, calories "
+        "from minutemetric where " + _where_device(device_id, *clauses)
+        + f" order by timestamp desc limit {int(cap)}"
+    )
+    return query(sql)
+
+
+def hr_load_energy_table(query, device_id, cutoff=None, cap=50000) -> pd.DataFrame:
+    """Most-recent per-minute heart rate, cumulative intraday load, and energy
+    reserve for a device, newest first, capped.
+
+    Backs the 48h reference figure (心率 / 日内累计负荷 / 储能):
+    ``heart_rate`` is the per-minute mean, ``total_load`` is the cumulative
+    intraday load (S1 + tss, reset each night session), and ``total_energy`` is
+    the 0-100 body-energy reserve. All three live in ``minutemetric``, so one
+    bounded query feeds the whole figure. Per-minute data is small, so the cap
+    is generous (``50000`` ≈ 34 days).
+    """
+    clauses: list[str] = []
+    if cutoff is not None:
+        clauses.append("timestamp > " + _cutoff_literal(cutoff))
+    sql = (
+        "select timestamp, night_date, heart_rate, total_load, total_energy "
         "from minutemetric where " + _where_device(device_id, *clauses)
         + f" order by timestamp desc limit {int(cap)}"
     )
@@ -911,3 +936,132 @@ def daily_autonomic_chart(df: pd.DataFrame) -> alt.Chart:
             title="Autonomic balance — % of night windows by state",
         )
     )
+
+
+def hr_load_energy_chart(
+    df: pd.DataFrame,
+) -> alt.Chart | alt.LayerChart | alt.VConcatChart:
+    """Heart rate · intraday cumulative load · energy reserve, as one figure with
+    three stacked panels that share the time axis (independent y-axes each).
+
+    Mirrors the 48h reference view (心率 / 日内累计负荷 / 储能):
+      * **Heart rate** — per-minute ``heart_rate`` plus a 5-minute smoothed
+        series (the reference's 分钟均值 / 5分钟平滑).
+      * **Load** — cumulative intraday ``total_load`` (S1 + tss). One line per
+        night session so the daily reset reads as a sawtooth break, not a drop:
+        the data already resets each night, and a single continuous line would
+        draw a false plunge from end-of-day to next-day start. Per-session
+        grouping means no NaN is injected, keeping ``to_json(allow_nan=False)``
+        safe (the contract the dashboard's JSON-render test pins).
+      * **Energy** — ``total_energy`` (0-100); continuous, it recovers overnight.
+    """
+    if df is None or df.empty:
+        return _empty(line=True, title="HR · load · energy — no rows")
+    d = df.copy()
+    d["timestamp"] = pd.to_datetime(d["timestamp"], errors="coerce")
+    # ``night_date`` drives the per-session load break; the query always selects
+    # it, but guard for a partial frame (e.g. an energy-only slice).
+    if "night_date" in d.columns:
+        d["night_date"] = pd.to_datetime(d["night_date"], errors="coerce")
+    d = d.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    has_hr = "heart_rate" in d.columns and bool(d["heart_rate"].notna().any())
+    has_load = "total_load" in d.columns and bool(d["total_load"].notna().any())
+    has_energy = "total_energy" in d.columns and bool(d["total_energy"].notna().any())
+    if not (has_hr or has_load or has_energy):
+        return _empty(line=True, title="HR · load · energy — no rows")
+
+    # A shared time axis (Vega shares x across a vconcat); independent y-axes
+    # because the three series have incommensurable units (bpm / load / 0-100).
+    x = alt.X("timestamp:T", title="time", axis=alt.Axis(format="%m-%d %H:%M"))
+    panels: list[Any] = []
+
+    if has_hr:
+        hr = d[["timestamp", "heart_rate"]].copy()
+        hr["heart_rate"] = pd.to_numeric(hr["heart_rate"], errors="coerce")
+        hr["hr_5min"] = hr["heart_rate"].rolling(5, min_periods=1).mean()
+        long = hr.melt(
+            id_vars="timestamp", var_name="series", value_name="bpm",
+            value_vars=["heart_rate", "hr_5min"],
+        )
+        _series_labels = {"heart_rate": "1-min avg", "hr_5min": "5-min smoothed"}
+        long["series"] = long["series"].map(_series_labels)
+        panels.append(
+            alt.Chart(_chart_df(long))
+            .mark_line(point=False)
+            .encode(
+                x=x,
+                y=alt.Y("bpm:Q", title="heart rate (bpm)"),
+                color=alt.Color(
+                    "series:N", title="",
+                    scale=alt.Scale(
+                        domain=["1-min avg", "5-min smoothed"],
+                        range=["#1f77b4", "#ff7f0e"],
+                    ),
+                ),
+                tooltip=[
+                    alt.Tooltip("series:N"),
+                    alt.Tooltip("bpm:Q", title="bpm", format=".0f"),
+                ],
+            )
+            .properties(height=150, title="Heart rate")
+        )
+
+    if has_load:
+        load_cols = (
+            ["timestamp", "total_load", "night_date"]
+            if "night_date" in d.columns
+            else ["timestamp", "total_load"]
+        )
+        load = d[load_cols].copy()
+        load["total_load"] = pd.to_numeric(load["total_load"], errors="coerce")
+        load = load.dropna(subset=["timestamp", "total_load"])
+        # One line per night session so the daily reset reads as a sawtooth break.
+        # With no ``night_date`` there is a single unbroken session.
+        groups = (
+            [g for _, g in load.groupby(load["night_date"], sort=True)]
+            if "night_date" in load.columns
+            else [load]
+        )
+        day_layers = [
+            g[["timestamp", "total_load"]].dropna(subset=["total_load"]) for g in groups
+        ]
+        day_layers = [g for g in day_layers if not g.empty]
+        if day_layers:
+            layers = [
+                alt.Chart(_chart_df(g))
+                .mark_line(point=False, color="#d95f02")
+                .encode(
+                    x=x,
+                    y=alt.Y("total_load:Q", title="intraday load"),
+                    tooltip=[alt.Tooltip("total_load:Q", title="load", format=".3f")],
+                )
+                for g in day_layers
+            ]
+            panels.append(
+                alt.layer(*layers).properties(
+                    height=150, title="Intraday cumulative load (resets daily)"
+                )
+            )
+
+    if has_energy:
+        en = d[["timestamp", "total_energy"]].copy()
+        en["total_energy"] = pd.to_numeric(en["total_energy"], errors="coerce")
+        en = en.dropna(subset=["total_energy"])
+        panels.append(
+            alt.Chart(_chart_df(en))
+            .mark_line(point=False, color="#2ca02c")
+            .encode(
+                x=x,
+                y=alt.Y(
+                    "total_energy:Q",
+                    title="energy (0-100)",
+                    scale=alt.Scale(domain=[0, 100]),
+                ),
+                tooltip=[alt.Tooltip("total_energy:Q", title="energy", format=".0f")],
+            )
+            .properties(height=150, title="Energy reserve")
+        )
+
+    if not panels:
+        return _empty(line=True, title="HR · load · energy — no rows")
+    return panels[0] if len(panels) == 1 else alt.vconcat(*panels)

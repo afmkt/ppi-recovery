@@ -254,6 +254,69 @@ def test_daily_table_selects_curated_columns_no_limit():
     assert len(out) == 2
 
 
+# --- hr_load_energy_table / hr_load_energy_chart ---------------------------
+
+
+def test_hr_load_energy_table_builds_bounded_sql():
+    query, calls = fake_query(_make_hr_load_energy_chart_df())
+    cutoff = pd.Timestamp("2026-11-07 00:00:00")
+    out = m.hr_load_energy_table(query, 1, cutoff=cutoff, cap=500)
+    sql = calls[0]
+    assert "device_id = 1" in sql
+    assert "timestamp > '2026-11-07 00:00:00.000000'" in sql  # exact quoted literal
+    # the three figure series are pulled; per-window / per-second cols are not
+    low = sql.lower()
+    for col in ["timestamp", "night_date", "heart_rate", "total_load", "total_energy"]:
+        assert col in low
+    for col in ["s1_load", "tss_load", "heart_rate_zone", "steps", "calories"]:
+        assert col not in low
+    assert "from minutemetric where device_id = 1" in sql
+    assert "order by timestamp desc" in sql
+    assert "limit 500" in sql
+    assert len(out) == 6  # 6 rows < cap 500 -> all returned
+
+
+def test_hr_load_energy_table_no_clause_no_stray_and_default_cap():
+    query, calls = fake_query(_make_hr_load_energy_chart_df())
+    m.hr_load_energy_table(query, 1)  # default: no cutoff, cap 50000
+    sql = calls[0]
+    # the no-filter case: only the device predicate, no trailing "and", big cap
+    assert "from minutemetric where device_id = 1 order by timestamp desc limit 50000" in sql
+    assert "timestamp >" not in sql
+
+
+def test_hr_load_energy_chart_splits_load_per_night():
+    # The load panel is one line layer per night session, so the daily reset
+    # reads as a sawtooth break (not a false connecting drop). Two nights in the
+    # fixture -> 3 panels (HR, load, energy); the load panel holds 2 layers.
+    chart = m.hr_load_energy_chart(_make_hr_load_energy_chart_df())
+    panels = chart.to_dict()["vconcat"]
+    assert [p.get("title") for p in panels] == [
+        "Heart rate",
+        "Intraday cumulative load (resets daily)",
+        "Energy reserve",
+    ]
+    load_panel = panels[1]
+    assert "layer" in load_panel, "load should be one layer per night session"
+    assert len(load_panel["layer"]) == 2
+
+
+def test_hr_load_energy_chart_energy_only_partial_frame_no_night_date():
+    # A partial frame lacking night_date must not crash: one energy panel, no
+    # break, and no NaN (the JSON-render contract the suite pins).
+    df = pd.DataFrame(
+        {
+            "timestamp": ["2026-11-07 09:00:00", "2026-11-07 09:01:00"],
+            "total_energy": [90, 80],
+        }
+    )
+    chart = m.hr_load_energy_chart(df)
+    spec = chart.to_dict()
+    assert "vconcat" not in spec  # a single panel returns the chart, not a concat
+    assert spec.get("title") == "Energy reserve"
+    assert "NaN" not in chart.to_json(allow_nan=False)
+
+
 # --- chart helpers render to JSON (no NaN crashes) --------------------------
 
 
@@ -334,6 +397,24 @@ def _make_daily_chart_df():
     )
 
 
+def _make_hr_load_energy_chart_df():
+    """Two night sessions of per-minute HR / cumulative load / energy — enough to
+    exercise the load panel's per-night-session break (the sawtooth reset)."""
+    return pd.DataFrame(
+        {
+            "timestamp": [
+                "2026-11-07 09:00:00", "2026-11-07 09:01:00", "2026-11-07 09:02:00",
+                "2026-11-08 09:00:00", "2026-11-08 09:01:00", "2026-11-08 09:02:00",
+            ],
+            "night_date": ["2026-11-07", "2026-11-07", "2026-11-07",
+                           "2026-11-08", "2026-11-08", "2026-11-08"],
+            "heart_rate": [50.0, 120.0, 60.0, 48.0, 110.0, 55.0],
+            "total_load": [1.0, 30.0, 60.0, 2.0, 35.0, 70.0],
+            "total_energy": [100, 90, 80, 95, 85, 75],
+        }
+    )
+
+
 @pytest.mark.parametrize(
     "df, helper",
     [
@@ -341,6 +422,7 @@ def _make_daily_chart_df():
         (_make_window_chart_df(), m.window_ribbon_chart),
         (_make_minute_chart_df(), m.minute_hr_chart),
         (_make_daily_chart_df(), m.daily_autonomic_chart),
+        (_make_hr_load_energy_chart_df(), m.hr_load_energy_chart),
     ],
 )
 def test_charts_render_to_json_on_populated_data(df, helper):
@@ -359,6 +441,10 @@ def test_charts_render_to_json_on_populated_data(df, helper):
         (
             ["summary_date", "sympathetic_pct", "parasympathetic_pct", "transition_pct"],
             m.daily_autonomic_chart,
+        ),
+        (
+            ["timestamp", "night_date", "heart_rate", "total_load", "total_energy"],
+            m.hr_load_energy_chart,
         ),
     ],
 )
