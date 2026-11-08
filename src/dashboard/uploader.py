@@ -18,7 +18,8 @@ import http.client
 import json
 import os
 import ssl
-from dataclasses import dataclass
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, replace
 from urllib.parse import urlsplit
 
 # Default target: the server this dashboard runs inside. The app binds HOST:PORT
@@ -49,12 +50,18 @@ class UploadResult:
     device_id: int | None = None
     file: str | None = None
     error: str | None = None
+    # The source file's name, set when a result comes from a batch of files so
+    # the UI can show which file produced it. None for a single-file upload.
+    name: str | None = None
 
     def as_markdown(self) -> str:
         """A one-line, UI-ready status (emoji + key facts)."""
         label = self.dtype.upper() if self.dtype else "upload"
+        # When a result names its source file (a batch upload), lead with it so a
+        # multi-file batch is traceable file-by-file.
+        head = f"**{self.name}** ({label})" if self.name else f"**{label}**"
         if self.ok:
-            parts = [f"✅ **{label}** uploaded"]
+            parts = [f"✅ {head} uploaded"]
             if self.processed is not None:
                 parts.append(f"{self.processed:,} row(s)")
             if self.device_id is not None:
@@ -64,7 +71,7 @@ class UploadResult:
             return " · ".join(parts)
         code = f"HTTP {self.status} " if self.status else ""
         reason = self.error or self.message or "unknown error"
-        return f"❌ **{label}** failed ({code}{reason})"
+        return f"❌ {head} failed ({code}{reason})"
 
 
 def parse_payload(data: bytes | str) -> dict:
@@ -214,3 +221,59 @@ def post_upload(
             ok=False, status=status, dtype=dtype, error="non-JSON response", message=raw[:300]
         )
     return _parse_result(status, body_obj, dtype)
+
+
+def post_upload_batch(
+    base: str,
+    prefix: str,
+    dtype: str,
+    files: Iterable[tuple[str, bytes | str]],
+    timeout: float = DEFAULT_TIMEOUT,
+) -> list[UploadResult]:
+    """Upload each ``file`` to ``{base}{prefix}/{dtype}``; one HTTP POST per file.
+
+    Returns one :class:`UploadResult` per input file, in order, each tagged with
+    its source ``name``. A file that fails the cheap client-side JSON gate
+    (:func:`parse_payload`) is reported as a *failed* result with the reason
+    instead of aborting the batch, so a good file in a bad batch still uploads
+    and the user sees exactly which file(s) failed and why.
+
+    Each POST reuses :func:`post_upload`, so request validation, the hash-named
+    write and the ``(device_id, time)`` upsert all happen in the API — the caller
+    only supplies ``(name, contents)`` pairs. The ``contents`` may be ``bytes``
+    (a ``mo.ui.file`` result) or ``str``.
+    """
+    results: list[UploadResult] = []
+    for name, contents in files:
+        try:
+            parse_payload(contents)
+            result = post_upload(base, prefix, dtype, contents, timeout=timeout)
+        except (ValueError, TypeError) as e:
+            result = UploadResult(ok=False, status=0, dtype=dtype, error=str(e))
+        results.append(replace(result, name=name))
+    return results
+
+
+def summarize(results: Sequence[UploadResult]) -> str:
+    """A one-line, UI-ready summary of a batch's outcome.
+
+    Success: ``✅ N/N uploaded · M row(s)``. Partial/total failure: a ``❌`` line
+    naming each failed file and its reason, so a multi-file attempt never looks
+    like it silently did nothing.
+    """
+    total = len(results)
+    if total == 0:
+        return ""
+    ok = sum(1 for r in results if r.ok)
+    if ok == total:
+        rows = sum(r.processed or 0 for r in results)
+        return f"✅ {ok}/{total} uploaded · {rows:,} row(s)"
+    fails = total - ok
+    reasons = [
+        f"{r.name or (r.dtype.upper() if r.dtype else 'upload')}: "
+        f"{r.error or r.message or (f'HTTP {r.status}' if r.status else 'unknown error')}"
+        for r in results
+        if not r.ok
+    ]
+    detail = "; ".join(reasons) if reasons else "failed"
+    return f"❌ {ok}/{total} ok, {fails} failed — {detail}"

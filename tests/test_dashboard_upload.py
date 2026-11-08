@@ -95,6 +95,60 @@ def test_describe_error_flattens_validation_detail():
     assert "datas.0.hr: field required" in uploader._describe_error(body)
 
 
+# --- pure: batch + summary --------------------------------------------------
+
+
+def test_as_markdown_success_includes_filename():
+    r = uploader.UploadResult(
+        ok=True,
+        status=200,
+        dtype="ppi",
+        processed=500,
+        device_id=3,
+        file="D-x.ppi.json",
+        name="cap.ppi.json",
+    )
+    md = r.as_markdown()
+    # The source file's name leads so a multi-file batch is traceable file-by-file.
+    assert "cap.ppi.json" in md
+    assert "PPI" in md
+
+
+def test_as_markdown_failure_includes_filename():
+    r = uploader.UploadResult(ok=False, status=422, dtype="sleep", error="datas: required", name="bad.json")
+    md = r.as_markdown()
+    assert "bad.json" in md
+    assert "SLEEP" in md
+
+
+def test_summarize_all_ok_counts_rows():
+    res = [
+        uploader.UploadResult(ok=True, status=200, dtype="ppi", processed=500, device_id=3, file="a", name="a.json"),
+        uploader.UploadResult(ok=True, status=200, dtype="ppi", processed=700, device_id=3, file="b", name="b.json"),
+    ]
+    md = uploader.summarize(res)
+    assert "2/2" in md
+    assert "1,200" in md
+    assert "✅" in md
+
+
+def test_summarize_partial_names_failed_file():
+    res = [
+        uploader.UploadResult(ok=True, status=200, dtype="ppi", processed=10, device_id=3, file="a", name="a.json"),
+        uploader.UploadResult(ok=False, status=422, dtype="ppi", error="datas: required", name="c.json"),
+    ]
+    md = uploader.summarize(res)
+    assert "1/2" in md
+    assert "1 failed" in md
+    # The user must be able to tell *which* file failed and why.
+    assert "c.json" in md
+    assert "datas: required" in md
+
+
+def test_summarize_empty_is_blank():
+    assert uploader.summarize([]) == ""
+
+
 # --- HTTP transport against a hermetic local server ------------------------
 
 
@@ -165,6 +219,26 @@ def test_post_upload_surfaces_error_body(server):
     assert r.ok is False
     assert r.status == 422
     assert "bad body" in (r.error or r.message)
+
+
+def test_post_upload_batch_each_file_hits_endpoint(server):
+    base, holder = server
+    good = b'{"device": "D", "address": "A", "timezone": "08:00", "datas": []}'
+    files = [
+        ("a.ppi.json", good),
+        ("not-json.ppi.json", b"not json"),  # bad JSON, gated client-side
+        ("b.ppi.json", good),
+    ]
+    results = uploader.post_upload_batch(base, "/api/upload", "ppi", files)
+
+    # One result per input file, in order, each tagged with its source name.
+    assert [r.name for r in results] == ["a.ppi.json", "not-json.ppi.json", "b.ppi.json"]
+    assert results[0].ok and results[2].ok
+    # A bad file is gated before the transport, so a good file in a bad batch
+    # still uploads: only the 2 good ones reached the endpoint.
+    assert holder["paths"] == ["/api/upload/ppi", "/api/upload/ppi"]
+    assert results[1].ok is False
+    assert "not valid JSON" in (results[1].error or "")
 
 
 def test_post_upload_transport_failure_returns_result_not_exception():

@@ -337,56 +337,136 @@ def uploader_mod():
 
 
 @app.cell
-def upload_view(mo, uploader):
+def upload_view(mo, uploader, pd):
     # The dashboard runs in-process in the FastAPI app, so it POSTs to the same
     # server that owns /api/upload/{ppi,sleep}. The endpoint validates the body,
     # writes the hash-named file and upserts by (device_id, time) — the UI only
     # moves bytes. Target + prefix come from the module (env-overridable).
     base = uploader.DEFAULT_BASE
     prefix = uploader.DEFAULT_PREFIX
-    status, set_status = mo.state("")
-    type_dd = mo.ui.dropdown(["PPI", "Sleep"], value="PPI", label="Type")
-    file_in = mo.ui.file(
-        filetypes=[".json"],
-        kind="area",
-        label="Drop or pick a ppi / sleep JSON file",
-    )
 
-    def on_upload(_):
-        results = file_in.value
-        if not results:
-            set_status("⚠ Pick a file first.")
-            return
-        rec = results[0]
-        dtype = type_dd.value.lower()
-        # Fail fast on malformed JSON instead of a cryptic 422 from the API.
-        try:
-            uploader.parse_payload(rec.contents)
-        except (ValueError, TypeError) as e:
-            set_status(f"⚠ {e}")
-            return
-        res = uploader.post_upload(base, prefix, dtype, rec.contents)
-        set_status(res.as_markdown())
+    # One file area + button per type, side by side: a PPI box and a Sleep box,
+    # so a user never has to choose a type before picking a file.
+    #
+    # Uploads run synchronously in the button callback. A per-second PPI/sleep
+    # capture is small and the transfer to the same host is fast, so the callback
+    # blocks only for that transfer — no worker thread. The cost is a brief UI
+    # freeze during the transfer, after which the results render, which is exactly
+    # the "the UI blocks and then tells me what happened" behaviour we want.
+    #
+    # Feedback the user can actually read:
+    #   * a per-box "last attempt" summary (✅ N/N · rows / ❌ which file + why),
+    #   * a shared, newest-first history table of every file's outcome.
+    _HISTORY_CAP = 50
+    # allow_self_loops=True is required: this cell both *sets* the state (from the
+    # button on_click callbacks) and *reads* it, so by marimo's default it would
+    # NOT re-render after a click — leaving the user with no feedback. This flag
+    # makes the click's state update re-run this cell so the per-box summary and
+    # history table update in place.
+    _history, _set_history = mo.state([], allow_self_loops=True)
+    _last_ppi, _set_last_ppi = mo.state("", allow_self_loops=True)
+    _last_sleep, _set_last_sleep = mo.state("", allow_self_loops=True)
 
-    upload_btn = mo.ui.button(label="Upload", on_click=on_upload, kind="neutral")
+    def _record(dtype, results):
+        """Append a batch's per-file results to the history (newest first) and
+        refresh that type's last-attempt summary line."""
+        now = pd.Timestamp.now().strftime("%H:%M:%S")
+        rows = [
+            {
+                "Time": now,
+                "Type": r.dtype.upper() if r.dtype else "—",
+                "File": r.name or "—",
+                "Result": "✅" if r.ok else "❌",
+                "Rows": f"{r.processed:,}" if r.processed is not None else "—",
+                "Device": f"#{r.device_id}" if r.device_id is not None else "—",
+                "Saved": r.file or "—",
+                "Detail": r.error or r.message or "—",
+            }
+            for r in results
+        ]
+        _set_history((rows + _history())[:_HISTORY_CAP])
+        (_set_last_ppi if dtype == "ppi" else _set_last_sleep)(uploader.summarize(results))
+
+    def _make_box(dtype, label, set_last, summary):
+        area = mo.ui.file(
+            filetypes=[".json"],
+            multiple=True,
+            kind="area",
+            label=f"Drop or pick {label} JSON file(s)",
+        )
+
+        def on_click(_):
+            # ``value`` is a list of (name, contents); empty when nothing picked.
+            files = area.value
+            if not files:
+                set_last("⚠ Pick a file first.")
+                return
+            # The whole batch uploads together; each file is gated and reported
+            # independently, so one bad file doesn't abort the rest.
+            results = uploader.post_upload_batch(
+                base,
+                prefix,
+                dtype,
+                [(f.name, f.contents) for f in files],
+            )
+            _record(dtype, results)
+
+        btn = mo.ui.button(
+            label=f"Upload {label}",
+            on_click=on_click,
+            kind="success",
+        )
+        summary_md = (
+            mo.md(summary)
+            if summary
+            else mo.md(f"_Idle — pick {label} file(s), then Upload._")
+        )
+        return mo.vstack(
+            [
+                mo.md(f"### {label}"),
+                area,
+                btn,
+                summary_md,
+            ]
+        )
+
+    # Read each box's last-attempt summary at the cell's top level so marimo
+    # tracks them as this cell's dependencies: a click updates the state and
+    # this cell re-renders to show the new summary / refresh the history table.
+    ppi_box = _make_box("ppi", "PPI", _set_last_ppi, _last_ppi())
+    sleep_box = _make_box("sleep", "Sleep", _set_last_sleep, _last_sleep())
+
+    # Shared per-file history (newest first), capped so the tab stays readable.
+    history = _history()
+    if history:
+        history_df = pd.DataFrame(
+            history,
+            columns=["Time", "Type", "File", "Result", "Rows", "Device", "Saved", "Detail"],
+        )
+        history_view = mo.ui.table(
+            history_df,
+            page_size=100,
+            show_search=True,
+            show_download=True,
+            freeze_columns_left=["Time", "Type", "File"],
+        )
+    else:
+        history_view = mo.md("_No uploads yet._")
+
     hint = mo.md(
-        f"POSTs the file verbatim to `{prefix}/{{ppi,sleep}}` on `{base}` — "
-        "the same endpoint a device / `newboom_sync.py` uses (validates, writes "
-        "the hash-named file, upserts by device+time; idempotent). A **newly "
-        "uploaded device** shows in the left panel after a reload (the device "
-        "list is read once at connect)."
+        f"Each box POSTs its file(s) verbatim to `{prefix}/{{ppi,sleep}}` on `{base}` — "
+        "the same endpoint a device / `newboom_sync.py` uses (validates, writes the "
+        "hash-named file, upserts by device+time; idempotent). Pick several files at "
+        "once and the whole batch uploads together. A **newly uploaded device** shows "
+        "in the left panel after a reload (the device list is read once at connect)."
     )
-    _status = status()
-    status_md = (
-        mo.md(_status)
-        if _status
-        else mo.md("_Idle — pick a type, choose a file, then Upload._")
-    )
+
     upload_view = mo.vstack(
         [
             mo.md("## Upload ppi / sleep JSON"),
-            mo.hstack([type_dd, file_in, upload_btn], gap=0.5),
-            status_md,
+            mo.hstack([ppi_box, sleep_box], gap=1),
+            mo.md("### Recent uploads"),
+            history_view,
             hint,
         ]
     )
