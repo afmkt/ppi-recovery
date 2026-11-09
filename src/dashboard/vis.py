@@ -592,7 +592,64 @@ def recovery_view(mo, query, get_device, m, day_picker, rec_window):
 
 
 @app.cell
-def _(mo, sidebar, overview_view, tables_view, recovery_view, upload_view):
+def docs_view(mo):
+    from dashboard import boom_docs
+
+    # A static reference: each app screen paired with the endpoint that renders
+    # it. Loaded entirely from the committed asset dir src/dashboard/resources
+    # (pairs.json + the screenshot PNGs) — the runtime never reads the docx.
+    # Regenerate the assets from the docx with tools/extract_boom_images.py.
+    # It does not depend on the sidebar's device/day state, so it never shows
+    # "select a device".
+    err = None
+    pairs = []
+    try:
+        pairs = boom_docs.load_pairs()
+    except OSError as e:
+        err = str(e)
+
+    if err is not None:
+        docs_view = mo.md(
+            "## API docs\n\n*Pair manifest not found — run `python tools/extract_boom_images.py`.*"
+        )
+    else:
+
+        def card(p):
+            shots = []
+            for n in p.images:
+                img = boom_docs.image_path(n)
+                shots.append(
+                    mo.image(src=str(img), width=240, rounded=True, alt=p.title)
+                    if img.is_file()
+                    else mo.md(f"*{n} missing from resources/*")
+                )
+            shots_view = mo.hstack(shots, gap=1) if len(shots) > 1 else shots[0]
+            # The link is origin-relative (Pair.path strips the host), so a click
+            # opens the endpoint on the same instance serving the dashboard,
+            # whether that is http://localhost:8000 or https://boom.sparkpos.cn.
+            link = mo.md(f"**{p.method}**  [{p.path}]({p.path})")
+            return mo.vstack([mo.md(p.title), shots_view, link])
+
+        blocks = [
+            mo.md(
+                "## API docs\n\n"
+                "Each screen of the mobile app, paired with the endpoint that renders "
+                "it (from `docs/boom.v1.0.docx`). Clicking an endpoint opens it on "
+                "this server — the link is relative to the dashboard's own origin."
+            )
+        ]
+        section = None
+        for p in pairs:
+            if p.section != section:
+                section = p.section
+                blocks.append(mo.md(f"### {section}"))
+            blocks.append(card(p))
+        docs_view = mo.vstack(blocks)
+    return (docs_view,)
+
+
+@app.cell
+def _(mo, sidebar, overview_view, tables_view, recovery_view, upload_view, docs_view):
     mo.hstack(
         [
             sidebar,
@@ -602,6 +659,7 @@ def _(mo, sidebar, overview_view, tables_view, recovery_view, upload_view):
                     "Tables": tables_view,
                     "Load & Energy": recovery_view,
                     "Upload": upload_view,
+                    "API Docs": docs_view,
                 }
             ),
         ],

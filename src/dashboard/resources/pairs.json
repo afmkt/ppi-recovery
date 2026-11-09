@@ -1,0 +1,168 @@
+[
+  {
+    "section": "一、首页接口文档",
+    "title": "1.1 获取首页训练状态",
+    "method": "GET",
+    "url": "http://47.100.30.18:18000/devices/{address}/go",
+    "images": [
+      "image1.png"
+    ]
+  },
+  {
+    "section": "二、状态页面接口文档",
+    "title": "2.1 获取状态页面基础数据",
+    "method": "GET",
+    "url": "http://47.100.30.18:18000/devices/{address}/status",
+    "images": [
+      "image2.png"
+    ]
+  },
+  {
+    "section": "二、状态页面接口文档",
+    "title": "2.2 获取训练准备度数据",
+    "method": "GET",
+    "url": "http://47.100.30.18:18000/devices/{address}/readiness",
+    "images": [
+      "image3.png"
+    ]
+  },
+  {
+    "section": "三、睡眠页面接口文档",
+    "title": "3.1 获取睡眠页面基础数据",
+    "method": "GET",
+    "url": "http://47.100.30.18:18000/devices/{address}/sleep_status",
+    "images": [
+      "image4.png",
+      "image5.png"
+    ]
+  },
+  {
+    "section": "三、睡眠页面接口文档",
+    "title": "3.2 获取睡眠期间数据",
+    "method": "GET",
+    "url": "http://47.100.30.18:18000/devices/{address}/sleep_metric",
+    "images": [
+      "image17.png"
+    ]
+  },
+  {
+    "section": "三、睡眠页面接口文档",
+    "title": "3.3 获取睡眠时长趋势数据",
+    "method": "GET",
+    "url": "http://47.100.30.18:18000/devices/{address}/sleep_trend",
+    "images": [
+      "image18.png"
+    ]
+  },
+  {
+    "section": "三、睡眠页面接口文档",
+    "title": "3.4 获取睡眠模式数据",
+    "method": "GET",
+    "url": "http://47.100.30.18:18000/devices/{address}/sleep_mode",
+    "images": [
+      "image19.png"
+    ]
+  },
+  {
+    "section": "四、储能页面接口文档",
+    "title": "4.1 获取储能页面基础数据",
+    "method": "GET",
+    "url": "http://47.100.30.18:18000/devices/{address}/energy_status",
+    "images": [
+      "image20.png"
+    ]
+  },
+  {
+    "section": "四、储能页面接口文档",
+    "title": "4.2 获取身体储能趋势数据",
+    "method": "GET",
+    "url": "http://47.100.30.18:18000/devices/{address}/energy_trend",
+    "images": [
+      "image21.png"
+    ]
+  },
+  {
+    "section": "五、负荷页面接口文档",
+    "title": "5.1 获取负荷页面基础数据",
+    "method": "GET",
+    "url": "http://47.100.30.18:18000/devices/{address}/load_status",
+    "images": [
+      "image22.png",
+      "image23.png"
+    ]
+  },
+  {
+    "section": "五、负荷页面接口文档",
+    "title": "5.2 获取负荷趋势数据",
+    "method": "GET",
+    "url": "http://47.100.30.18:18000/devices/{address}/load_trend",
+    "images": [
+      "image26.png"
+    ]
+  },
+  {
+    "section": "五、负荷页面接口文档",
+    "title": "5.3 获取运动负荷数据",
+    "method": "GET",
+    "url": "http://47.100.30.18:18000/devices/{address}/sport_load",
+    "images": [
+      "image27.png"
+    ]
+  },
+  {
+    "section": "五、负荷页面接口文档",
+    "title": "5.4 获取睡眠压力数据",
+    "method": "GET",
+    "url": "http://47.100.30.18:18000/devices/{address}/sleep_pressure",
+    "images": [
+      "image32.png"
+    ]
+  },
+  {
+    "section": "六、超量恢复页面接口文档",
+    "title": "6.1 获取超量恢复基础数据",
+    "method": "GET",
+    "url": "http://47.100.30.18:18000/devices/{address}/superrecovery",
+    "images": [
+      "image33.png"
+    ]
+  },
+  {
+    "section": "六、超量恢复页面接口文档",
+    "title": "6.2 获取ATL/CTL趋势数据",
+    "method": "GET",
+    "url": "http://47.100.30.18:18000/devices/{address}/atlctl",
+    "images": [
+      "image34.png"
+    ]
+  },
+  {
+    "section": "七、身体指标页面接口文档",
+    "title": "7.1 获取身体指标数据",
+    "method": "GET",
+    "url": "http://47.100.30.18:18000/devices/{address}/body_metrics",
+    "images": [
+      "image35.png",
+      "image36.png"
+    ]
+  },
+  {
+    "section": "八、日历图表接口文档",
+    "title": "8.1 获取日历图表数据",
+    "method": "GET",
+    "url": "http://47.100.30.18:18000/devices/{address}/calendar_tables",
+    "images": [
+      "image37.png"
+    ]
+  },
+  {
+    "section": "九、问卷页面接口文档",
+    "title": "9.1 获取问卷内容",
+    "method": "GET",
+    "url": "http://47.100.30.18:18000/app/questionnaire",
+    "images": [
+      "image38.png",
+      "image39.png"
+    ]
+  }
+]

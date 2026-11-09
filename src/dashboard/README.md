@@ -116,6 +116,44 @@ Two caveats: a large PPI file makes the button briefly block the kernel while it
 round-trips; and a **newly uploaded device** shows in the left sidebar only after
 a reload — the device list is read once at connect.
 
+## API Docs tab
+
+A static reference page (no device/day selection) that renders the mobile-app
+screenshots — extracted from `docs/boom.v1.0.docx` into
+`src/dashboard/resources/` — **paired with the endpoint that renders
+each one**. The doc is a per-screen API reference; `dashboard.boom_docs` walks it
+in document order and, for every app screenshot, grabs the HTTP request that
+immediately follows it (method + URL). Inline *formula diagrams* are not app
+screenshots and carry no single endpoint, so a screenshot group becomes a pair
+only when a request follows it before the next heading — the nine formula PNGs
+drop out.
+
+Each pair renders its screenshot(s) (a screen may have two) and a **clickable
+link to the endpoint**. The link is **origin-relative** (`Pair.path` strips the
+scheme/host/port, e.g. `/devices/{address}/go`), so a click lands on the endpoint
+served by the *same instance* that serves the dashboard — `http://localhost:8000`
+or `https://boom.sparkpos.cn` both resolve correctly, and every path already maps
+to a real route in `newboom.boom`.
+
+Both the screenshot binaries **and** the pair manifest (`pairs.json`) live in
+the committed asset dir `src/dashboard/resources/`, and the tab loads everything
+from there — screenshots via
+`mo.image(src=dashboard.boom_docs.image_path(name))` and the pairs via
+`dashboard.boom_docs.load_pairs()`. The runtime therefore **never reads the
+docx**; the docx exists only to regenerate the assets. Regenerate both with
+`python tools/extract_boom_images.py` (add `--prune` to drop screenshots the doc
+no longer references); the tool is idempotent and opens the docx only to rebuild
+`resources/`.
+
+- `BOOM_DOCX` — the source docx for the *regeneration tool* only (default
+  `docs/boom.v1.0.docx`, CWD-relative like `DATABASE_URL` / `UPLOAD_DIR`); it is
+  **not** read at runtime. If `pairs.json` is missing the tab degrades to a
+  "pair manifest not found" note; a missing screenshot in `resources/` shows an
+  inline "missing from resources/" placeholder.
+
+The parser (`dashboard.boom_docs`) is pure stdlib (`zipfile` + `xml.etree`, no
+third-party `.docx` dependency) and is tested in `tests/test_boom_docs.py`.
+
 ## Data model
 
 The builders live in `dashboard.metrics` and take a `query` callable
