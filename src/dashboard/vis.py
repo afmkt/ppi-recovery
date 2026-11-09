@@ -337,7 +337,63 @@ def daily_panel(mo, pd, query, get_device, m, day_picker):
 
 
 @app.cell
-def tables_view(mo, get_device, ppi_panel, window_panel, minute_panel, daily_panel):
+def rmssd_panel(mo, pd, query, get_device, m, day_picker, window_dd, row_cap):
+    _dv = get_device()
+    if _dv is None:
+        rmssd_panel = mo.md("*select a device*")
+    else:
+        _id = int(_dv["id"])
+        _day = m._day_from_picker(day_picker, query, _id, "rmssdsegment", "night_date")
+        _lower, _upper = m.day_bounds(_day, window_dd.value)
+        _cap = int(row_cap.value)
+        _df = m.rmssd_segment_table(query, _id, cutoff=_lower, cap=_cap, day=_day)
+        _capped = " · *capped — raise cap or widen window to see more*" if len(_df) >= _cap else ""
+        _caption = mo.md(
+            f"**{len(_df):,} segments** · night {_day.isoformat()} · window {window_dd.value} · "
+            "ln-RMSSD trajectory by trend" + _capped
+        )
+        _chart = m.rmssd_segment_chart(_df)
+        _table = mo.ui.table(
+            _df,
+            page_size=100,
+            show_search=True,
+            show_download=True,
+            freeze_columns_left=["night_date", "segment_id"],
+        )
+        rmssd_panel = mo.vstack([_caption, _chart, _table])
+    return (rmssd_panel,)
+
+
+@app.cell
+def hourly_panel(mo, pd, query, get_device, m, day_picker, window_dd, row_cap):
+    _dv = get_device()
+    if _dv is None:
+        hourly_panel = mo.md("*select a device*")
+    else:
+        _id = int(_dv["id"])
+        _day = m._day_from_picker(day_picker, query, _id, "hourlystatus", "hour_start")
+        _lower, _upper = m.day_bounds(_day, window_dd.value)
+        _cap = int(row_cap.value)
+        _df = m.hourly_status_table(query, _id, cutoff=_lower, cap=_cap, day=_day)
+        _capped = " · *capped — raise cap or widen window to see more*" if len(_df) >= _cap else ""
+        _caption = mo.md(
+            f"**{len(_df):,} hours** · day {_day.isoformat()} · window {window_dd.value} · "
+            "current vs frozen morning status" + _capped
+        )
+        _chart = m.hourly_status_chart(_df)
+        _table = mo.ui.table(
+            _df,
+            page_size=100,
+            show_search=True,
+            show_download=True,
+            freeze_columns_left=["hour_start"],
+        )
+        hourly_panel = mo.vstack([_caption, _chart, _table])
+    return (hourly_panel,)
+
+
+@app.cell
+def tables_view(mo, get_device, ppi_panel, window_panel, minute_panel, rmssd_panel, hourly_panel, daily_panel):
     _dv = get_device()
     # The banner keeps the active device visible at the top of this tab, where
     # (unlike Overview) no per-panel header otherwise names it.
@@ -351,6 +407,8 @@ def tables_view(mo, get_device, ppi_panel, window_panel, minute_panel, daily_pan
             "Cleaned PPI": ppi_panel,
             "Windows": window_panel,
             "Minutes": minute_panel,
+            "RMSSD": rmssd_panel,
+            "Hourly": hourly_panel,
             "Daily": daily_panel,
         }
     )

@@ -32,8 +32,9 @@ sections:
 
 ## Tables tab
 
-A data browser for the four derived tables, each a sub-tab (Cleaned PPI /
-Windows / Minutes / Daily). Every sub-tab shows a chart on top and a
+A data browser for the six derived tables, each a sub-tab (Cleaned PPI /
+Windows / Minutes / RMSSD / Hourly / Daily). Every sub-tab shows a chart on top
+and a
 **client-side paginated table** below — `mo.ui.table` with `page_size=100`,
 search and CSV/parquet download — so the UI never loads the whole table at
 once.
@@ -47,7 +48,10 @@ Because the raw PPI table holds ~1M rows/device (per-second), the query is
 - **Max rows** (default `2000`) hard-caps the query with `ORDER BY <time> DESC
   LIMIT N`. A capped panel notes it.
 - **Per-table filters** on top: Windows offers state / sleep-only / min valid
-  ratio; Cleaned PPI offers "cleaned only" and "fresh only". Daily has no
+  ratio; Cleaned PPI offers "cleaned only" and "fresh only". RMSSD (night
+  segments) and Hourly (per-hour status) reuse the shared Time window / Max rows
+  like the per-second tables and carry no per-table filters — RMSSD's time key is
+  the night date, so its window is night-granular. Daily has no
   controls — it shows every day (at most one row/device/day).
 
 **Self-explaining empty states.** A chart that has nothing to plot does not fail
@@ -122,6 +126,8 @@ The builders live in `dashboard.metrics` and take a `query` callable
 | Cleaned PPI | `ppi` (`ppi_clean` not null) | `time` | PPI ms over time, colored by activity |
 | Windows | `windowmetric` | `window_start` | LF/HF ribbon over `window_mid_h`, colored by state |
 | Minutes | `minutemetric` | `timestamp` | heart rate over time, colored by HR zone |
+| RMSSD | `rmssdsegment` | `night_date` | ln-RMSSD trajectory over `start_h`/`end_h`, colored by `trend_type` |
+| Hourly | `hourlystatus` | `hour_start` | `current_status` vs frozen `morning_status` over time |
 | Daily | `dailysummary` | `summary_date` | sympathetic/parasympathetic/transition stacked bars |
 
 Tests for the builders, the time-window anchoring, and the empty-ribbon

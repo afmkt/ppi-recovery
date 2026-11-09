@@ -254,6 +254,139 @@ def test_daily_table_selects_curated_columns_no_limit():
     assert len(out) == 2
 
 
+# --- rmssd_segment_table ----------------------------------------------------
+
+
+def test_rmssd_segment_table_builds_bounded_sql():
+    rows = pd.DataFrame(
+        {
+            "night_date": ["2026-01-01"] * 3,
+            "segment_id": [1, 2, 3],
+            "start_h": [15.7, 17.4, 18.8],
+            "end_h": [17.4, 18.8, 21.0],
+            "duration_min": [99.0, 79.0, 133.0],
+            "window_count": [100, 71, 135],
+            "trend_type": ["STABLE", "RISING", "FALLING"],
+            "lnrmssd_start": [2.9, 2.65, 3.2],
+            "lnrmssd_end": [2.86, 3.18, 3.83],
+            "lnrmssd_fitted_start": [2.9, 2.65, 3.2],
+            "lnrmssd_fitted_end": [2.86, 3.18, 3.83],
+            "lnrmssd_delta": [0.018, 0.412, 0.526],
+            "lnrmssd_slope_per_h": [0.001, 0.3, 0.4],
+            "segment_volatility": [0.143, 0.101, 0.115],
+            "segment_sse": [1.0, 1.0, 1.0],
+        }
+    )
+    query, calls = fake_query(rows)
+    out = m.rmssd_segment_table(
+        query, 1, cutoff=pd.Timestamp("2025-12-31 12:00:00"), cap=2
+    )
+    sql = calls[0]
+    assert "device_id = 1" in sql
+    # night_date is a DATE, so the time-window cutoff is applied at day granularity
+    assert "night_date >= '2025-12-31'" in sql
+    # the curated subset is pulled in
+    for col in [
+        "segment_id", "start_h", "end_h", "window_count", "trend_type",
+        "lnrmssd_start", "lnrmssd_end", "lnrmssd_delta",
+        "lnrmssd_slope_per_h", "segment_volatility", "segment_sse",
+    ]:
+        assert col in sql
+    # the primary key is not dragged in
+    assert " id," not in sql and "select id" not in sql.lower()
+    assert "order by night_date desc, segment_id asc" in sql
+    assert "limit 2" in sql
+    assert len(out) == 2
+
+
+def test_rmssd_segment_table_no_clause_no_stray_and():
+    query, calls = fake_query(pd.DataFrame())
+    m.rmssd_segment_table(query, 1, cap=50)
+    sql = calls[0]
+    # the no-filter case: only the device predicate, no trailing "and"
+    assert (
+        "from rmssdsegment where device_id = 1 "
+        "order by night_date desc, segment_id asc limit 50" in sql
+    )
+    assert "night_date >=" not in sql
+    assert "night_date =" not in sql
+
+
+def test_rmssd_segment_table_day_filter_adds_calendar_predicate():
+    query, calls = fake_query(pd.DataFrame())
+    m.rmssd_segment_table(query, 1, day="2026-01-01", cap=100)
+    sql = calls[0]
+    assert "night_date = '2026-01-01'" in sql
+
+
+def test_rmssd_segment_table_day_filter_omitted_when_none():
+    query, calls = fake_query(pd.DataFrame())
+    m.rmssd_segment_table(query, 1, cap=100)
+    sql = calls[0]
+    assert "night_date =" not in sql
+    assert "night_date >=" not in sql
+
+
+# --- hourly_status_table ----------------------------------------------------
+
+
+def test_hourly_status_table_builds_bounded_sql():
+    rows = pd.DataFrame(
+        {
+            "hour_start": [f"2026-01-01 0{i}:00:00.000000" for i in range(3)],
+            "morning_status": [60] * 3,
+            "current_status": [60, 55, 50],
+            "t1": [0.0] * 3,
+            "t2": [1.0, 2.0, 3.0],
+            "t3": [0.0] * 3,
+            "t4": [0.0] * 3,
+            "hr_5min_avg": [60.0, 58.0, 56.0],
+            "is_sleep_or_exercise": [True, False, False],
+            "is_temporary": [True] * 3,
+        }
+    )
+    query, calls = fake_query(rows)
+    out = m.hourly_status_table(
+        query, 1, cutoff=pd.Timestamp("2025-12-31 00:00:00"), cap=2
+    )
+    sql = calls[0]
+    assert "device_id = 1" in sql
+    # a true datetime time column, so the cutoff is the fixed-width timestamp
+    assert "hour_start > '2025-12-31 00:00:00.000000'" in sql
+    for col in [
+        "morning_status", "current_status", "t1", "t2", "t3", "t4",
+        "hr_5min_avg", "is_sleep_or_exercise", "is_temporary",
+    ]:
+        assert col in sql
+    assert "order by hour_start desc" in sql
+    assert "limit 2" in sql
+    assert len(out) == 2
+
+
+def test_hourly_status_table_no_clause_no_stray_and_default_cap():
+    query, calls = fake_query(pd.DataFrame())
+    m.hourly_status_table(query, 1)  # default: no cutoff, cap 5000
+    sql = calls[0]
+    # the no-filter case: only the device predicate, no trailing "and", big cap
+    assert "from hourlystatus where device_id = 1 order by hour_start desc limit 5000" in sql
+    assert "hour_start >" not in sql
+    assert "date(hour_start)" not in sql
+
+
+def test_hourly_status_table_day_filter_adds_calendar_predicate():
+    query, calls = fake_query(pd.DataFrame())
+    m.hourly_status_table(query, 1, day="2026-01-01", cap=100)
+    sql = calls[0]
+    assert "date(hour_start) = '2026-01-01'" in sql
+
+
+def test_hourly_status_table_day_filter_omitted_when_none():
+    query, calls = fake_query(pd.DataFrame())
+    m.hourly_status_table(query, 1, cap=100)
+    sql = calls[0]
+    assert "date(hour_start)" not in sql
+
+
 # --- hr_load_energy_table / hr_load_energy_chart ---------------------------
 
 
@@ -415,6 +548,51 @@ def _make_hr_load_energy_chart_df():
     )
 
 
+def _make_rmssd_chart_df():
+    """A night of RMSSD macro-segments with an uppercase ``trend_type`` (as the
+    DB stores it) — enough to exercise the trajectory chart and its lowercasing."""
+    return pd.DataFrame(
+        {
+            "night_date": ["2026-10-12"] * 3,
+            "segment_id": [1, 2, 3],
+            "start_h": [15.7, 17.4, 18.8],
+            "end_h": [17.4, 18.8, 21.0],
+            "duration_min": [99.0, 79.0, 133.0],
+            "window_count": [100, 71, 135],
+            "trend_type": ["STABLE", "RISING", "RISING"],
+            "lnrmssd_start": [2.9, 2.65, 3.2],
+            "lnrmssd_end": [2.86, 3.18, 3.83],
+            "lnrmssd_fitted_start": [2.9, 2.65, 3.2],
+            "lnrmssd_fitted_end": [2.86, 3.18, 3.83],
+            "lnrmssd_delta": [0.018, 0.412, 0.526],
+            "lnrmssd_slope_per_h": [0.001, 0.3, 0.4],
+            "segment_volatility": [0.143, 0.101, 0.115],
+            "segment_sse": [1.0, 1.0, 1.0],
+        }
+    )
+
+
+def _make_hourly_chart_df():
+    return pd.DataFrame(
+        {
+            "hour_start": [
+                "2026-10-13 07:00:00.000000",
+                "2026-10-13 14:00:00.000000",
+                "2026-10-13 23:00:00.000000",
+            ],
+            "morning_status": [60, 60, 60],
+            "current_status": [60, 55, 50],
+            "t1": [0.0] * 3,
+            "t2": [1.0, 2.0, 0.0],
+            "t3": [0.0] * 3,
+            "t4": [0.0] * 3,
+            "hr_5min_avg": [60.0, 58.0, 56.0],
+            "is_sleep_or_exercise": [True, False, True],
+            "is_temporary": [True, True, True],
+        }
+    )
+
+
 @pytest.mark.parametrize(
     "df, helper",
     [
@@ -423,6 +601,8 @@ def _make_hr_load_energy_chart_df():
         (_make_minute_chart_df(), m.minute_hr_chart),
         (_make_daily_chart_df(), m.daily_autonomic_chart),
         (_make_hr_load_energy_chart_df(), m.hr_load_energy_chart),
+        (_make_rmssd_chart_df(), m.rmssd_segment_chart),
+        (_make_hourly_chart_df(), m.hourly_status_chart),
     ],
 )
 def test_charts_render_to_json_on_populated_data(df, helper):
@@ -446,12 +626,34 @@ def test_charts_render_to_json_on_populated_data(df, helper):
             ["timestamp", "night_date", "heart_rate", "total_load", "total_energy"],
             m.hr_load_energy_chart,
         ),
+        (
+            ["night_date", "segment_id", "start_h", "end_h", "trend_type",
+             "lnrmssd_start", "lnrmssd_end"],
+            m.rmssd_segment_chart,
+        ),
+        (
+            ["hour_start", "morning_status", "current_status", "t1", "t2", "t3",
+             "t4", "hr_5min_avg", "is_sleep_or_exercise", "is_temporary"],
+            m.hourly_status_chart,
+        ),
     ],
 )
 def test_charts_render_placeholder_on_empty_data(cols, helper):
     chart = helper(pd.DataFrame(columns=cols))
     json = chart.to_json(allow_nan=False)
     assert isinstance(json, str) and len(json) > 0
+
+
+def test_rmssd_segment_chart_normalizes_trend_case():
+    # Regression: the DB stores TrendType as the enum *name* (uppercase, e.g.
+    # "RISING"); the color scale fixes a lowercase domain. Without lowercasing,
+    # no plotted point maps to a color and the trajectory renders empty even
+    # though the slice is full of segments.
+    chart = m.rmssd_segment_chart(_make_rmssd_chart_df())
+    j = chart.to_json(allow_nan=False)
+    assert "RISING" not in j and "STABLE" not in j and "FALLING" not in j
+    for v in ("rising", "falling", "stable"):
+        assert v in j
 
 
 def test_window_ribbon_chart_normalizes_state_case():

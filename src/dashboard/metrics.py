@@ -900,6 +900,59 @@ def daily_table(query, device_id, day=None) -> pd.DataFrame:
     )
 
 
+def rmssd_segment_table(query, device_id, cutoff=None, cap=5000,
+                        day=None) -> pd.DataFrame:
+    """Most-recent RMSSD macro-segments for a device, newest night first,
+    segments in ascending order — the timing, window count, trend classification
+    and the ln-RMSSD linear-fit / fit-quality metrics (not the primary key).
+
+    ``rmssdsegment`` has no absolute per-event timestamp: its only time key is
+    ``night_date`` (a ``DATE``). So, unlike the per-second / per-window /
+    per-minute builders, the time-window ``cutoff`` is applied at *day*
+    granularity (``night_date >= <cutoff day>``) — a wider ``window_dd`` preset
+    shows more recent nights — and when ``day`` is given that single night is the
+    binding scope (the day filter dominates the day-truncated cutoff).
+    """
+    clauses: list[str] = []
+    if cutoff is not None:
+        clauses.append("night_date >= '" + _day_literal(cutoff) + "'")
+    if day is not None:
+        clauses.append("night_date = '" + _day_literal(day) + "'")
+    sql = (
+        "select night_date, segment_id, start_h, end_h, duration_min, "
+        "window_count, trend_type, lnrmssd_start, lnrmssd_end, "
+        "lnrmssd_fitted_start, lnrmssd_fitted_end, lnrmssd_delta, "
+        "lnrmssd_slope_per_h, segment_volatility, segment_sse "
+        "from rmssdsegment where " + _where_device(device_id, *clauses)
+        + f" order by night_date desc, segment_id asc limit {int(cap)}"
+    )
+    return query(sql)
+
+
+def hourly_status_table(query, device_id, cutoff=None, cap=5000,
+                        day=None) -> pd.DataFrame:
+    """Most-recent hourly dynamic-status snapshots for a device, newest hour
+    first, capped — the frozen morning restart (``morning_status``), the
+    post-adjustment ``current_status``, the four time-in-zone hour counts
+    (``t1``–``t4``), the 5-minute HR and the two classification flags.
+
+    Mirrors ``minute_table`` (a true datetime time column), so the time-window
+    ``cutoff`` and the ``day`` filter apply directly on ``hour_start``.
+    """
+    clauses: list[str] = []
+    if cutoff is not None:
+        clauses.append("hour_start > " + _cutoff_literal(cutoff))
+    if day is not None:
+        clauses.append("date(hour_start) = '" + _day_literal(day) + "'")
+    sql = (
+        "select hour_start, morning_status, current_status, t1, t2, t3, t4, "
+        "hr_5min_avg, is_sleep_or_exercise, is_temporary "
+        "from hourlystatus where " + _where_device(device_id, *clauses)
+        + f" order by hour_start desc limit {int(cap)}"
+    )
+    return query(sql)
+
+
 # --- Feature 4 chart helpers -----------------------------------------------
 # Each returns an Altair spec (NaN-dropped, so ``to_json(allow_nan=False)`` is
 # safe) plus a no-data placeholder of the same dimensions when the slice is
@@ -1220,3 +1273,95 @@ def hr_load_energy_chart(
     if not panels:
         return _empty(line=True, title="HR · load · energy — no rows")
     return panels[0] if len(panels) == 1 else alt.vconcat(*panels)
+
+
+def rmssd_segment_chart(df: pd.DataFrame) -> alt.Chart:
+    """ln-RMSSD trajectory across a night: each segment contributes its start and
+    end endpoints (``start_h``/``lnrmssd_start``, ``end_h``/``lnrmssd_end``),
+    colored by ``trend_type`` (rising / falling / stable). A trend change breaks
+    the colored line — the discrete color channel draws one series per value.
+
+    ``trend_type`` is stored as the enum *name* (uppercase, e.g. ``STABLE``); the
+    fixed color domain is lowercase, so it is lowercased first (mirrors
+    ``window_ribbon_chart``) or every point would map to no color and the chart
+    would render empty."""
+    if df is None or df.empty:
+        return _empty(line=True, title="RMSSD segments — no rows")
+    d = df.copy()
+    for c in ("start_h", "end_h", "lnrmssd_start", "lnrmssd_end"):
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    if "trend_type" in d.columns:
+        d["trend_type"] = d["trend_type"].astype("string").str.lower()
+    start = d.rename(columns={"start_h": "hour", "lnrmssd_start": "lnrmssd"})[
+        ["hour", "lnrmssd", "trend_type"]
+    ]
+    end = d.rename(columns={"end_h": "hour", "lnrmssd_end": "lnrmssd"})[
+        ["hour", "lnrmssd", "trend_type"]
+    ]
+    long = _chart_df(pd.concat([start, end], ignore_index=True))
+    if long.empty:
+        return _empty(line=True, title="RMSSD segments — no rows")
+    return (
+        alt.Chart(long)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("hour:Q", title="hour from night start"),
+            y=alt.Y("lnrmssd:Q", title="ln RMSSD"),
+            color=alt.Color(
+                "trend_type:N",
+                title="trend",
+                scale=alt.Scale(
+                    domain=["rising", "falling", "stable"],
+                    range=["#1f77b4", "#d62728", "#7f7f7f"],
+                ),
+            ),
+            tooltip=["hour", "lnrmssd", "trend_type"],
+        )
+        .properties(width=560, height=180, title="RMSSD segments — ln RMSSD trajectory")
+    )
+
+
+def hourly_status_chart(df: pd.DataFrame) -> alt.Chart:
+    """Per-hour dynamic status: ``current_status`` (the post-adjustment score)
+    over ``hour_start`` with the frozen ``morning_status`` restart as a faint
+    second series — the ppi/raw-vs-cleaned pairing, here current-vs-frozen."""
+    if df is None or df.empty:
+        return _empty(line=True, title="Hourly status — no rows")
+    d = df.copy()
+    d["hour_start"] = pd.to_datetime(d["hour_start"], errors="coerce")
+    d = d.dropna(subset=["hour_start"])
+    series = [
+        c for c in ("current_status", "morning_status")
+        if c in d.columns and d[c].notna().any()
+    ]
+    if not series:
+        return _empty(line=True, title="Hourly status — no rows")
+    long = d[["hour_start"] + series].melt(
+        id_vars="hour_start", var_name="series", value_name="status",
+        value_vars=series,
+    )
+    long["series"] = long["series"].map(
+        {"current_status": "current", "morning_status": "morning (frozen)"}
+    )
+    long = _chart_df(long)
+    if long.empty:
+        return _empty(line=True, title="Hourly status — no rows")
+    return (
+        alt.Chart(long)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("hour_start:T", title="time (local)"),
+            y=alt.Y("status:Q", title="status score"),
+            color=alt.Color(
+                "series:N",
+                title="",
+                scale=alt.Scale(
+                    domain=["current", "morning (frozen)"],
+                    range=["#1f77b4", "#ff7f0e"],
+                ),
+            ),
+            tooltip=["hour_start", "series", "status"],
+        )
+        .properties(width=560, height=180, title="Hourly status — current vs frozen morning")
+    )
