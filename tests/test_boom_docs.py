@@ -160,3 +160,29 @@ def test_missing_docx_raises(tmp_path):
 def test_docx_path_env_override(monkeypatch):
     monkeypatch.setenv("BOOM_DOCX", "custom/path.docx")
     assert boom_docs.docx_path().as_posix() == "custom/path.docx"
+
+
+def test_fill_address_substitutes_selected_device_mac():
+    # The dashboard fills the {address} template with the selected device's MAC,
+    # so the link points at that device's endpoint.
+    assert (
+        boom_docs.fill_address("/devices/{address}/go", "D9:4C:37:91:9C:7E")
+        == "/devices/D9:4C:37:91:9C:7E/go"
+    )
+
+
+def test_fill_address_none_keeps_template():
+    # No device selected -> the {address} placeholder stays literal, so the link
+    # still shows the endpoint template.
+    assert (
+        boom_docs.fill_address("/devices/{address}/go", None)
+        == "/devices/{address}/go"
+    )
+
+
+def test_fill_address_leaves_non_device_paths_untouched():
+    # A path without the placeholder (e.g. the questionnaire) is returned as-is.
+    assert (
+        boom_docs.fill_address("/app/questionnaire", "D9:4C:37:91:9C:7E")
+        == "/app/questionnaire"
+    )

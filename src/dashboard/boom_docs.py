@@ -109,6 +109,18 @@ class Pair:
         )
 
 
+def fill_address(path: str, address: str | None) -> str:
+    """Fill the ``{address}`` template placeholder in an origin-relative path
+    (:meth:`Pair.path`) with a concrete device MAC, for a rendered link.
+
+    ``address`` is the MAC of the device selected in the dashboard's global
+    sidebar state. When it is ``None`` (no device selected) the ``{address}``
+    placeholder is left in place, so the link still shows the template; paths
+    without the placeholder (e.g. ``/app/questionnaire``) come back unchanged.
+    """
+    return path.replace("{address}", address) if address else path
+
+
 def _rid_targets(z: zipfile.ZipFile) -> dict[str, str]:
     """Map relationship Id -> target (e.g. ``rId5 -> media/image1.png``)."""
     rels = z.read("word/_rels/document.xml.rels").decode("utf-8")

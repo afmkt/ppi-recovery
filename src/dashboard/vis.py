@@ -592,15 +592,24 @@ def recovery_view(mo, query, get_device, m, day_picker, rec_window):
 
 
 @app.cell
-def docs_view(mo):
+def docs_view(mo, get_device):
+    import html
+
     from dashboard import boom_docs
 
     # A static reference: each app screen paired with the endpoint that renders
     # it. Loaded entirely from the committed asset dir src/dashboard/resources
     # (pairs.json + the screenshot PNGs) — the runtime never reads the docx.
     # Regenerate the assets from the docx with tools/extract_boom_images.py.
-    # It does not depend on the sidebar's device/day state, so it never shows
-    # "select a device".
+    # It never shows "select a device": the {address} template in each link is
+    # filled with the MAC of the device selected in the sidebar, and falls back
+    # to the literal {address} when no device is selected.
+    #
+    # get_device() is the sidebar's global selection: a pandas row, or None when
+    # nothing is selected.
+    _dv = get_device()
+    _address = _dv.get("mac") if _dv is not None else None
+
     err = None
     pairs = []
     try:
@@ -624,18 +633,28 @@ def docs_view(mo):
                     else mo.md(f"*{n} missing from resources/*")
                 )
             shots_view = mo.hstack(shots, gap=1) if len(shots) > 1 else shots[0]
-            # The link is origin-relative (Pair.path strips the host), so a click
-            # opens the endpoint on the same instance serving the dashboard,
-            # whether that is http://localhost:8000 or https://boom.sparkpos.cn.
-            link = mo.md(f"**{p.method}**  [{p.path}]({p.path})")
+            # Origin-relative (Pair.path strips the host), so a click lands on the
+            # endpoint served by the same instance as the dashboard — whether that
+            # is http://localhost:8000 or https://boom.sparkpos.cn. {address} is
+            # filled with the selected device's MAC (or left as the template when
+            # none is selected). target="_blank" opens the endpoint in a new
+            # browser tab instead of navigating away from the dashboard.
+            href = boom_docs.fill_address(p.path, _address)
+            link = mo.Html(
+                f"<strong>{html.escape(p.method)}</strong>&nbsp;&nbsp;"
+                f"<a href=\"{html.escape(href, quote=True)}\" target=\"_blank\">"
+                f"{html.escape(href)}</a>"
+            )
             return mo.vstack([mo.md(p.title), shots_view, link])
 
         blocks = [
             mo.md(
                 "## API docs\n\n"
                 "Each screen of the mobile app, paired with the endpoint that renders "
-                "it (from `docs/boom.v1.0.docx`). Clicking an endpoint opens it on "
-                "this server — the link is relative to the dashboard's own origin."
+                "it (from `docs/boom.v1.0.docx`). Clicking an endpoint opens it in a "
+                "new browser tab on this server — the link is relative to the "
+                "dashboard's own origin, with `{address}` filled from the device "
+                "selected in the left panel."
             )
         ]
         section = None

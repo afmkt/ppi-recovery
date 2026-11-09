@@ -118,7 +118,7 @@ a reload — the device list is read once at connect.
 
 ## API Docs tab
 
-A static reference page (no device/day selection) that renders the mobile-app
+A static reference page (no day selection) that renders the mobile-app
 screenshots — extracted from `docs/boom.v1.0.docx` into
 `src/dashboard/resources/` — **paired with the endpoint that renders
 each one**. The doc is a per-screen API reference; `dashboard.boom_docs` walks it
@@ -126,14 +126,21 @@ in document order and, for every app screenshot, grabs the HTTP request that
 immediately follows it (method + URL). Inline *formula diagrams* are not app
 screenshots and carry no single endpoint, so a screenshot group becomes a pair
 only when a request follows it before the next heading — the nine formula PNGs
-drop out.
+drop out. It reads the device selected in the sidebar only to fill the
+`{address}` template in each link, so with no device selected the template stays
+literal and the tab never demands a selection.
 
 Each pair renders its screenshot(s) (a screen may have two) and a **clickable
 link to the endpoint**. The link is **origin-relative** (`Pair.path` strips the
 scheme/host/port, e.g. `/devices/{address}/go`), so a click lands on the endpoint
 served by the *same instance* that serves the dashboard — `http://localhost:8000`
 or `https://boom.sparkpos.cn` both resolve correctly, and every path already maps
-to a real route in `newboom.boom`.
+to a real route in `newboom.boom`. The `{address}` placeholder is filled with the
+MAC of the device selected in the sidebar
+(`dashboard.boom_docs.fill_address`, falling back to the literal `{address}` when
+none is selected), and the link opens in a **new browser tab**
+(`target="_blank"` — marimo's HTML sanitizer preserves it and adds
+`rel="noopener noreferrer"`) rather than navigating the dashboard away.
 
 Both the screenshot binaries **and** the pair manifest (`pairs.json`) live in
 the committed asset dir `src/dashboard/resources/`, and the tab loads everything
