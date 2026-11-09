@@ -19,9 +19,9 @@ class Device(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     name: str = Field(index=True)
     mac: str = Field(index=True, unique=True)
-    created_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
+    created_at: NaiveDatetime = Field(default_factory=datetime.now)
     tz: str | None = Field(
-        default=None, description="Device local UTC offset, e.g. '08:00'"
+        default=None, description="Device local offset, e.g. '08:00'"
     )
     is_female: bool = Field(
         default=False, description="Selects the female tss load formula"
@@ -454,7 +454,7 @@ class QuestionnaireAnswer(SQLModel, table=True):
     user_type: str = Field(description="User type value: beginner/serious/professional")
     question: str = Field(description="Submitted question text")
     selected: str = Field(description="Selected option value")
-    created_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
+    created_at: NaiveDatetime = Field(default_factory=datetime.now)
 
 
 class Conversation(SQLModel, table=True):
@@ -471,8 +471,8 @@ class Conversation(SQLModel, table=True):
     device_id: int = Field(foreign_key="device.id", index=True)
     device: Device = Relationship(back_populates="coach_conversations")
     title: str = Field(default="新对话", unique=True, description="对话标题")
-    created_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
-    updated_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
+    created_at: NaiveDatetime = Field(default_factory=datetime.now)
+    updated_at: NaiveDatetime = Field(default_factory=datetime.now)
     messages: Mapped[list["Message"]] = Relationship(back_populates="conversation")
 
 
@@ -498,7 +498,7 @@ class Message(SQLModel, table=True):
     audio_url: str | None = Field(default=None, description="语音URL(仅语音消息)")
     transcript: str | None = Field(default=None, description="语音转文本(仅语音消息)")
     feedback: str | None = Field(default=None, description="like / dislike (§11.11)")
-    created_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
+    created_at: NaiveDatetime = Field(default_factory=datetime.now)
 
 
 # ---------------------------------------------------------------------------
@@ -542,7 +542,7 @@ class LayerFreshness(SQLModel, table=True):
     lag_s: float | None = Field(
         default=None, description="now - latest_data_time in seconds; NULL if empty"
     )
-    last_scan_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
+    last_scan_at: NaiveDatetime = Field(default_factory=datetime.now)
     __table_args__ = (UniqueConstraint("device_id", "layer", name="uix_device_layer"),)
 
 
@@ -574,7 +574,7 @@ class DataGap(SQLModel, table=True):
         default=False,
         description="True once the day has elapsed; closed rows are immutable",
     )
-    computed_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
+    computed_at: NaiveDatetime = Field(default_factory=datetime.now)
     __table_args__ = (
         UniqueConstraint("device_id", "gap_date", name="uix_device_gap_date"),
     )
@@ -625,7 +625,7 @@ class Reconciliation(SQLModel, table=True):
     detail: str | None = Field(
         default=None, description="Tolerance band + observed/expected"
     )
-    computed_at: NaiveDatetime = Field(default_factory=datetime.utcnow)
+    computed_at: NaiveDatetime = Field(default_factory=datetime.now)
     __table_args__ = (
         UniqueConstraint(
             "device_id", "night_date", "check", name="uix_device_night_check"

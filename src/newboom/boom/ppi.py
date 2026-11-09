@@ -8,9 +8,9 @@ caddy-served SPA) keep working unchanged.
 ``spo2`` is the device-raw ×10 value, consistent with the ``PPI`` table and
 ``/upload/ppi`` (new-interface.md §3.1: ``950`` = 95.0%); the display layer
 folds it back to a percentage. ``address`` keys on ``Device.mac``. ``time`` is
-the UTC instant as stored (``PPI.time``), rendered ``YYYY-MM-DD HH:MM:SS`` — the
-same format as ``/upload/ppi``, which ``boom_ui`` parses with
-``pd.to_datetime(…, utc=True)``.
+the device-local instant as stored (``PPI.time``), rendered ``YYYY-MM-DD
+HH:MM:SS`` in the device's timezone — the same format as ``/upload/ppi``.
+Parse it as a naive local timestamp, not an aware one, or it mis-shifts.
 """
 
 from __future__ import annotations

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 
 import numpy as np
 from scipy.interpolate import interp1d
@@ -402,37 +402,60 @@ def process_window_metrics(device_id: int) -> int:
             session.commit()
             session.refresh(progress)
 
-        # Idle short-circuit: if the newest PPI is already at or behind the
-        # processed cursor, this device has no new data and its last night is
-        # already built — skip so a frozen device (data stopped) doesn't
-        # re-render its last night every cycle. Watermark = Progress.end_time
-        # (the resume cursor); max(PPI.time) shows the cursor is caught up. A
-        # backfill older than the cursor wouldn't be caught, but PPI is
-        # appended chronologically.
-        if progress.end_time is not None:
-            max_ppi = session.exec(
-                select(func.max(PPI.time)).where(PPI.device_id == device_id)
-            ).one()
-            if max_ppi is not None and max_ppi <= progress.end_time:
-                return 0
+        # # Idle short-circuit: if the newest PPI is already at or behind the
+        # # processed cursor, this device has no new data and its last night is
+        # # already built — skip so a frozen device (data stopped) doesn't
+        # # re-render its last night every cycle. Watermark = Progress.end_time
+        # # (the resume cursor); max(PPI.time) shows the cursor is caught up. A
+        # # backfill older than the cursor wouldn't be caught, but PPI is
+        # # appended chronologically.
+        # if progress.end_time is not None:
+        #     max_ppi = session.exec(
+        #         select(func.max(PPI.time)).where(PPI.device_id == device_id)
+        #     ).one()
+        #     if max_ppi is not None and max_ppi <= progress.end_time:
+        #         return 0
 
-        # Determine start time based on last processed window, or default to 7 days ago
+        # # Determine start time based on last processed window, or default to 7 days ago
+        # start_time = progress.end_time
+        # if not start_time:
+        #     # Look at the earliest available PPI or default to 7 days ago
+        #     # Limit to 1: an unbounded `order_by(time).first()` materializes the
+        #     # entire PPI table through the ORM to read a single row (~6s on a
+        #     # 1M-row device). The index seek with LIMIT 1 is sub-millisecond.
+        #     earliest_ppi = session.exec(
+        #         select(PPI)
+        #         .where(PPI.device_id == device_id)
+        #         .order_by(col(PPI.time).asc())
+        #         .limit(1)
+        #     ).first()
+        #     start_time = earliest_ppi.time if earliest_ppi else datetime.now()
+
+        # end_time = datetime.now()
+        max_ppi = session.exec(
+            select(func.max(PPI.time)).where(PPI.device_id == device_id)
+        ).one()
+        if max_ppi is None:
+            return 0  # no PPI yet for this device
+
+        # Idle short-circuit: newest PPI already at/behind the cursor → the frozen
+        # device's last night is built; skip so it isn't re-rendered every cycle.
+        if progress.end_time is not None and max_ppi <= progress.end_time:
+            return 0
+
+        # Resume from the cursor; on first run build from the earliest record.
         start_time = progress.end_time
         if not start_time:
-            # Look at the earliest available PPI or default to 7 days ago
-            # Limit to 1: an unbounded `order_by(time).first()` materializes the
-            # entire PPI table through the ORM to read a single row (~6s on a
-            # 1M-row device). The index seek with LIMIT 1 is sub-millisecond.
+            # ... LIMIT 1 comment ...
             earliest_ppi = session.exec(
                 select(PPI)
                 .where(PPI.device_id == device_id)
                 .order_by(col(PPI.time).asc())
                 .limit(1)
             ).first()
-            start_time = earliest_ppi.time if earliest_ppi else datetime.now(UTC)
+            start_time = earliest_ppi.time if earliest_ppi else max_ppi
 
-        end_time = datetime.now(UTC)
-
+        end_time = max_ppi
     # Build window metrics using our compute function
     metrics = window_metrics_for_device(device_id, start_time, end_time)
     if not metrics:
@@ -797,7 +820,7 @@ def record_diagnostics(device_id: int) -> None:
              summary; 1 PPI row ≈ 1 s).
     """
     with Session(engine) as session:
-        now = datetime.now(UTC).replace(tzinfo=None)
+        now = datetime.now()
 
         # --- Q1-Q4: per-layer freshness ---
         raw_max, raw_n = _max_count(session, PPI, PPI.time, device_id)

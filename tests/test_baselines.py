@@ -119,7 +119,7 @@ def test_daily_summary_loads_sleep_rest_hr():
         s.add(
             Sleep(
                 device_id=device_id,
-                timezone="UTC",
+                timezone="08:00",
                 time=datetime(2026, 10, 27, 23, 0),
                 sleep_onset_time=0,
                 awake_time=0,

@@ -19,7 +19,7 @@ Two behaviors, both keyed to the device's local timezone:
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 
 from newboom.boom.schemas import AtlCtlPoint, DatePoint
 from newboom.config import STALE_WINDOW_DAYS
@@ -34,17 +34,13 @@ __all__ = [
 
 
 def local_today(device: Device | None) -> date:
-    """Device-local 'today' via its fixed-offset ``tz`` (naive local if unset).
+    """Device-local 'today' — the server's wall-clock date.
 
     Mirrors ``newboom.boom_compute._today_local`` so the staleness threshold and
-    the pipeline's day keying use the same clock.
+    the pipeline's day keying use the same clock. The system is pure local
+    (single zone), so the device's ``tz`` is informational and not applied.
     """
-    if device is None or not device.tz:
-        return datetime.now().date()
-    sign = -1 if device.tz.startswith("-") else 1
-    hours, minutes = (int(x) for x in device.tz.lstrip("+-").split(":"))
-    tz = timezone(timedelta(hours=sign * hours, minutes=sign * minutes))
-    return datetime.now(timezone.utc).astimezone(tz).date()
+    return datetime.now().date()
 
 
 def mark_stale(

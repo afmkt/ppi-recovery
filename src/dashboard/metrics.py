@@ -10,7 +10,6 @@ exercised against any engine.
 from __future__ import annotations
 
 import math
-from datetime import datetime
 from typing import Any
 
 import altair as alt
@@ -106,7 +105,7 @@ def fleet_freshness(query, devices: pd.DataFrame) -> pd.DataFrame:
 
     raw["first_ppi"] = pd.to_datetime(raw["first_ppi"], errors="coerce")
     raw["last_ppi"] = pd.to_datetime(raw["last_ppi"], errors="coerce")
-    now = pd.Timestamp(datetime.now())
+    now = pd.Timestamp.now()
     raw["age_h"] = (now - raw["last_ppi"]).dt.total_seconds() / 3600.0
     raw["stale"] = raw["age_h"] > STALE_HOURS
     raw["active_days"] = raw["active_days"].fillna(0).astype(int)
@@ -190,7 +189,8 @@ def ingestion_meta(query, device_id: int) -> dict:
     ).iloc[0]
     last = pd.to_datetime(row["last_ppi"], errors="coerce")
     first = pd.to_datetime(row["first_ppi"], errors="coerce")
-    age_h = None if pd.isna(last) else (datetime.now() - last).total_seconds() / 3600.0
+    now = pd.Timestamp.now()
+    age_h = None if pd.isna(last) else (now - last).total_seconds() / 3600.0
     state = "LIVE" if (age_h is not None and age_h <= STALE_HOURS) else "STALE"
     return {
         "last": last,
@@ -231,6 +231,110 @@ def ingestion_summary(meta: dict) -> str:
     )
 
 
+# --- raw-input coverage & quality ------------------------------------------
+# The two direct measures of the raw PPI feed, shown as the overview headline:
+# how *complete* the feed is (received vs an expected per-second stream) and how
+# much of what arrived is *unusable* (a raw second the cleaner could not turn
+# into a beat interval). Both are device-wide over the whole PPI history, so
+# they read as a single headline; the per-day coverage chart below drills into
+# the completeness of each calendar day.
+
+def raw_input_quality(query, device_id: int) -> dict:
+    """Device-wide raw-PPI coverage and quality over the whole PPI history.
+
+    One aggregate scan of ``ppi`` returns the four raw counts; the ratios are
+    derived in Python:
+
+      * ``coverage_pct`` = 100 · total / (active_days · ``FULL_DAY_S``). A full
+        per-second stream is 86,400 rows/day, so a device that reports a
+        complete day reads 100%. Expected is over the days the device was
+        *active*, so a device that stops and resumes is not penalised for the
+        gap between.
+      * ``invalid_pct``  = 100 · invalid / total. ``invalid`` is the PPI seconds
+        the cleaner *scored* unusable — ``ppi_clean`` is NULL among processed
+        (not-fresh) rows: a raw value out of physiological range or a local
+        outlier the ±5 local-median check rejected (the pipeline's own
+        ``valid_ratio`` inverse, ``1 - valid_ratio``).
+
+    Not-yet-scored seconds are ``fresh`` (``ppi_clean`` still NULL until
+    ``clean_ppi`` runs), so they are counted as ``pending`` and **excluded from
+    invalid** — a device that just ingested a file must not read as 100%
+    invalid. ``total`` is all received seconds (the denominator the user asked
+    for: "invalid over total data points").
+    """
+    row = query(
+        f"""select
+              count(*) as total,
+              count(distinct date(time)) as active_days,
+              sum(case when ppi_clean is null then 1 else 0 end) as null_clean,
+              sum(case when fresh then 1 else 0 end) as pending
+            from ppi where device_id = {int(device_id)}"""
+    ).iloc[0]
+    total = int(row["total"] or 0)
+    active_days = int(row["active_days"] or 0)
+    # Fresh rows are always un-scored (ppi_clean NULL until clean_ppi runs), so
+    # the processed-but-rejected remainder is the genuine "invalid" count.
+    pending = int(row["pending"] or 0)
+    null_clean = int(row["null_clean"] or 0)
+    invalid = max(null_clean - pending, 0)
+    valid = total - invalid - pending
+    expected = active_days * FULL_DAY_S
+    coverage_pct = (100.0 * total / expected) if expected else 0.0
+    invalid_pct = (100.0 * invalid / total) if total else 0.0
+    return {
+        "total": total,
+        "active_days": active_days,
+        "expected": expected,
+        "coverage_pct": coverage_pct,
+        "invalid": invalid,
+        "valid": valid,
+        "pending": pending,
+        "invalid_pct": invalid_pct,
+    }
+
+
+def coverage_quality_md(quality: dict) -> str:
+    """One-line explainer for the two raw-input ratios in the table below."""
+    return (
+        "Two direct measures of the raw PPI feed — **coverage** is the seconds "
+        "received against an expected per-second stream "
+        f"({quality['active_days']} active day(s) × 86,400 s); **invalid** is "
+        "the received seconds the cleaner could not turn into a beat interval "
+        "(out of physiological range or a local outlier), over all received."
+    )
+
+
+def coverage_quality_table(quality: dict) -> pd.DataFrame:
+    """The two raw-input ratios as a 2-row table; empty when the device has no
+    PPI data yet (the panel then shows a no-data placeholder)."""
+    if not quality["total"]:
+        return pd.DataFrame(columns=["measure", "value", "detail"])
+    pending_note = (
+        f" · {fmt_num(quality['pending'])} not yet scored"
+        if quality["pending"]
+        else ""
+    )
+    rows = [
+        {
+            "measure": "Coverage — received / expected",
+            "value": f"{quality['coverage_pct']:.1f}%",
+            "detail": (
+                f"{fmt_num(quality['total'])} / {fmt_num(quality['expected'])} "
+                f"PPI seconds · {quality['active_days']} active day(s)"
+            ),
+        },
+        {
+            "measure": "Invalid — of total received",
+            "value": f"{quality['invalid_pct']:.1f}%",
+            "detail": (
+                f"{fmt_num(quality['invalid'])} of {fmt_num(quality['total'])} "
+                f"PPI seconds unusable{pending_note}"
+            ),
+        },
+    ]
+    return pd.DataFrame(rows, columns=["measure", "value", "detail"])
+
+
 # ===========================================================================
 # Feature 2 — aggregation pipeline monitoring
 # ===========================================================================
@@ -250,7 +354,7 @@ def aggregation_progress(query, device_id: int) -> pd.DataFrame:
                  when 'MINUTE_METRIC' then 2 else 3 end"""
     )
     prog["end_time"] = pd.to_datetime(prog["end_time"], errors="coerce")
-    now = pd.Timestamp(datetime.now())
+    now = pd.Timestamp.now()
     prog["age_h"] = (now - prog["end_time"]).dt.total_seconds() / 3600.0
     prog["lag_raw_h"] = (raw_max - prog["end_time"]).dt.total_seconds() / 3600.0
     prog["age"] = prog["age_h"].apply(fmt_dur)
@@ -455,16 +559,9 @@ def layer_freshness(query, device_id: int, now=None) -> pd.DataFrame:
     if now is None:
         df["lag_h"] = df["lag_s"] / 3600.0
     else:
-        # Live lag. Normalize both sides to naive so the subtraction can't crash
-        # on a tz mismatch: the worker stores naive-UTC timestamps, but a
-        # caller may hand us a tz-aware ``now`` (pd.Timestamp.now("UTC")).
-        now_ts = pd.Timestamp(now)
-        if now_ts.tz is not None:
-            now_ts = now_ts.tz_localize(None)
-        latest = df["latest_data_time"]
-        if latest.dt.tz is not None:
-            latest = latest.dt.tz_localize(None)
-        df["lag_h"] = (now_ts - latest).dt.total_seconds() / 3600.0
+        # Live lag. Both 'now' and the stored latest are naive local, so a direct
+        # subtraction is safe.
+        df["lag_h"] = (pd.Timestamp(now) - df["latest_data_time"]).dt.total_seconds() / 3600.0
     df["lag"] = df["lag_h"].apply(fmt_dur)
     df["stage"] = df["layer"].str.lower().map(LAYER_LABELS).fillna(df["layer"])
     df["_order"] = df["layer"].str.lower().map(
@@ -574,13 +671,13 @@ def window_cutoff(preset, anchor=None):
     "1h" meaningful for a device whose latest sample is days old: it means the
     last hour of *data the device has*, so a historical device shows its most
     recent hour instead of an empty future window. A caller that omits
-    ``anchor`` falls back to naive-UTC "now" (a live device).
+    ``anchor`` falls back to naive-local "now" (a live device).
     """
     delta_s = _WINDOW_PRESETS.get(preset, 3600.0)
     if delta_s is None:
         return None
     if anchor is None:
-        anchor = pd.Timestamp.now("UTC").tz_localize(None)
+        anchor = pd.Timestamp.now()
     return pd.Timestamp(anchor) - pd.Timedelta(seconds=float(delta_s))
 
 
@@ -629,23 +726,68 @@ def _cutoff_literal(cutoff) -> str:
     return "'" + pd.Timestamp(cutoff).strftime("%Y-%m-%d %H:%M:%S.%f") + "'"
 
 
+def _day_literal(day) -> str:
+    """A fixed ``YYYY-MM-DD`` value for a calendar day, matching the
+    ``date(<col>)`` projection of the stored datetime text. The builder wraps
+    it in single quotes (as ``_cutoff_literal`` does), so this returns the bare
+    value. Accepts a ``date``/``Timestamp``/``'YYYY-MM-DD'`` string."""
+    return pd.Timestamp(day).strftime("%Y-%m-%d")
+
+
+def day_bounds(day, preset="All"):
+    """Resolve the global day picker to a ``(lower_bound, upper_bound)``.
+
+    ``day`` is a ``date``/``Timestamp``/``'YYYY-MM-DD'``. The window preset
+    (see ``_WINDOW_PRESETS``) is centered on the middle of that day (noon), so
+    a preset like ``12h`` covers the day's middle 12 hours. ``All`` spans the
+    whole calendar day (midnight to midnight). A preset wider than a day is fine
+    — the per-day ``date(<col>)`` filter in the builders keeps the result inside
+    the chosen day. ``None`` means no bound on that side.
+    """
+    if day is None:
+        return None, None
+    day_ts = pd.Timestamp(day).normalize()
+    preset = _WINDOW_PRESETS.get(preset, 3600.0)
+    if preset is None:
+        return day_ts, day_ts + pd.Timedelta(days=1)
+    half = preset / 2.0
+    noon = day_ts + pd.Timedelta(hours=12)
+    return noon - pd.Timedelta(seconds=half), noon + pd.Timedelta(seconds=half)
+
+
+def _day_from_picker(day_picker, query, device_id, table, time_col):
+    """Coerce the global day picker to a ``date`` for the builders.
+
+    The picker's ``value`` is a ``'YYYY-MM-DD'`` string (or ``None`` before a
+    pick); when it is missing we fall back to the device's own most-recent data
+    day, so a freshly loaded device still shows its latest day without a click.
+    """
+    val = getattr(day_picker, "value", None)
+    if val:
+        return pd.Timestamp(val).date()
+    last = last_data_time(query, device_id, table, time_col)
+    return pd.Timestamp.now().date() if last is None else last.date()
+
+
 def _where_device(device_id, *clauses: str) -> str:
     base = "device_id = " + str(int(device_id))
     return base + (" and " + " and ".join(clauses) if clauses else "")
 
 
 def cleaned_ppi(query, device_id, cutoff=None, cap=2000,
-                cleaned_only=False, fresh_only=False) -> pd.DataFrame:
+                cleaned_only=False, fresh_only=False, day=None) -> pd.DataFrame:
     """Most-recent per-second PPI rows for a device, newest first, capped.
 
     ``spo2`` is stored raw×10 (0 = "not reported this second"); a ``spo2_pct``
     column (÷10, blank when 0) is appended for display. Rows are bounded by
     ``cutoff`` and ``cap`` so the browser never receives the full per-second
-    table.
+    table. When ``day`` is given, rows are restricted to that calendar day.
     """
     clauses: list[str] = []
     if cutoff is not None:
         clauses.append("time > " + _cutoff_literal(cutoff))
+    if day is not None:
+        clauses.append("date(time) = '" + _day_literal(day) + "'")
     if cleaned_only:
         clauses.append("ppi_clean IS NOT NULL")
     if fresh_only:
@@ -665,16 +807,19 @@ def cleaned_ppi(query, device_id, cutoff=None, cap=2000,
 
 
 def window_table(query, device_id, cutoff=None, cap=5000,
-                 states=None, sleep_only=False, min_valid=0.0) -> pd.DataFrame:
+                 states=None, sleep_only=False, min_valid=0.0, day=None) -> pd.DataFrame:
     """Most-recent windowmetrics for a device, newest first, capped and
     optionally filtered by state / sleep / minimum ``valid_ratio``.
 
     ``states`` matches case-insensitively (the DB stores the enum name, whose
-    case is not relied on).
+    case is not relied on). When ``day`` is given, windows are restricted to
+    that calendar day.
     """
     clauses: list[str] = []
     if cutoff is not None:
         clauses.append("window_start > " + _cutoff_literal(cutoff))
+    if day is not None:
+        clauses.append("date(window_start) = '" + _day_literal(day) + "'")
     if states:
         ph = ", ".join(f"'{str(s)}'" for s in states)
         clauses.append(f"lower(state) in ({ph})")
@@ -690,11 +835,16 @@ def window_table(query, device_id, cutoff=None, cap=5000,
     return query(sql)
 
 
-def minute_table(query, device_id, cutoff=None, cap=5000) -> pd.DataFrame:
-    """Most-recent minutemetrics for a device, newest first, capped."""
+def minute_table(query, device_id, cutoff=None, cap=5000, day=None) -> pd.DataFrame:
+    """Most-recent minutemetrics for a device, newest first, capped.
+
+    When ``day`` is given, minutes are restricted to that calendar day.
+    """
     clauses: list[str] = []
     if cutoff is not None:
         clauses.append("timestamp > " + _cutoff_literal(cutoff))
+    if day is not None:
+        clauses.append("date(timestamp) = '" + _day_literal(day) + "'")
     sql = (
         "select timestamp, night_date, heart_rate, s1_load, tss_load, "
         "total_load, heart_rate_zone, steps, calories "
@@ -704,7 +854,7 @@ def minute_table(query, device_id, cutoff=None, cap=5000) -> pd.DataFrame:
     return query(sql)
 
 
-def hr_load_energy_table(query, device_id, cutoff=None, cap=50000) -> pd.DataFrame:
+def hr_load_energy_table(query, device_id, cutoff=None, cap=50000, day=None) -> pd.DataFrame:
     """Most-recent per-minute heart rate, cumulative intraday load, and energy
     reserve for a device, newest first, capped.
 
@@ -713,11 +863,14 @@ def hr_load_energy_table(query, device_id, cutoff=None, cap=50000) -> pd.DataFra
     intraday load (S1 + tss, reset each night session), and ``total_energy`` is
     the 0-100 body-energy reserve. All three live in ``minutemetric``, so one
     bounded query feeds the whole figure. Per-minute data is small, so the cap
-    is generous (``50000`` ≈ 34 days).
+    is generous (``50000`` ≈ 34 days). When ``day`` is given, minutes are
+    restricted to that calendar day.
     """
     clauses: list[str] = []
     if cutoff is not None:
         clauses.append("timestamp > " + _cutoff_literal(cutoff))
+    if day is not None:
+        clauses.append("date(timestamp) = '" + _day_literal(day) + "'")
     sql = (
         "select timestamp, night_date, heart_rate, total_load, total_energy "
         "from minutemetric where " + _where_device(device_id, *clauses)
@@ -726,12 +879,14 @@ def hr_load_energy_table(query, device_id, cutoff=None, cap=50000) -> pd.DataFra
     return query(sql)
 
 
-def daily_table(query, device_id) -> pd.DataFrame:
-    """Every daily-summary row for a device (one per day), newest first.
+def daily_table(query, device_id, day=None) -> pd.DataFrame:
+    """Daily-summary rows for a device, newest first (one per day).
 
     A curated column subset — scores, HRV baselines/vals, energy, autonomic
-    balance and the coaching text — rather than all 48 columns.
+    balance and the coaching text — rather than all 48 columns. When ``day`` is
+    given, only that calendar day's summary is returned.
     """
+    clauses = ["summary_date = '" + _day_literal(day) + "'"] if day is not None else []
     return query(
         "select summary_date, status_score, base_score, sleep_score, "
         "rest_heart_rate_val, hrv_night_val, hrv_morning_val, "
@@ -740,7 +895,7 @@ def daily_table(query, device_id) -> pd.DataFrame:
         "atl, ctl, tsb, "
         "sympathetic_pct, parasympathetic_pct, transition_pct, "
         "boom_go_text, training_suggestion, is_temporary_algorithm "
-        "from dailysummary where " + _where_device(device_id)
+        "from dailysummary where " + _where_device(device_id, *clauses)
         + " order by summary_date desc"
     )
 
@@ -781,7 +936,7 @@ def ppi_clean_chart(df: pd.DataFrame) -> alt.Chart:
         alt.Chart(m)
         .mark_line(point=False)
         .encode(
-            x=alt.X("time:T", title="time (UTC)"),
+            x=alt.X("time:T", title="time (local)"),
             y=alt.Y("ms:Q", title="ms between beats"),
             color=alt.Color("series:N", title=""),
         )
@@ -883,7 +1038,7 @@ def minute_hr_chart(df: pd.DataFrame) -> alt.Chart:
         alt.Chart(d)
         .mark_line(point=False)
         .encode(
-            x=alt.X("timestamp:T", title="time (UTC)"),
+            x=alt.X("timestamp:T", title="time (local)"),
             y=alt.Y("heart_rate:Q", title="HR (bpm)"),
             color=alt.Color("heart_rate_zone:N", title="HR zone"),
         )

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from datetime import UTC, date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import numpy as np
@@ -65,13 +65,12 @@ def _sigmoid(total_load: float) -> float:
 
 
 def _today_local(device: Device | None) -> date:
-    """Local 'today' for the device via its fixed-offset tz (naive local if unset)."""
-    if not device or not device.tz:
-        return datetime.now().date()
-    sign = -1 if device.tz.startswith("-") else 1
-    hours, minutes = map(int, device.tz.lstrip("+-").split(":"))
-    tz = timezone(timedelta(hours=sign * hours, minutes=sign * minutes))
-    return datetime.now(UTC).astimezone(tz).date()
+    """Local 'today' — the server's wall-clock date.
+
+    The system is pure local (single zone), so the device's ``tz`` is
+    informational and not applied here.
+    """
+    return datetime.now().date()
 
 
 def _hr_params(

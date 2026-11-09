@@ -371,7 +371,7 @@ async def send_message(
     session.add(ai_msg)
     session.commit()
     session.refresh(ai_msg)
-    conv.updated_at = datetime.utcnow()
+    conv.updated_at = datetime.now()
     session.add(conv)
     session.commit()
     return BoomResponse(
@@ -452,7 +452,7 @@ async def send_message_stream(
                 ai_id = str(ai.id)
                 c = writer.get(Conversation, conv_id)
                 if c is not None:
-                    c.updated_at = datetime.utcnow()
+                    c.updated_at = datetime.now()
                     writer.add(c)
                     writer.commit()
             yield _sse(

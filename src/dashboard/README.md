@@ -7,11 +7,28 @@ The left sidebar selects a device. The main area has three tabs.
 
 ## Overview tab
 
-The existing health/pipeline/quality view:
+The per-device health/pipeline/quality view. At the top, right under the
+ingestion banner, is the **Coverage & data quality** headline — the two direct
+measures of the raw PPI feed (`dashboard.metrics.raw_input_quality`):
 
-1. Ingestion Health & Pipeline Throughput
-2. Aggregation Pipeline Monitoring
-3. Data Quality & Statistical Sanity
+- **Coverage — received / expected**: seconds ingested against an expected
+  per-second stream (`active_days × 86,400 s`). A complete day reads 100%; a
+  broken feed reads near 0%. Expected is over the days the device was *active*,
+  so a device that stops and resumes is not penalised for the gap between.
+- **Invalid — of total received**: the received seconds the cleaner could not
+  turn into a beat interval (`ppi_clean` is NULL among *processed* rows — out of
+  physiological range or a local outlier the ±5 local-median check rejected; the
+  inverse of the pipeline's `valid_ratio`). Not-yet-scored *fresh* seconds are
+  counted as *pending* and excluded from invalid, so a device that just ingested
+  a file is not misread as 100% invalid.
+
+Both are device-wide over the whole PPI history; the per-day coverage chart lower
+down (`coverage_chart`) drills completeness in per calendar day. The remaining
+sections:
+
+1. Pipeline Throughput & Task Watermarks
+2. Aggregation Production (windowmetric vs minutemetric rows/day)
+3. Daily Coverage & Gaps
 
 ## Tables tab
 

@@ -72,7 +72,7 @@ def test_retry_does_not_mask_permanent_errors() -> None:
 
 def test_run_write_retries_and_upsert_is_idempotent() -> None:
     with Session(engine) as s:
-        d = Device(name="dev", mac="AA:BB:CC:DD:EE:FF", tz="UTC")
+        d = Device(name="dev", mac="AA:BB:CC:DD:EE:FF", tz="08:00")
         s.add(d)
         s.commit()
         s.refresh(d)

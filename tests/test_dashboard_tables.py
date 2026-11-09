@@ -75,7 +75,7 @@ def test_window_cutoff_no_anchor_falls_back_to_now():
     cutoff = m.window_cutoff("1h")
     assert cutoff is not None
     assert cutoff.tz is None
-    now = pd.Timestamp.now("UTC").tz_localize(None)
+    now = pd.Timestamp.now()
     assert abs((now - cutoff).total_seconds() - 3600.0) < 5.0
 
 
@@ -538,3 +538,277 @@ def test_window_ribbon_caption_with_data_has_no_explanation():
     cap = m.window_ribbon_caption(df, start, end, last_lfhf=None)
     assert "**1** with LF/HF" in cap
     assert "no LF/HF in this window" not in cap
+
+
+# --- global day filter ------------------------------------------------------
+
+
+def test_cleaned_ppi_day_filter_adds_calendar_predicate():
+    query, calls = fake_query(_ppi_rows())
+    m.cleaned_ppi(query, 1, day="2026-01-01")
+    sql = calls[0]
+    assert "date(time) = '2026-01-01'" in sql
+    assert "device_id = 1" in sql
+
+
+def test_cleaned_ppi_day_filter_omitted_when_none():
+    query, calls = fake_query(_ppi_rows())
+    m.cleaned_ppi(query, 1)
+    sql = calls[0]
+    assert "date(time)" not in sql
+
+
+def test_window_table_day_filter_adds_calendar_predicate():
+    rows = pd.DataFrame(
+        {
+            "night_date": ["2026-01-01"] * 3,
+            "window_start": [f"2026-01-01 0{i}:00:00" for i in range(3)],
+            "window_mid_h": [0.0, 1.0, 2.0],
+            "state": ["sympathetic"] * 3,
+            "is_sleep": [False] * 3,
+            "valid_ratio": [1.0] * 3,
+            "rmssd_ms": [0.0] * 3,
+            "ln_rmssd": [0.0] * 3,
+            "lf_hf": [0.0] * 3,
+            "lf": [0.0] * 3,
+            "hf": [0.0] * 3,
+        }
+    )
+    query, calls = fake_query(rows)
+    m.window_table(query, 1, day="2026-01-01", cap=50)
+    sql = calls[0]
+    assert "date(window_start) = '2026-01-01'" in sql
+    assert "valid_ratio >= 0.000000" in sql
+
+
+def test_minute_table_day_filter_adds_calendar_predicate():
+    rows = pd.DataFrame(
+        {
+            "timestamp": [f"2026-01-01 0{i}:00" for i in range(3)],
+            "night_date": ["2026-01-01"] * 3,
+            "heart_rate": [70.0, 71.0, 72.0],
+            "s1_load": [1.0, 2.0, 3.0],
+            "tss_load": [0.0] * 3,
+            "total_load": [1.0, 2.0, 3.0],
+            "heart_rate_zone": [0] * 3,
+            "steps": [0] * 3,
+            "calories": [0.0] * 3,
+        }
+    )
+    query, calls = fake_query(rows)
+    m.minute_table(query, 1, day="2026-01-01", cap=50)
+    assert "date(timestamp) = '2026-01-01'" in calls[0]
+
+
+def test_minute_table_day_filter_omitted_when_none():
+    query, calls = fake_query(pd.DataFrame())
+    m.minute_table(query, 1, cap=10)
+    assert "date(timestamp)" not in calls[0]
+
+
+def test_hr_load_energy_table_day_filter_adds_calendar_predicate():
+    query, calls = fake_query(_make_hr_load_energy_chart_df())
+    m.hr_load_energy_table(query, 1, day="2026-01-01", cap=50)
+    assert "date(timestamp) = '2026-01-01'" in calls[0]
+
+
+def test_daily_table_day_filter_restricts_to_one_day():
+    rows = pd.DataFrame({"summary_date": ["2026-01-01", "2025-12-31"]})
+    query, calls = fake_query(rows)
+    m.daily_table(query, 1, day="2026-01-01")
+    sql = calls[0]
+    assert "summary_date = '2026-01-01'" in sql
+    assert "device_id = 1" in sql
+    # still newest-first, still no cap
+    assert "order by summary_date desc" in sql
+    assert "limit" not in sql
+
+
+def test_daily_table_day_filter_omitted_when_none():
+    query, calls = fake_query(pd.DataFrame({"summary_date": ["2026-01-01"]}))
+    m.daily_table(query, 1)
+    assert "summary_date =" not in calls[0]
+
+
+def test_day_bounds_all_is_day_span():
+    lower, upper = m.day_bounds("2026-01-01", "All")
+    assert lower == pd.Timestamp("2026-01-01 00:00:00")
+    assert upper == pd.Timestamp("2026-01-02 00:00:00")
+
+
+def test_day_bounds_preset_centers_on_day():
+    lower, upper = m.day_bounds("2026-01-01", "12h")
+    assert lower == pd.Timestamp("2026-01-01 06:00:00")
+    assert upper == pd.Timestamp("2026-01-01 18:00:00")
+
+
+def test_day_bounds_preset_spans_full_day_for_24h():
+    # a 24h window centered on noon is exactly the calendar day, midnight to
+    # midnight; the per-day calendar predicate in the builders is what keeps a
+    # *wider* preset inside the chosen day.
+    lower, upper = m.day_bounds("2026-01-01", "24h")
+    assert lower == pd.Timestamp("2026-01-01 00:00:00")
+    assert upper == pd.Timestamp("2026-01-02 00:00:00")
+
+
+def test_day_bounds_wide_preset_crosses_midnight():
+    # a 30d window centered on the day spills into neighbouring days; the
+    # per-day calendar predicate (added by the builders) is what keeps the
+    # result inside the chosen day.
+    lower, upper = m.day_bounds("2026-01-01", "30d")
+    assert lower == pd.Timestamp("2025-12-17 12:00:00")
+    assert upper == pd.Timestamp("2026-01-16 12:00:00")
+
+
+def test_day_bounds_unknown_preset_defaults_to_one_hour():
+    lower, upper = m.day_bounds("2026-01-01", "bogus")
+    assert lower == pd.Timestamp("2026-01-01 11:30:00")
+    assert upper == pd.Timestamp("2026-01-01 12:30:00")
+
+
+def test_day_bounds_none_day_returns_no_bounds():
+    assert m.day_bounds(None, "All") == (None, None)
+
+
+def _FakePicker(value):
+    class _P:
+        def __init__(self, v):
+            self.value = v
+    return _P(value)
+
+
+def test_day_from_picker_uses_picker_value():
+    query, calls = fake_query(pd.DataFrame())
+    got = m._day_from_picker(_FakePicker("2026-01-01"), query, 1, "ppi", "time")
+    assert got == pd.Timestamp("2026-01-01").date()
+    # a concrete value short-circuits: no max(time) lookup is issued
+    assert calls == []
+
+
+def test_day_from_picker_falls_back_to_latest_data_day():
+    # No picker value -> fall back to the device's most-recent data day so a
+    # freshly loaded device still shows its latest day without a click.
+    def q_max(sql: str) -> pd.DataFrame:
+        assert "max(" in sql.lower() and "device_id = 1" in sql
+        return pd.DataFrame({"t": [pd.Timestamp("2026-10-29 20:35:07")]})
+
+    got = m._day_from_picker(_FakePicker(None), q_max, 1, "ppi", "time")
+    assert got == pd.Timestamp("2026-10-29").date()
+
+
+def test_day_from_picker_falls_back_to_today_when_no_data():
+    def q_empty(sql: str) -> pd.DataFrame:
+        return pd.DataFrame({"t": [pd.NaT]})
+
+    got = m._day_from_picker(_FakePicker(None), q_empty, 1, "ppi", "time")
+    assert got == pd.Timestamp.now().date()
+
+
+# --- raw_input_quality / coverage_quality (raw-input coverage & quality) ----
+
+
+def test_raw_input_quality_derives_coverage_and_invalid():
+    # one aggregate row: total seconds, active days, null ppi_clean, fresh rows.
+    row = pd.DataFrame(
+        {
+            "total": [1_055_339],
+            "active_days": [17],
+            "null_clean": [406_795],
+            "pending": [0],
+        }
+    )
+    query, calls = fake_query(row)
+    q = m.raw_input_quality(query, 1)
+    # expected is a full per-second stream over the days the device was active.
+    assert q["expected"] == 17 * m.FULL_DAY_S
+    assert q["coverage_pct"] == pytest.approx(100.0 * 1_055_339 / (17 * 86_400))
+    # no pending -> every null ppi_clean is a processed-but-rejected "invalid".
+    assert q["invalid"] == 406_795
+    assert q["invalid_pct"] == pytest.approx(100.0 * 406_795 / 1_055_339)
+    assert q["valid"] == 1_055_339 - 406_795
+    assert q["pending"] == 0
+    # device predicate, single aggregate scan (no stray order/limit).
+    sql = calls[0].lower()
+    assert "device_id = 1" in sql
+    assert "count(*) as total" in sql
+    assert "count(distinct date(time)) as active_days" in sql
+    assert "order by" not in sql
+    assert "limit" not in sql
+
+
+def test_raw_input_quality_excludes_pending_from_invalid():
+    # fresh (un-scored) seconds must not read as "invalid": they're pending.
+    # 500 null ppi_clean = 300 scored-invalid + 200 still fresh.
+    row = pd.DataFrame(
+        {
+            "total": [1000],
+            "active_days": [1],
+            "null_clean": [500],
+            "pending": [200],
+        }
+    )
+    query, _ = fake_query(row)
+    q = m.raw_input_quality(query, 1)
+    assert q["pending"] == 200
+    assert q["invalid"] == 300  # 500 null - 200 pending
+    assert q["invalid_pct"] == pytest.approx(30.0)  # over total, not scored
+    assert q["valid"] == 500
+
+
+def test_raw_input_quality_empty_device_is_zeroed():
+    # count(*) = 0: SUMs come back NULL, ratios must be 0, no crash.
+    row = pd.DataFrame(
+        {"total": [0], "active_days": [0], "null_clean": [None], "pending": [None]}
+    )
+    query, _ = fake_query(row)
+    q = m.raw_input_quality(query, 1)
+    assert q["total"] == 0
+    assert q["expected"] == 0
+    assert q["coverage_pct"] == 0.0
+    assert q["invalid"] == 0
+    assert q["invalid_pct"] == 0.0
+
+
+def test_coverage_quality_table_two_rows_and_pending_note():
+    q = {
+        "total": 1000,
+        "active_days": 1,
+        "expected": 86_400,
+        "coverage_pct": 100.0 * 1000 / 86_400,
+        "invalid": 300,
+        "valid": 500,
+        "pending": 200,
+        "invalid_pct": 30.0,
+    }
+    df = m.coverage_quality_table(q)
+    assert list(df.columns) == ["measure", "value", "detail"]
+    assert len(df) == 2
+    # pending seconds are surfaced in the invalid detail so the denominator
+    # (all received) vs the invalid count (scored only) stays honest.
+    assert "200 not yet scored" in df.iloc[1]["detail"]
+    assert df.iloc[0]["value"].endswith("%")
+    assert df.iloc[1]["value"].endswith("%")
+
+
+def test_coverage_quality_table_empty_when_no_data():
+    q = {
+        "total": 0,
+        "active_days": 0,
+        "expected": 0,
+        "coverage_pct": 0.0,
+        "invalid": 0,
+        "valid": 0,
+        "pending": 0,
+        "invalid_pct": 0.0,
+    }
+    df = m.coverage_quality_table(q)
+    assert df.empty
+
+
+def test_coverage_quality_md_mentions_both_measures():
+    md = m.coverage_quality_md(
+        {"active_days": 17, "coverage_pct": 71.9, "invalid_pct": 38.5}
+    )
+    assert "coverage" in md.lower()
+    assert "invalid" in md.lower()
+    assert "17 active day(s)" in md
