@@ -5,15 +5,20 @@ app = marimo.App(width="medium")
 
 
 @app.cell
-def sidebar(mo, devices, state):
-    current_id = (state.get_device() or {}).get("id")
+def sidebar(mo, devices, now, window, get_device, set_device):
+    # ``get_device()`` is either ``None`` (nothing selected) or a pandas row
+    # (a Series) from ``devices.iterrows()``. A bare ``or {}`` would call
+    # ``bool()`` on the Series, which pandas forbids ("ambiguous truth value"),
+    # so guard the ``None`` case explicitly.
+    _dv = get_device()
+    current_id = None if _dv is None else _dv.get("id")
     buttons = []
     for _, row in devices.iterrows():
         is_selected = row.get("id") == current_id
         label = f"● {row.get('mac', '?')}" if is_selected else str(row.get("mac", "?"))
         btn = mo.ui.button(
             label=label,
-            on_click=lambda _, dv=row: state.set_device(dv),
+            on_click=lambda _, dv=row: set_device(dv),
             kind="info" if is_selected else "neutral",
         )
         buttons.append(btn)
@@ -21,9 +26,9 @@ def sidebar(mo, devices, state):
     sidebar = mo.sidebar(
         [
             mo.md("### Now"),
-            state.now,
+            now,
             mo.md("### Time window"),
-            state.window,
+            window,
             mo.md("### Devices"),
             mo.vstack(buttons, gap=0.3),
         ],
@@ -69,8 +74,16 @@ def metrics():
 
 @app.cell
 def state(mo, pd):
-    from types import SimpleNamespace
-
+    # The global "now" + "time window" (shared by every tab) and the selected
+    # device's reactive state.
+    #
+    # The device getter/setter are returned as *top-level* globals, not wrapped
+    # in a namespace: marimo's reactive execution (runtime._find_cells_for_state)
+    # re-runs a cell only when one of its top-level refs *is* the State object the
+    # setter registered. Hiding it behind `get_device()` breaks that match,
+    # so a device click updates nothing. `allow_self_loops=True` lets the sidebar
+    # — which both reads the selection and sets it on click — re-render its own
+    # active marker after a click.
     now = mo.ui.datetime(
         value=pd.Timestamp.now().strftime("%Y-%m-%dT%H:%M:%S"),
         precision="second",
@@ -79,21 +92,15 @@ def state(mo, pd):
     window = mo.ui.dropdown(
         ["1h", "6h", "24h", "48h", "7d"], value="24h", label="Time window"
     )
-    get_device, set_device = mo.state(None)
-    state = SimpleNamespace(
-        now=now,
-        window=window,
-        get_device=get_device,
-        set_device=set_device,
-    )
-    return (state,)
+    get_device, set_device = mo.state(None, allow_self_loops=True)
+    return (now, window, get_device, set_device)
 
 
 @app.cell
-def overview_view(state, mo, pd, query, m):
+def overview_view(get_device, mo, pd, query, m):
     from dashboard.metrics import fmt_num, fmt_ts
 
-    dv = state.get_device()
+    dv = get_device()
     if dv is None:
         overview_view = mo.md("## Please select a device")
     else:
@@ -176,17 +183,17 @@ def overview_view(state, mo, pd, query, m):
 
 
 @app.cell
-def ppi_panel(mo, pd, query, state, m):
-    _dv = state.get_device()
+def ppi_panel(mo, pd, query, get_device, now, window, m):
+    _dv = get_device()
     if _dv is None:
         ppi_panel = mo.md("*select a device*")
     else:
         _id = int(_dv["id"])
-        _lower, _upper = m.window_bounds(state.now.value, state.window.value)
+        _lower, _upper = m.window_bounds(now.value, window.value)
         _df = m.cleaned_ppi(query, _id, cutoff=_lower, upper=_upper)
         _caption = mo.md(
             f"**{len(_df):,} rows** · "
-            + m.window_range_md(state.window.value, _lower, _upper)
+            + m.window_range_md(window.value, _lower, _upper)
         )
         _chart = m.ppi_clean_chart(_df)
         _table = mo.ui.table(
@@ -201,13 +208,13 @@ def ppi_panel(mo, pd, query, state, m):
 
 
 @app.cell
-def window_panel(mo, pd, query, state, m):
-    _dv = state.get_device()
+def window_panel(mo, pd, query, get_device, now, window, m):
+    _dv = get_device()
     if _dv is None:
         window_panel = mo.md("*select a device*")
     else:
         _id = int(_dv["id"])
-        _lower, _upper = m.window_bounds(state.now.value, state.window.value)
+        _lower, _upper = m.window_bounds(now.value, window.value)
         _df = m.window_table(query, _id, cutoff=_lower, upper=_upper)
         _last_lfhf = m.last_lfhf_time(query, _id)
         _caption = m.window_ribbon_caption(_df, _lower, _upper, _last_lfhf)
@@ -227,17 +234,17 @@ def window_panel(mo, pd, query, state, m):
 
 
 @app.cell
-def minute_panel(mo, pd, query, state, m):
-    _dv = state.get_device()
+def minute_panel(mo, pd, query, get_device, now, window, m):
+    _dv = get_device()
     if _dv is None:
         minute_panel = mo.md("*select a device*")
     else:
         _id = int(_dv["id"])
-        _lower, _upper = m.window_bounds(state.now.value, state.window.value)
+        _lower, _upper = m.window_bounds(now.value, window.value)
         _df = m.minute_table(query, _id, cutoff=_lower, upper=_upper)
         _caption = mo.md(
             f"**{len(_df):,} rows** · "
-            + m.window_range_md(state.window.value, _lower, _upper)
+            + m.window_range_md(window.value, _lower, _upper)
         )
         _chart = m.minute_hr_chart(_df)
         _table = mo.ui.table(
@@ -252,18 +259,18 @@ def minute_panel(mo, pd, query, state, m):
 
 
 @app.cell
-def daily_panel(mo, pd, query, state, m):
-    _dv = state.get_device()
+def daily_panel(mo, pd, query, get_device, now, window, m):
+    _dv = get_device()
     if _dv is None:
         daily_panel = mo.md("*select a device*")
     else:
         _id = int(_dv["id"])
-        _lower, _upper = m.window_bounds(state.now.value, state.window.value)
+        _lower, _upper = m.window_bounds(now.value, window.value)
         _df = m.daily_table(query, _id, cutoff=_lower, upper=_upper)
         _caption = mo.md(
             f"**{len(_df)} daily summary row(s)** · "
             + m.window_range_md(
-                state.window.value, _lower, _upper, "curated columns, newest first"
+                window.value, _lower, _upper, "curated columns, newest first"
             )
         )
         _chart = m.daily_autonomic_chart(_df)
@@ -279,18 +286,18 @@ def daily_panel(mo, pd, query, state, m):
 
 
 @app.cell
-def rmssd_panel(mo, pd, query, state, m):
-    _dv = state.get_device()
+def rmssd_panel(mo, pd, query, get_device, now, window, m):
+    _dv = get_device()
     if _dv is None:
         rmssd_panel = mo.md("*select a device*")
     else:
         _id = int(_dv["id"])
-        _lower, _upper = m.window_bounds(state.now.value, state.window.value)
+        _lower, _upper = m.window_bounds(now.value, window.value)
         _df = m.rmssd_segment_table(query, _id, cutoff=_lower, upper=_upper)
         _caption = mo.md(
             f"**{len(_df):,} segments** · "
             + m.window_range_md(
-                state.window.value, _lower, _upper, "ln-RMSSD trajectory by trend"
+                window.value, _lower, _upper, "ln-RMSSD trajectory by trend"
             )
         )
         _chart = m.rmssd_segment_chart(_df)
@@ -306,18 +313,18 @@ def rmssd_panel(mo, pd, query, state, m):
 
 
 @app.cell
-def hourly_panel(mo, pd, query, state, m):
-    _dv = state.get_device()
+def hourly_panel(mo, pd, query, get_device, now, window, m):
+    _dv = get_device()
     if _dv is None:
         hourly_panel = mo.md("*select a device*")
     else:
         _id = int(_dv["id"])
-        _lower, _upper = m.window_bounds(state.now.value, state.window.value)
+        _lower, _upper = m.window_bounds(now.value, window.value)
         _df = m.hourly_status_table(query, _id, cutoff=_lower, upper=_upper)
         _caption = mo.md(
             f"**{len(_df):,} hours** · "
             + m.window_range_md(
-                state.window.value,
+                window.value,
                 _lower,
                 _upper,
                 "current vs frozen morning status",
@@ -338,7 +345,7 @@ def hourly_panel(mo, pd, query, state, m):
 @app.cell
 def tables_view(
     mo,
-    state,
+    get_device,
     ppi_panel,
     window_panel,
     minute_panel,
@@ -346,7 +353,7 @@ def tables_view(
     hourly_panel,
     daily_panel,
 ):
-    _dv = state.get_device()
+    _dv = get_device()
     # The banner keeps the active device visible at the top of this tab, where
     # (unlike Overview) no per-panel header otherwise names it.
     _banner = (
@@ -524,20 +531,20 @@ def upload_view(mo, uploader, pd):
 
 
 @app.cell
-def recovery_view(mo, query, state, m):
-    _dv = state.get_device()
+def recovery_view(mo, query, get_device, now, window, m):
+    _dv = get_device()
     if _dv is None:
         recovery_view = mo.md("*select a device*")
     else:
         _id = int(_dv["id"])
-        _lower, _upper = m.window_bounds(state.now.value, state.window.value)
+        _lower, _upper = m.window_bounds(now.value, window.value)
         _cap = 5000
         _df = m.hr_load_energy_table(query, _id, cutoff=_lower, upper=_upper, cap=_cap)
         _capped = f"*capped at {_cap:,} rows — most recent*" if len(_df) >= _cap else ""
         _caption = mo.md(
             f"**{len(_df):,} rows** · "
             + m.window_range_md(
-                state.window.value,
+                window.value,
                 _lower,
                 _upper,
                 "heart rate · intraday load · energy reserve",
@@ -557,7 +564,7 @@ def recovery_view(mo, query, state, m):
 
 
 @app.cell
-def docs_view(mo, state):
+def docs_view(mo, get_device):
     import html
 
     from dashboard import boom_docs
@@ -570,9 +577,9 @@ def docs_view(mo, state):
     # filled with the MAC of the device selected in the sidebar, and falls back
     # to the literal {address} when no device is selected.
     #
-    # state.get_device() is the sidebar's global selection: a pandas row, or
+    # get_device() is the sidebar's global selection: a pandas row, or
     # None when nothing is selected.
-    _dv = state.get_device()
+    _dv = get_device()
     _address = _dv.get("mac") if _dv is not None else None
 
     err = None
