@@ -56,18 +56,13 @@ Because the raw PPI table holds ~1M rows/device (per-second), the query is
 - **Time window** is the *global* control in the left sidebar (shared with the
   Load & Energy tab), not a per-tab one. It resolves to the range
   **`[now − window, now]`**, so every sub-tab reads the same slice.
-- **Max rows** (default `2000`, tops out at `5000`) hard-caps the query with
-  `ORDER BY <time> DESC LIMIT N`. A capped panel notes it. The `5000` ceiling
-  exists because the per-minute charts melt a second series (e.g. raw + 5-min
-  smoothed), so a larger cap could not render in Altair's per-chart row guard
-  anyway; and the window presets stop at `7d`, so no slice can blow past
-  marimo's output-size limit.
-- **Per-table filters** on top: Windows offers state / sleep-only / min valid
-  ratio; Cleaned PPI offers "cleaned only" and "fresh only". RMSSD (night
-  segments) and Hourly (per-hour status) reuse the shared window / Max rows
-  like the per-second tables and carry no per-table filters — RMSSD's time key is
-  the night date, so its window is night-granular. Daily has no
-  controls — it shows every day (at most one row/device/day).
+- Each builder also applies a **fixed internal cap** (`ORDER BY <time> DESC
+  LIMIT N`) — the per-second `Cleaned PPI` table caps at `2000` rows, the
+  per-minute / per-window / per-night / per-hour tables at `5000` — so a `7d`
+  window never reaches the browser and no slice blows past Altair's per-chart
+  row guard. There is no user-facing row-count control and no per-table
+  filters; RMSSD keys its window on the night date (night-granular), and Daily
+  shows every day (at most one row/device/day).
 
 **Self-explaining empty states.** A chart that has nothing to plot does not fail
 silently: the panel shows a caption stating the time window, how many data
