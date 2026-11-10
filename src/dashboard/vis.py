@@ -5,12 +5,8 @@ app = marimo.App(width="medium")
 
 
 @app.cell
-def device_sidebar(mo, sql, devices, pd):
+def device_sidebar(mo, devices, now_picker, window_dd):
     get_device, set_device = mo.state(None)
-    # Global day selector, above the device list: every data tab reads its
-    # window from this one picker. ``value`` is a 'YYYY-MM-DD' string; panels
-    # fall back to the device's own latest day when None.
-    day_picker = mo.ui.date(value=str(pd.Timestamp.now().date()), label="Day")
     current_id = (get_device() or {}).get("id")
     buttons = []
     for _, row in devices.iterrows():
@@ -25,16 +21,22 @@ def device_sidebar(mo, sql, devices, pd):
         )
         buttons.append(btn)
 
+    # The global "now" and "time window" live here, above the device list: they
+    # are shared by every tab (Tables sub-tabs and the Load & Energy figure), so
+    # one picker + one dropdown drive the whole dashboard. A window is the range
+    # [now - window, now]; set "now" back to view a historical device.
     sidebar = mo.sidebar(
         [
-            mo.md("### Date"),
-            day_picker,
+            mo.md("### Now"),
+            now_picker,
+            mo.md("### Time window"),
+            window_dd,
             mo.md("### Devices"),
             mo.vstack(buttons, gap=0.3),
         ],
         width="200px",
     )
-    return get_device, set_device, day_picker, sidebar
+    return get_device, set_device, sidebar
 
 
 @app.cell
@@ -73,10 +75,24 @@ def metrics():
 
 
 @app.cell
-def controls(mo):
-    # Time window shared by the per-second / per-window / per-minute tables.
+def controls(mo, pd):
+    # Global "now": the system clock every panel reads its window from. A full
+    # datetime (date + hour/minute/second) so a window can start at any instant,
+    # not just a calendar day's noon. Default is wall-clock now; a historical
+    # device is viewed by setting "now" back to its range. ``value`` is an
+    # ISO-8601 'YYYY-MM-DDTHH:MM:SS' string (naive local, matching stored times).
+    now_picker = mo.ui.datetime(
+        value=pd.Timestamp.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        precision="second",
+        label="Now",
+    )
+    # Global time window shared by *every* graph and data table — the Tables
+    # sub-tabs and the Load & Energy figure alike. The range is always
+    # [now - window, now] (see metrics.window_bounds). Presets are finite: there
+    # is no "All" — the raw PPI table is ~1M rows/device, so an unbounded window
+    # can never reach the browser and the cap always binds instead.
     window_dd = mo.ui.dropdown(
-        ["1h", "6h", "24h", "7d", "30d", "All"], value="1h", label="Time window"
+        ["1h", "6h", "24h", "48h", "7d", "30d"], value="24h", label="Time window"
     )
     # Hard row cap for every time-series table (server-side LIMIT).
     row_cap = mo.ui.dropdown(
@@ -95,12 +111,8 @@ def controls(mo):
     )
     win_sleep_only = mo.ui.switch(value=False, label="sleep windows only")
     win_min_valid = mo.ui.slider(0.0, 1.0, value=0.0, step=0.05, label="min valid_ratio")
-    # The Load & Energy figure spans two days, so it gets its own window control
-    # defaulting to 48h (window_dd above defaults to 1h and has no 48h option).
-    rec_window = mo.ui.dropdown(
-        ["12h", "24h", "48h", "7d", "30d", "All"], value="48h", label="Time window"
-    )
     return (
+        now_picker,
         window_dd,
         row_cap,
         cleaned_only,
@@ -108,7 +120,6 @@ def controls(mo):
         win_states,
         win_sleep_only,
         win_min_valid,
-        rec_window,
     )
 
 
@@ -207,28 +218,32 @@ def overview_view(get_device, mo, pd, query, m):
 
 
 @app.cell
-def ppi_panel(mo, pd, query, get_device, m, day_picker, window_dd, row_cap, cleaned_only, fresh_only):
+def ppi_panel(mo, pd, query, get_device, m, now_picker, window_dd, row_cap, cleaned_only, fresh_only):
     _dv = get_device()
     if _dv is None:
         ppi_panel = mo.md("*select a device*")
     else:
         _id = int(_dv["id"])
-        _day = m._day_from_picker(day_picker, query, _id, "ppi", "time")
-        _lower, _upper = m.day_bounds(_day, window_dd.value)
+        _lower, _upper = m.window_bounds(now_picker.value, window_dd.value)
         _cap = int(row_cap.value)
         _df = m.cleaned_ppi(
             query,
             _id,
             cutoff=_lower,
+            upper=_upper,
             cap=_cap,
             cleaned_only=bool(cleaned_only.value),
             fresh_only=bool(fresh_only.value),
-            day=_day,
         )
-        _capped = " · *capped — widen window or raise cap to see more*" if len(_df) >= _cap else ""
+        _capped = "*capped — widen window or raise cap to see more*" if len(_df) >= _cap else ""
         _caption = mo.md(
-            f"**{len(_df):,} rows** · day {_day.isoformat()} · window {window_dd.value} · "
-            f"cleaned-only {cleaned_only.value} · fresh-only {fresh_only.value}{_capped}"
+            f"**{len(_df):,} rows** · "
+            + m.window_range_md(
+                window_dd.value, _lower, _upper,
+                f"cleaned-only {cleaned_only.value}",
+                f"fresh-only {fresh_only.value}",
+                _capped,
+            )
         )
         _chart = m.ppi_clean_chart(_df)
         _table = mo.ui.table(
@@ -244,7 +259,7 @@ def ppi_panel(mo, pd, query, get_device, m, day_picker, window_dd, row_cap, clea
 
 @app.cell
 def window_panel(
-    mo, pd, query, get_device, m, day_picker,
+    mo, pd, query, get_device, m, now_picker,
     window_dd, row_cap, win_states, win_sleep_only, win_min_valid,
 ):
     _dv = get_device()
@@ -252,18 +267,17 @@ def window_panel(
         window_panel = mo.md("*select a device*")
     else:
         _id = int(_dv["id"])
-        _day = m._day_from_picker(day_picker, query, _id, "windowmetric", "window_start")
-        _lower, _upper = m.day_bounds(_day, window_dd.value)
+        _lower, _upper = m.window_bounds(now_picker.value, window_dd.value)
         _cap = int(row_cap.value)
         _df = m.window_table(
             query,
             _id,
             cutoff=_lower,
+            upper=_upper,
             cap=_cap,
             states=list(win_states.value or []),
             sleep_only=bool(win_sleep_only.value),
             min_valid=float(win_min_valid.value or 0.0),
-            day=_day,
         )
         _last_lfhf = m.last_lfhf_time(query, _id)
         _caption = m.window_ribbon_caption(_df, _lower, _upper, _last_lfhf)
@@ -285,19 +299,19 @@ def window_panel(
 
 
 @app.cell
-def minute_panel(mo, pd, query, get_device, m, day_picker, window_dd, row_cap):
+def minute_panel(mo, pd, query, get_device, m, now_picker, window_dd, row_cap):
     _dv = get_device()
     if _dv is None:
         minute_panel = mo.md("*select a device*")
     else:
         _id = int(_dv["id"])
-        _day = m._day_from_picker(day_picker, query, _id, "minutemetric", "timestamp")
-        _lower, _upper = m.day_bounds(_day, window_dd.value)
+        _lower, _upper = m.window_bounds(now_picker.value, window_dd.value)
         _cap = int(row_cap.value)
-        _df = m.minute_table(query, _id, cutoff=_lower, cap=_cap, day=_day)
-        _capped = " · *capped — raise cap or widen window to see more*" if len(_df) >= _cap else ""
+        _df = m.minute_table(query, _id, cutoff=_lower, upper=_upper, cap=_cap)
+        _capped = "*capped — raise cap or widen window to see more*" if len(_df) >= _cap else ""
         _caption = mo.md(
-            f"**{len(_df):,} rows** · day {_day.isoformat()} · window {window_dd.value}{_capped}"
+            f"**{len(_df):,} rows** · "
+            + m.window_range_md(window_dd.value, _lower, _upper, _capped)
         )
         _chart = m.minute_hr_chart(_df)
         _table = mo.ui.table(
@@ -312,17 +326,17 @@ def minute_panel(mo, pd, query, get_device, m, day_picker, window_dd, row_cap):
 
 
 @app.cell
-def daily_panel(mo, pd, query, get_device, m, day_picker):
+def daily_panel(mo, pd, query, get_device, m, now_picker, window_dd):
     _dv = get_device()
     if _dv is None:
         daily_panel = mo.md("*select a device*")
     else:
         _id = int(_dv["id"])
-        _day = m._day_from_picker(day_picker, query, _id, "dailysummary", "summary_date")
-        _df = m.daily_table(query, _id, day=_day)
+        _lower, _upper = m.window_bounds(now_picker.value, window_dd.value)
+        _df = m.daily_table(query, _id, cutoff=_lower, upper=_upper)
         _caption = mo.md(
-            f"**{len(_df)} daily summary row(s)** · day {_day.isoformat()} · "
-            "curated columns, newest first"
+            f"**{len(_df)} daily summary row(s)** · "
+            + m.window_range_md(window_dd.value, _lower, _upper, "curated columns, newest first")
         )
         _chart = m.daily_autonomic_chart(_df)
         _table = mo.ui.table(
@@ -337,20 +351,21 @@ def daily_panel(mo, pd, query, get_device, m, day_picker):
 
 
 @app.cell
-def rmssd_panel(mo, pd, query, get_device, m, day_picker, window_dd, row_cap):
+def rmssd_panel(mo, pd, query, get_device, m, now_picker, window_dd, row_cap):
     _dv = get_device()
     if _dv is None:
         rmssd_panel = mo.md("*select a device*")
     else:
         _id = int(_dv["id"])
-        _day = m._day_from_picker(day_picker, query, _id, "rmssdsegment", "night_date")
-        _lower, _upper = m.day_bounds(_day, window_dd.value)
+        _lower, _upper = m.window_bounds(now_picker.value, window_dd.value)
         _cap = int(row_cap.value)
-        _df = m.rmssd_segment_table(query, _id, cutoff=_lower, cap=_cap, day=_day)
-        _capped = " · *capped — raise cap or widen window to see more*" if len(_df) >= _cap else ""
+        _df = m.rmssd_segment_table(query, _id, cutoff=_lower, upper=_upper, cap=_cap)
+        _capped = "*capped — raise cap or widen window to see more*" if len(_df) >= _cap else ""
         _caption = mo.md(
-            f"**{len(_df):,} segments** · night {_day.isoformat()} · window {window_dd.value} · "
-            "ln-RMSSD trajectory by trend" + _capped
+            f"**{len(_df):,} segments** · "
+            + m.window_range_md(
+                window_dd.value, _lower, _upper, "ln-RMSSD trajectory by trend", _capped
+            )
         )
         _chart = m.rmssd_segment_chart(_df)
         _table = mo.ui.table(
@@ -365,20 +380,21 @@ def rmssd_panel(mo, pd, query, get_device, m, day_picker, window_dd, row_cap):
 
 
 @app.cell
-def hourly_panel(mo, pd, query, get_device, m, day_picker, window_dd, row_cap):
+def hourly_panel(mo, pd, query, get_device, m, now_picker, window_dd, row_cap):
     _dv = get_device()
     if _dv is None:
         hourly_panel = mo.md("*select a device*")
     else:
         _id = int(_dv["id"])
-        _day = m._day_from_picker(day_picker, query, _id, "hourlystatus", "hour_start")
-        _lower, _upper = m.day_bounds(_day, window_dd.value)
+        _lower, _upper = m.window_bounds(now_picker.value, window_dd.value)
         _cap = int(row_cap.value)
-        _df = m.hourly_status_table(query, _id, cutoff=_lower, cap=_cap, day=_day)
-        _capped = " · *capped — raise cap or widen window to see more*" if len(_df) >= _cap else ""
+        _df = m.hourly_status_table(query, _id, cutoff=_lower, upper=_upper, cap=_cap)
+        _capped = "*capped — raise cap or widen window to see more*" if len(_df) >= _cap else ""
         _caption = mo.md(
-            f"**{len(_df):,} hours** · day {_day.isoformat()} · window {window_dd.value} · "
-            "current vs frozen morning status" + _capped
+            f"**{len(_df):,} hours** · "
+            + m.window_range_md(
+                window_dd.value, _lower, _upper, "current vs frozen morning status", _capped
+            )
         )
         _chart = m.hourly_status_chart(_df)
         _table = mo.ui.table(
@@ -561,23 +577,23 @@ def upload_view(mo, uploader, pd):
 
 
 @app.cell
-def recovery_view(mo, query, get_device, m, day_picker, rec_window):
+def recovery_view(mo, query, get_device, m, now_picker, window_dd):
     _dv = get_device()
-    # ``rec_window`` (its own 48h-default control, created in ``controls``) is
-    # passed in so its value is read in a cell other than the one that created
-    # it — marimo forbids reading a UIElement's value in its own cell.
     if _dv is None:
         recovery_view = mo.md("*select a device*")
     else:
         _id = int(_dv["id"])
-        _day = m._day_from_picker(day_picker, query, _id, "minutemetric", "timestamp")
-        _lower, _upper = m.day_bounds(_day, rec_window.value)
+        _lower, _upper = m.window_bounds(now_picker.value, window_dd.value)
         _cap = 50000
-        _df = m.hr_load_energy_table(query, _id, cutoff=_lower, cap=_cap, day=_day)
-        _capped = " · *capped — widen window or raise cap to see more*" if len(_df) >= _cap else ""
+        _df = m.hr_load_energy_table(query, _id, cutoff=_lower, upper=_upper, cap=_cap)
+        _capped = "*capped — widen window or raise cap to see more*" if len(_df) >= _cap else ""
         _caption = mo.md(
-            f"**{len(_df):,} rows** · day {_day.isoformat()} · window {rec_window.value} · "
-            "heart rate · intraday load · energy reserve" + _capped
+            f"**{len(_df):,} rows** · "
+            + m.window_range_md(
+                window_dd.value, _lower, _upper,
+                "heart rate · intraday load · energy reserve",
+                _capped,
+            )
         )
         _chart = m.hr_load_energy_chart(_df)
         _table = mo.ui.table(
@@ -587,7 +603,7 @@ def recovery_view(mo, query, get_device, m, day_picker, rec_window):
             show_download=True,
             freeze_columns_left=["timestamp"],
         )
-        recovery_view = mo.vstack([_caption, rec_window, _chart, _table])
+        recovery_view = mo.vstack([_caption, _chart, _table])
     return (recovery_view,)
 
 

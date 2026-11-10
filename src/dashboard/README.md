@@ -3,7 +3,18 @@ Accessed at **`/dashboard/`** when the API runs (`uvicorn newboom.api:app` /
 `newboom.dashboard`, alongside the API and the ingestion worker. It reads
 `data/newboom.db` read-only, so it works both live and from a historical DB.
 
-The left sidebar selects a device. The main area has three tabs.
+The left sidebar sets the **global time range** and selects a device. At the top
+are two controls shared by *every* tab and sub-tab:
+
+- **Now** — a full datetime picker (date + hour/minute/second), defaulting to
+  wall-clock now. It is the anchor every window is measured from.
+- **Time window** — a preset dropdown (`1h` / `6h` / `24h` / `48h` / `7d` /
+  `30d`, no "All"). The window is always **`[now − window, now]`**, resolved
+  once and applied identically by every graph and data table, so the whole
+  dashboard reads one consistent range. Set "Now" back to a past instant to view
+  a historical device.
+
+The main area has tabs (Overview / Tables / Load & Energy / Upload / API Docs).
 
 ## Overview tab
 
@@ -42,14 +53,14 @@ once.
 Because the raw PPI table holds ~1M rows/device (per-second), the query is
 **bounded server-side** so a sub-tab can only fetch a window of data:
 
-- **Time window** (dropdown: `1h` / `6h` / `24h` / `7d` / `All`). For a single
-  device it anchors to that device's *most recent* data time (not wall-clock
-  "now"), so a historical device's `1h` is its own last hour of data.
+- **Time window** is the *global* control in the left sidebar (shared with the
+  Load & Energy tab), not a per-tab one. It resolves to the range
+  **`[now − window, now]`**, so every sub-tab reads the same slice.
 - **Max rows** (default `2000`) hard-caps the query with `ORDER BY <time> DESC
   LIMIT N`. A capped panel notes it.
 - **Per-table filters** on top: Windows offers state / sleep-only / min valid
   ratio; Cleaned PPI offers "cleaned only" and "fresh only". RMSSD (night
-  segments) and Hourly (per-hour status) reuse the shared Time window / Max rows
+  segments) and Hourly (per-hour status) reuse the shared window / Max rows
   like the per-second tables and carry no per-table filters — RMSSD's time key is
   the night date, so its window is night-granular. Daily has no
   controls — it shows every day (at most one row/device/day).
@@ -65,7 +76,7 @@ all"), and the table below shows the (invalid) windows so the reason is visible.
 
 ## Load & Energy tab
 
-The 48h reference view: three stacked panels that **share the time axis with
+The reference view: three stacked panels that **share the time axis with
 independent y-axes** (a single figure, three subplots), matching
 `samples/test_hr_ppi_48h_20261107.png`:
 
@@ -80,11 +91,10 @@ independent y-axes** (a single figure, three subplots), matching
 
 All three series live in `minutemetric`, so one bounded query
 (`dashboard.metrics.hr_load_energy_table`) feeds the whole figure
-(`dashboard.metrics.hr_load_energy_chart`); a paginated table sits below. The
-tab carries its **own** `Time window` dropdown (default `48h` — the reference
-span) because the `window_dd` / `row_cap` shared by the Tables sub-tabs are
-headless (never embedded), so a figure that needs a long window can't rely on
-them. Builders are tested in `tests/test_dashboard_tables.py`.
+(`dashboard.metrics.hr_load_energy_chart`); a paginated table sits below. Like
+the Tables sub-tabs it is driven by the **global** `now` + `time window`
+controls in the left sidebar — the same window every tab shares — so no per-tab
+dropdown is needed. Builders are tested in `tests/test_dashboard_tables.py`.
 
 ## Upload tab
 

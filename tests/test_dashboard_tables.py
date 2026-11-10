@@ -54,7 +54,7 @@ def _ppi_rows(n: int = 5) -> pd.DataFrame:
     )
 
 
-# --- window_cutoff / last_data_time ----------------------------------------
+# --- window_cutoff / window_bounds ----------------------------------------
 
 
 def test_window_cutoff_resolves_presets_relative_to_anchor():
@@ -62,13 +62,18 @@ def test_window_cutoff_resolves_presets_relative_to_anchor():
     assert m.window_cutoff("1h", anchor=anchor) == anchor - pd.Timedelta(hours=1)
     assert m.window_cutoff("6h", anchor=anchor) == anchor - pd.Timedelta(hours=6)
     assert m.window_cutoff("24h", anchor=anchor) == anchor - pd.Timedelta(hours=24)
+    assert m.window_cutoff("48h", anchor=anchor) == anchor - pd.Timedelta(hours=48)
     assert m.window_cutoff("7d", anchor=anchor) == anchor - pd.Timedelta(days=7)
-    assert m.window_cutoff("All", anchor=anchor) is None
+    assert m.window_cutoff("30d", anchor=anchor) == anchor - pd.Timedelta(days=30)
 
 
-def test_window_cutoff_unknown_preset_defaults_to_one_hour():
+def test_window_cutoff_unknown_or_legacy_preset_defaults_to_one_hour():
+    # No "All" preset: a legacy or unknown preset falls back to the 1h lower
+    # bound, so every window is finite (the cap always binds — never a scan of
+    # the ~1M-row PPI table).
     anchor = pd.Timestamp("2026-06-01 12:00:00")
     assert m.window_cutoff("bogus", anchor=anchor) == anchor - pd.Timedelta(hours=1)
+    assert m.window_cutoff("All", anchor=anchor) == anchor - pd.Timedelta(hours=1)
 
 
 def test_window_cutoff_no_anchor_falls_back_to_now():
@@ -79,31 +84,32 @@ def test_window_cutoff_no_anchor_falls_back_to_now():
     assert abs((now - cutoff).total_seconds() - 3600.0) < 5.0
 
 
-def test_last_data_time_returns_max_or_none():
-    # max(time) over one device's layer, used to anchor a window to the data
-    def q_max(sql: str) -> pd.DataFrame:
-        assert "max(" in sql.lower() and "device_id = 1" in sql
-        return pd.DataFrame({"t": [pd.Timestamp("2026-10-29 20:35:07")]})
-
-    t = m.last_data_time(q_max, 1, "ppi", "time")
-    assert t == pd.Timestamp("2026-10-29 20:35:07")
-
-    # empty layer -> None (window then falls back to "now")
-    def q_empty(sql: str) -> pd.DataFrame:
-        return pd.DataFrame({"t": [pd.NaT]})
-
-    assert m.last_data_time(q_empty, 1, "ppi", "time") is None
+def test_window_bounds_is_now_minus_preset_to_now():
+    # start = now - preset, end = now: the window every table and chart shares.
+    now = pd.Timestamp("2026-11-08 20:35:07")
+    lower, upper = m.window_bounds(now, "1h")
+    assert lower == now - pd.Timedelta(hours=1)
+    assert upper == now
 
 
-def test_window_anchored_to_last_data_time_populates_historical_device():
-    # The regression: a device whose last sample is days old must still show its
-    # most recent hour under the "1h" default, not an empty future window.
-    last = pd.Timestamp("2026-10-29 20:35:07")
-    anchor = last  # as last_data_time would return it
-    cutoff = m.window_cutoff("1h", anchor=anchor)
-    assert cutoff == last - pd.Timedelta(hours=1)
-    # "All" is unaffected (no lower bound)
-    assert m.window_cutoff("All", anchor=anchor) is None
+def test_window_bounds_every_preset_is_finite_and_upper_is_now():
+    # No "All": every preset yields a finite lower bound < upper == now, so the
+    # builder cap always binds instead of an unbounded scan.
+    now = pd.Timestamp("2026-11-08 20:35:07")
+    for preset in ["1h", "6h", "24h", "48h", "7d", "30d"]:
+        lower, upper = m.window_bounds(now, preset)
+        assert lower < upper
+        assert upper == now
+
+
+def test_window_bounds_accepts_iso_string_and_none_falls_back_to_now():
+    # The picker's value is an ISO-8601 string; a cleared picker (None) falls
+    # back to wall-clock now while still upper-bounding at "now".
+    lower, upper = m.window_bounds("2026-11-08T20:00:00", "24h")
+    assert lower == pd.Timestamp("2026-11-07 20:00:00")
+    assert upper == pd.Timestamp("2026-11-08 20:00:00")
+    lower2, upper2 = m.window_bounds(None, "1h")
+    assert upper2 - lower2 == pd.Timedelta(hours=1)
 
 
 # --- cleaned_ppi ------------------------------------------------------------
@@ -309,22 +315,23 @@ def test_rmssd_segment_table_no_clause_no_stray_and():
         "order by night_date desc, segment_id asc limit 50" in sql
     )
     assert "night_date >=" not in sql
-    assert "night_date =" not in sql
+    assert "night_date <=" not in sql
 
 
-def test_rmssd_segment_table_day_filter_adds_calendar_predicate():
+def test_rmssd_segment_table_upper_bound_adds_date_predicate():
+    # night_date is a DATE, so the upper bound is truncated to a calendar day.
     query, calls = fake_query(pd.DataFrame())
-    m.rmssd_segment_table(query, 1, day="2026-01-01", cap=100)
+    m.rmssd_segment_table(query, 1, upper=pd.Timestamp("2026-01-01 12:00:00"), cap=100)
     sql = calls[0]
-    assert "night_date = '2026-01-01'" in sql
+    assert "night_date <= '2026-01-01'" in sql
 
 
-def test_rmssd_segment_table_day_filter_omitted_when_none():
+def test_rmssd_segment_table_lower_bound_adds_date_predicate():
+    # a wider window preset shows more recent nights: night_date >= <cutoff day>.
     query, calls = fake_query(pd.DataFrame())
-    m.rmssd_segment_table(query, 1, cap=100)
+    m.rmssd_segment_table(query, 1, cutoff=pd.Timestamp("2025-12-31 12:00:00"), cap=100)
     sql = calls[0]
-    assert "night_date =" not in sql
-    assert "night_date >=" not in sql
+    assert "night_date >= '2025-12-31'" in sql
 
 
 # --- hourly_status_table ----------------------------------------------------
@@ -370,21 +377,23 @@ def test_hourly_status_table_no_clause_no_stray_and_default_cap():
     # the no-filter case: only the device predicate, no trailing "and", big cap
     assert "from hourlystatus where device_id = 1 order by hour_start desc limit 5000" in sql
     assert "hour_start >" not in sql
+    assert "hour_start <=" not in sql
     assert "date(hour_start)" not in sql
 
 
-def test_hourly_status_table_day_filter_adds_calendar_predicate():
+def test_hourly_status_table_upper_bound_adds_timestamp_predicate():
     query, calls = fake_query(pd.DataFrame())
-    m.hourly_status_table(query, 1, day="2026-01-01", cap=100)
+    m.hourly_status_table(query, 1, upper=pd.Timestamp("2026-01-01 12:00:00"), cap=100)
     sql = calls[0]
-    assert "date(hour_start) = '2026-01-01'" in sql
+    # a true datetime time column, so the upper bound is a fixed-width timestamp
+    assert "hour_start <= '2026-01-01 12:00:00.000000'" in sql
 
 
-def test_hourly_status_table_day_filter_omitted_when_none():
+def test_hourly_status_table_lower_bound_adds_timestamp_predicate():
     query, calls = fake_query(pd.DataFrame())
-    m.hourly_status_table(query, 1, cap=100)
+    m.hourly_status_table(query, 1, cutoff=pd.Timestamp("2025-12-31 00:00:00"), cap=100)
     sql = calls[0]
-    assert "date(hour_start)" not in sql
+    assert "hour_start > '2025-12-31 00:00:00.000000'" in sql
 
 
 # --- hr_load_energy_table / hr_load_energy_chart ---------------------------
@@ -742,25 +751,32 @@ def test_window_ribbon_caption_with_data_has_no_explanation():
     assert "no LF/HF in this window" not in cap
 
 
-# --- global day filter ------------------------------------------------------
+# --- window bounds in the builders ---------------------------------------
+# Every time-series builder is bounded by the shared window [cutoff, upper]
+# (start = now - preset, end = now; see window_bounds). The datetime columns
+# get a fixed-width timestamp bound; the DATE columns get a day-truncated
+# bound. There is no single-calendar-day filter anymore: the window itself is
+# the scope, applied identically by every table and chart.
 
 
-def test_cleaned_ppi_day_filter_adds_calendar_predicate():
+def test_cleaned_ppi_upper_bound_adds_timestamp_predicate():
     query, calls = fake_query(_ppi_rows())
-    m.cleaned_ppi(query, 1, day="2026-01-01")
+    m.cleaned_ppi(query, 1, upper=pd.Timestamp("2026-01-01 12:00:00"))
     sql = calls[0]
-    assert "date(time) = '2026-01-01'" in sql
+    assert "time <= '2026-01-01 12:00:00.000000'" in sql
     assert "device_id = 1" in sql
-
-
-def test_cleaned_ppi_day_filter_omitted_when_none():
-    query, calls = fake_query(_ppi_rows())
-    m.cleaned_ppi(query, 1)
-    sql = calls[0]
+    # no legacy single-calendar-day filter
     assert "date(time)" not in sql
 
 
-def test_window_table_day_filter_adds_calendar_predicate():
+def test_cleaned_ppi_no_bound_when_upper_none():
+    query, calls = fake_query(_ppi_rows())
+    m.cleaned_ppi(query, 1)
+    sql = calls[0]
+    assert "time >" not in sql and "time <=" not in sql
+
+
+def test_window_table_upper_bound_adds_timestamp_predicate():
     rows = pd.DataFrame(
         {
             "night_date": ["2026-01-01"] * 3,
@@ -777,13 +793,14 @@ def test_window_table_day_filter_adds_calendar_predicate():
         }
     )
     query, calls = fake_query(rows)
-    m.window_table(query, 1, day="2026-01-01", cap=50)
+    m.window_table(query, 1, upper=pd.Timestamp("2026-01-01 12:00:00"), cap=50)
     sql = calls[0]
-    assert "date(window_start) = '2026-01-01'" in sql
+    assert "window_start <= '2026-01-01 12:00:00.000000'" in sql
     assert "valid_ratio >= 0.000000" in sql
+    assert "date(window_start)" not in sql
 
 
-def test_minute_table_day_filter_adds_calendar_predicate():
+def test_minute_table_upper_bound_adds_timestamp_predicate():
     rows = pd.DataFrame(
         {
             "timestamp": [f"2026-01-01 0{i}:00" for i in range(3)],
@@ -798,112 +815,44 @@ def test_minute_table_day_filter_adds_calendar_predicate():
         }
     )
     query, calls = fake_query(rows)
-    m.minute_table(query, 1, day="2026-01-01", cap=50)
-    assert "date(timestamp) = '2026-01-01'" in calls[0]
+    m.minute_table(query, 1, upper=pd.Timestamp("2026-01-01 12:00:00"), cap=50)
+    sql = calls[0]
+    assert "timestamp <= '2026-01-01 12:00:00.000000'" in sql
+    assert "date(timestamp)" not in sql
 
 
-def test_minute_table_day_filter_omitted_when_none():
-    query, calls = fake_query(pd.DataFrame())
-    m.minute_table(query, 1, cap=10)
-    assert "date(timestamp)" not in calls[0]
-
-
-def test_hr_load_energy_table_day_filter_adds_calendar_predicate():
+def test_hr_load_energy_table_upper_bound_adds_timestamp_predicate():
     query, calls = fake_query(_make_hr_load_energy_chart_df())
-    m.hr_load_energy_table(query, 1, day="2026-01-01", cap=50)
-    assert "date(timestamp) = '2026-01-01'" in calls[0]
+    m.hr_load_energy_table(query, 1, upper=pd.Timestamp("2026-01-01 12:00:00"), cap=50)
+    sql = calls[0]
+    assert "timestamp <= '2026-01-01 12:00:00.000000'" in sql
+    assert "date(timestamp)" not in sql
 
 
-def test_daily_table_day_filter_restricts_to_one_day():
+def test_daily_table_window_bounds_at_day_granularity():
+    # summary_date is a DATE: the window bounds truncate to calendar days
+    # (>= date(cutoff), <= date(upper)); one row/day, so no cap.
     rows = pd.DataFrame({"summary_date": ["2026-01-01", "2025-12-31"]})
     query, calls = fake_query(rows)
-    m.daily_table(query, 1, day="2026-01-01")
+    m.daily_table(
+        query, 1,
+        cutoff=pd.Timestamp("2025-12-31 00:00:00"),
+        upper=pd.Timestamp("2026-01-01 23:00:00"),
+    )
     sql = calls[0]
-    assert "summary_date = '2026-01-01'" in sql
+    assert "summary_date >= '2025-12-31'" in sql
+    assert "summary_date <= '2026-01-01'" in sql
     assert "device_id = 1" in sql
-    # still newest-first, still no cap
     assert "order by summary_date desc" in sql
     assert "limit" not in sql
+    assert "date(summary_date)" not in sql
 
 
-def test_daily_table_day_filter_omitted_when_none():
+def test_daily_table_no_bounds_when_window_none():
     query, calls = fake_query(pd.DataFrame({"summary_date": ["2026-01-01"]}))
     m.daily_table(query, 1)
-    assert "summary_date =" not in calls[0]
-
-
-def test_day_bounds_all_is_day_span():
-    lower, upper = m.day_bounds("2026-01-01", "All")
-    assert lower == pd.Timestamp("2026-01-01 00:00:00")
-    assert upper == pd.Timestamp("2026-01-02 00:00:00")
-
-
-def test_day_bounds_preset_centers_on_day():
-    lower, upper = m.day_bounds("2026-01-01", "12h")
-    assert lower == pd.Timestamp("2026-01-01 06:00:00")
-    assert upper == pd.Timestamp("2026-01-01 18:00:00")
-
-
-def test_day_bounds_preset_spans_full_day_for_24h():
-    # a 24h window centered on noon is exactly the calendar day, midnight to
-    # midnight; the per-day calendar predicate in the builders is what keeps a
-    # *wider* preset inside the chosen day.
-    lower, upper = m.day_bounds("2026-01-01", "24h")
-    assert lower == pd.Timestamp("2026-01-01 00:00:00")
-    assert upper == pd.Timestamp("2026-01-02 00:00:00")
-
-
-def test_day_bounds_wide_preset_crosses_midnight():
-    # a 30d window centered on the day spills into neighbouring days; the
-    # per-day calendar predicate (added by the builders) is what keeps the
-    # result inside the chosen day.
-    lower, upper = m.day_bounds("2026-01-01", "30d")
-    assert lower == pd.Timestamp("2025-12-17 12:00:00")
-    assert upper == pd.Timestamp("2026-01-16 12:00:00")
-
-
-def test_day_bounds_unknown_preset_defaults_to_one_hour():
-    lower, upper = m.day_bounds("2026-01-01", "bogus")
-    assert lower == pd.Timestamp("2026-01-01 11:30:00")
-    assert upper == pd.Timestamp("2026-01-01 12:30:00")
-
-
-def test_day_bounds_none_day_returns_no_bounds():
-    assert m.day_bounds(None, "All") == (None, None)
-
-
-def _FakePicker(value):
-    class _P:
-        def __init__(self, v):
-            self.value = v
-    return _P(value)
-
-
-def test_day_from_picker_uses_picker_value():
-    query, calls = fake_query(pd.DataFrame())
-    got = m._day_from_picker(_FakePicker("2026-01-01"), query, 1, "ppi", "time")
-    assert got == pd.Timestamp("2026-01-01").date()
-    # a concrete value short-circuits: no max(time) lookup is issued
-    assert calls == []
-
-
-def test_day_from_picker_falls_back_to_latest_data_day():
-    # No picker value -> fall back to the device's most-recent data day so a
-    # freshly loaded device still shows its latest day without a click.
-    def q_max(sql: str) -> pd.DataFrame:
-        assert "max(" in sql.lower() and "device_id = 1" in sql
-        return pd.DataFrame({"t": [pd.Timestamp("2026-10-29 20:35:07")]})
-
-    got = m._day_from_picker(_FakePicker(None), q_max, 1, "ppi", "time")
-    assert got == pd.Timestamp("2026-10-29").date()
-
-
-def test_day_from_picker_falls_back_to_today_when_no_data():
-    def q_empty(sql: str) -> pd.DataFrame:
-        return pd.DataFrame({"t": [pd.NaT]})
-
-    got = m._day_from_picker(_FakePicker(None), q_empty, 1, "ppi", "time")
-    assert got == pd.Timestamp.now().date()
+    sql = calls[0]
+    assert "summary_date >=" not in sql and "summary_date <=" not in sql
 
 
 # --- raw_input_quality / coverage_quality (raw-input coverage & quality) ----

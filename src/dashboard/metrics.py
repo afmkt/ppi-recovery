@@ -641,61 +641,59 @@ def coverage_chart(daily: pd.DataFrame, full_day_s: float = FULL_DAY_S) -> alt.C
 #
 # The per-second PPI table is a million rows; per-minute/per-window tables are
 # ~20k. None of them can be shipped to the browser whole, so every builder is
-# bounded server-side: a time-window ``cutoff`` plus a hard ``cap`` (a
-# ``LIMIT``). The bounded slice is then handed to a marimo table for client-side
-# paging/search. All four time columns are indexed, so the bounding query is
-# fast. Each builder takes the same ``query`` callable (``SQL -> DataFrame``)
-# as the rest of the module, so it is testable against any engine.
+# bounded server-side by the shared window ``[cutoff, upper]`` (a lower bound
+# plus a hard ``cap`` = a ``LIMIT``). The window is ``[now - preset, now]`` —
+# the global "now" datetime picker minus the global "time window" preset,
+# resolved once by ``window_bounds`` and applied identically by every table and
+# chart, so the whole dashboard reads one consistent range. The bounded slice is
+# then handed to a marimo table for client-side paging/search. All the time
+# columns are indexed, so the bounding query is fast. Each builder takes the same
+# ``query`` callable (``SQL -> DataFrame``) as the rest of the module, so it is
+# testable against any engine.
 # ===========================================================================
 
-# Per-second window presets for the time-series tables. ``None`` = no lower
-# bound ("All"). Values are in seconds.
+# Time-window presets for every time-series table and chart. Values are in
+# seconds; each is a *finite* span. There is deliberately no "All" — the raw PPI
+# table is ~1M rows/device, so an unbounded window can never reach the browser;
+# the ``cap`` (``LIMIT``) always binds, and "All" would be both useless and
+# unbounded.
 _WINDOW_PRESETS = {
-    "12h": 12 * 3600.0,
     "1h": 3600.0,
     "6h": 6 * 3600.0,
     "24h": 24 * 3600.0,
     "48h": 48 * 3600.0,
     "7d": 7 * 86400.0,
     "30d": 30 * 86400.0,
-    "All": None,
 }
 
 
 def window_cutoff(preset, anchor=None):
-    """Resolve a window preset to a lower bound relative to ``anchor``, or
-    None for "All".
+    """Resolve a window preset to a lower bound relative to ``anchor``.
 
-    ``anchor`` is the device's most recent data time (see ``last_data_time``).
-    Anchoring to the data rather than wall-clock "now" keeps a preset like
-    "1h" meaningful for a device whose latest sample is days old: it means the
-    last hour of *data the device has*, so a historical device shows its most
-    recent hour instead of an empty future window. A caller that omits
-    ``anchor`` falls back to naive-local "now" (a live device).
+    ``anchor`` is the global "now" (the datetime picker's value, or wall-clock
+    "now" when omitted). A preset like "1h" is the last hour *before* that "now",
+    so the window is the half-open range ``[now - preset, now]`` — the same
+    window every table and chart shares. An unknown preset falls back to 1h.
     """
     delta_s = _WINDOW_PRESETS.get(preset, 3600.0)
-    if delta_s is None:
-        return None
     if anchor is None:
         anchor = pd.Timestamp.now()
     return pd.Timestamp(anchor) - pd.Timedelta(seconds=float(delta_s))
 
 
-def last_data_time(query, device_id, table, time_col):
-    """Most recent data time for a device's layer, or None when it has none.
+def window_bounds(now, preset="24h"):
+    """Resolve the global "now" + "time window" to a ``(lower, upper)`` range.
 
-    Used to anchor a time window to the device's own data (rather than
-    wall-clock "now") so a historical device's "1h" window is its last hour of
-    data, not an empty future window. ``table``/``time_col`` are internal, not
-    user input, so they are interpolated directly.
+    ``start = now - preset``, ``end = now`` — the window every table and chart
+    is bounded by (see the module docstring / ``vis.py``). ``now`` is the
+    global datetime picker's value (a ``Timestamp``/``datetime``/
+    ``'YYYY-MM-DDTHH:MM:SS'`` string, or ``None`` for the wall-clock fallback);
+    ``preset`` is a ``_WINDOW_PRESETS`` key. The upper bound is always ``now`` so
+    the window never leaks into the future; the lower bound is always finite
+    (no "All"), so the builder ``cap`` always binds.
     """
-    row = query(f"select max({time_col}) as t from {table} where device_id = {int(device_id)}")
-    if row.empty:
-        return None
-    ts = pd.to_datetime(row.iloc[0]["t"], errors="coerce")
-    if pd.isna(ts):
-        return None
-    return ts
+    now_ts = pd.Timestamp(now) if now is not None else pd.Timestamp.now()
+    return window_cutoff(preset, anchor=now_ts), now_ts
 
 
 def last_lfhf_time(query, device_id):
@@ -734,39 +732,15 @@ def _day_literal(day) -> str:
     return pd.Timestamp(day).strftime("%Y-%m-%d")
 
 
-def day_bounds(day, preset="All"):
-    """Resolve the global day picker to a ``(lower_bound, upper_bound)``.
-
-    ``day`` is a ``date``/``Timestamp``/``'YYYY-MM-DD'``. The window preset
-    (see ``_WINDOW_PRESETS``) is centered on the middle of that day (noon), so
-    a preset like ``12h`` covers the day's middle 12 hours. ``All`` spans the
-    whole calendar day (midnight to midnight). A preset wider than a day is fine
-    — the per-day ``date(<col>)`` filter in the builders keeps the result inside
-    the chosen day. ``None`` means no bound on that side.
+def window_range_md(preset, lower, upper, *extras) -> str:
+    """A one-line caption for a bounded panel: the window label plus the
+    resolved ``[now - preset, now]`` range, then any bare extra tokens joined
+    with `` · `` (blank ones skipped). ``fmt_ts`` (``YYYY-MM-DD HH:MM``) keeps
+    the line compact; exact seconds are irrelevant to a panel header.
     """
-    if day is None:
-        return None, None
-    day_ts = pd.Timestamp(day).normalize()
-    preset = _WINDOW_PRESETS.get(preset, 3600.0)
-    if preset is None:
-        return day_ts, day_ts + pd.Timedelta(days=1)
-    half = preset / 2.0
-    noon = day_ts + pd.Timedelta(hours=12)
-    return noon - pd.Timedelta(seconds=half), noon + pd.Timedelta(seconds=half)
-
-
-def _day_from_picker(day_picker, query, device_id, table, time_col):
-    """Coerce the global day picker to a ``date`` for the builders.
-
-    The picker's ``value`` is a ``'YYYY-MM-DD'`` string (or ``None`` before a
-    pick); when it is missing we fall back to the device's own most-recent data
-    day, so a freshly loaded device still shows its latest day without a click.
-    """
-    val = getattr(day_picker, "value", None)
-    if val:
-        return pd.Timestamp(val).date()
-    last = last_data_time(query, device_id, table, time_col)
-    return pd.Timestamp.now().date() if last is None else last.date()
+    parts = [f"window **{preset}** · {fmt_ts(lower)} → {fmt_ts(upper)}"]
+    parts += [e for e in extras if e]
+    return " · ".join(parts)
 
 
 def _where_device(device_id, *clauses: str) -> str:
@@ -774,20 +748,20 @@ def _where_device(device_id, *clauses: str) -> str:
     return base + (" and " + " and ".join(clauses) if clauses else "")
 
 
-def cleaned_ppi(query, device_id, cutoff=None, cap=2000,
-                cleaned_only=False, fresh_only=False, day=None) -> pd.DataFrame:
+def cleaned_ppi(query, device_id, cutoff=None, upper=None, cap=2000,
+                cleaned_only=False, fresh_only=False) -> pd.DataFrame:
     """Most-recent per-second PPI rows for a device, newest first, capped.
 
     ``spo2`` is stored raw×10 (0 = "not reported this second"); a ``spo2_pct``
-    column (÷10, blank when 0) is appended for display. Rows are bounded by
-    ``cutoff`` and ``cap`` so the browser never receives the full per-second
-    table. When ``day`` is given, rows are restricted to that calendar day.
+    column (÷10, blank when 0) is appended for display. Rows are bounded by the
+    window ``(cutoff, upper]`` (``time > cutoff`` and ``time <= upper``) and by
+    ``cap`` so the browser never receives the full per-second table.
     """
     clauses: list[str] = []
     if cutoff is not None:
         clauses.append("time > " + _cutoff_literal(cutoff))
-    if day is not None:
-        clauses.append("date(time) = '" + _day_literal(day) + "'")
+    if upper is not None:
+        clauses.append("time <= " + _cutoff_literal(upper))
     if cleaned_only:
         clauses.append("ppi_clean IS NOT NULL")
     if fresh_only:
@@ -806,20 +780,20 @@ def cleaned_ppi(query, device_id, cutoff=None, cap=2000,
     return df[["time", "hr", "spo2_pct", "ppi", "ppi_clean", "activity", "fresh"]]
 
 
-def window_table(query, device_id, cutoff=None, cap=5000,
-                 states=None, sleep_only=False, min_valid=0.0, day=None) -> pd.DataFrame:
+def window_table(query, device_id, cutoff=None, upper=None, cap=5000,
+                 states=None, sleep_only=False, min_valid=0.0) -> pd.DataFrame:
     """Most-recent windowmetrics for a device, newest first, capped and
     optionally filtered by state / sleep / minimum ``valid_ratio``.
 
     ``states`` matches case-insensitively (the DB stores the enum name, whose
-    case is not relied on). When ``day`` is given, windows are restricted to
-    that calendar day.
+    case is not relied on). Rows are bounded by the window
+    ``(cutoff, upper]`` on ``window_start``.
     """
     clauses: list[str] = []
     if cutoff is not None:
         clauses.append("window_start > " + _cutoff_literal(cutoff))
-    if day is not None:
-        clauses.append("date(window_start) = '" + _day_literal(day) + "'")
+    if upper is not None:
+        clauses.append("window_start <= " + _cutoff_literal(upper))
     if states:
         ph = ", ".join(f"'{str(s)}'" for s in states)
         clauses.append(f"lower(state) in ({ph})")
@@ -835,16 +809,16 @@ def window_table(query, device_id, cutoff=None, cap=5000,
     return query(sql)
 
 
-def minute_table(query, device_id, cutoff=None, cap=5000, day=None) -> pd.DataFrame:
+def minute_table(query, device_id, cutoff=None, upper=None, cap=5000) -> pd.DataFrame:
     """Most-recent minutemetrics for a device, newest first, capped.
 
-    When ``day`` is given, minutes are restricted to that calendar day.
+    Rows are bounded by the window ``(cutoff, upper]`` on ``timestamp``.
     """
     clauses: list[str] = []
     if cutoff is not None:
         clauses.append("timestamp > " + _cutoff_literal(cutoff))
-    if day is not None:
-        clauses.append("date(timestamp) = '" + _day_literal(day) + "'")
+    if upper is not None:
+        clauses.append("timestamp <= " + _cutoff_literal(upper))
     sql = (
         "select timestamp, night_date, heart_rate, s1_load, tss_load, "
         "total_load, heart_rate_zone, steps, calories "
@@ -854,23 +828,23 @@ def minute_table(query, device_id, cutoff=None, cap=5000, day=None) -> pd.DataFr
     return query(sql)
 
 
-def hr_load_energy_table(query, device_id, cutoff=None, cap=50000, day=None) -> pd.DataFrame:
+def hr_load_energy_table(query, device_id, cutoff=None, upper=None, cap=50000) -> pd.DataFrame:
     """Most-recent per-minute heart rate, cumulative intraday load, and energy
     reserve for a device, newest first, capped.
 
-    Backs the 48h reference figure (心率 / 日内累计负荷 / 储能):
+    Backs the reference figure (心率 / 日内累计负荷 / 储能):
     ``heart_rate`` is the per-minute mean, ``total_load`` is the cumulative
     intraday load (S1 + tss, reset each night session), and ``total_energy`` is
     the 0-100 body-energy reserve. All three live in ``minutemetric``, so one
     bounded query feeds the whole figure. Per-minute data is small, so the cap
-    is generous (``50000`` ≈ 34 days). When ``day`` is given, minutes are
-    restricted to that calendar day.
+    is generous (``50000`` ≈ 34 days); rows are bounded by the window
+    ``(cutoff, upper]`` on ``timestamp``.
     """
     clauses: list[str] = []
     if cutoff is not None:
         clauses.append("timestamp > " + _cutoff_literal(cutoff))
-    if day is not None:
-        clauses.append("date(timestamp) = '" + _day_literal(day) + "'")
+    if upper is not None:
+        clauses.append("timestamp <= " + _cutoff_literal(upper))
     sql = (
         "select timestamp, night_date, heart_rate, total_load, total_energy "
         "from minutemetric where " + _where_device(device_id, *clauses)
@@ -879,14 +853,20 @@ def hr_load_energy_table(query, device_id, cutoff=None, cap=50000, day=None) -> 
     return query(sql)
 
 
-def daily_table(query, device_id, day=None) -> pd.DataFrame:
+def daily_table(query, device_id, cutoff=None, upper=None) -> pd.DataFrame:
     """Daily-summary rows for a device, newest first (one per day).
 
     A curated column subset — scores, HRV baselines/vals, energy, autonomic
-    balance and the coaching text — rather than all 48 columns. When ``day`` is
-    given, only that calendar day's summary is returned.
+    balance and the coaching text — rather than all 48 columns. When the window
+    is given, the range is bounded at *day* granularity on ``summary_date``
+    (``>= date(cutoff)`` and ``<= date(upper)``); one row/day keeps it tiny, so
+    no ``LIMIT`` is needed.
     """
-    clauses = ["summary_date = '" + _day_literal(day) + "'"] if day is not None else []
+    clauses: list[str] = []
+    if cutoff is not None:
+        clauses.append("summary_date >= '" + _day_literal(cutoff) + "'")
+    if upper is not None:
+        clauses.append("summary_date <= '" + _day_literal(upper) + "'")
     return query(
         "select summary_date, status_score, base_score, sleep_score, "
         "rest_heart_rate_val, hrv_night_val, hrv_morning_val, "
@@ -900,24 +880,22 @@ def daily_table(query, device_id, day=None) -> pd.DataFrame:
     )
 
 
-def rmssd_segment_table(query, device_id, cutoff=None, cap=5000,
-                        day=None) -> pd.DataFrame:
+def rmssd_segment_table(query, device_id, cutoff=None, upper=None, cap=5000) -> pd.DataFrame:
     """Most-recent RMSSD macro-segments for a device, newest night first,
     segments in ascending order — the timing, window count, trend classification
     and the ln-RMSSD linear-fit / fit-quality metrics (not the primary key).
 
     ``rmssdsegment`` has no absolute per-event timestamp: its only time key is
     ``night_date`` (a ``DATE``). So, unlike the per-second / per-window /
-    per-minute builders, the time-window ``cutoff`` is applied at *day*
-    granularity (``night_date >= <cutoff day>``) — a wider ``window_dd`` preset
-    shows more recent nights — and when ``day`` is given that single night is the
-    binding scope (the day filter dominates the day-truncated cutoff).
+    per-minute builders, the window is applied at *day* granularity
+    (``night_date >= date(cutoff)`` and ``<= date(upper)``) — a wider window
+    preset shows more recent nights.
     """
     clauses: list[str] = []
     if cutoff is not None:
         clauses.append("night_date >= '" + _day_literal(cutoff) + "'")
-    if day is not None:
-        clauses.append("night_date = '" + _day_literal(day) + "'")
+    if upper is not None:
+        clauses.append("night_date <= '" + _day_literal(upper) + "'")
     sql = (
         "select night_date, segment_id, start_h, end_h, duration_min, "
         "window_count, trend_type, lnrmssd_start, lnrmssd_end, "
@@ -929,21 +907,20 @@ def rmssd_segment_table(query, device_id, cutoff=None, cap=5000,
     return query(sql)
 
 
-def hourly_status_table(query, device_id, cutoff=None, cap=5000,
-                        day=None) -> pd.DataFrame:
+def hourly_status_table(query, device_id, cutoff=None, upper=None, cap=5000) -> pd.DataFrame:
     """Most-recent hourly dynamic-status snapshots for a device, newest hour
     first, capped — the frozen morning restart (``morning_status``), the
     post-adjustment ``current_status``, the four time-in-zone hour counts
     (``t1``–``t4``), the 5-minute HR and the two classification flags.
 
-    Mirrors ``minute_table`` (a true datetime time column), so the time-window
-    ``cutoff`` and the ``day`` filter apply directly on ``hour_start``.
+    Mirrors ``minute_table`` (a true datetime time column), so the window
+    bounds apply directly on ``hour_start`` (``> cutoff`` and ``<= upper``).
     """
     clauses: list[str] = []
     if cutoff is not None:
         clauses.append("hour_start > " + _cutoff_literal(cutoff))
-    if day is not None:
-        clauses.append("date(hour_start) = '" + _day_literal(day) + "'")
+    if upper is not None:
+        clauses.append("hour_start <= " + _cutoff_literal(upper))
     sql = (
         "select hour_start, morning_status, current_status, t1, t2, t3, t4, "
         "hr_5min_avg, is_sleep_or_exercise, is_temporary "
