@@ -8,11 +8,11 @@ are two controls shared by *every* tab and sub-tab:
 
 - **Now** — a full datetime picker (date + hour/minute/second), defaulting to
   wall-clock now. It is the anchor every window is measured from.
-- **Time window** — a preset dropdown (`1h` / `6h` / `24h` / `48h` / `7d` /
-  `30d`, no "All"). The window is always **`[now − window, now]`**, resolved
-  once and applied identically by every graph and data table, so the whole
-  dashboard reads one consistent range. Set "Now" back to a past instant to view
-  a historical device.
+- **Time window** — a preset dropdown (`1h` / `6h` / `24h` / `48h` / `7d`, no
+  "All"; the presets top out at 7d). The window is always **`[now − window,
+  now]`**, resolved once and applied identically by every graph and data table,
+  so the whole dashboard reads one consistent range. Set "Now" back to a past
+  instant to view a historical device.
 
 The main area has tabs (Overview / Tables / Load & Energy / Upload / API Docs).
 
@@ -56,8 +56,12 @@ Because the raw PPI table holds ~1M rows/device (per-second), the query is
 - **Time window** is the *global* control in the left sidebar (shared with the
   Load & Energy tab), not a per-tab one. It resolves to the range
   **`[now − window, now]`**, so every sub-tab reads the same slice.
-- **Max rows** (default `2000`) hard-caps the query with `ORDER BY <time> DESC
-  LIMIT N`. A capped panel notes it.
+- **Max rows** (default `2000`, tops out at `5000`) hard-caps the query with
+  `ORDER BY <time> DESC LIMIT N`. A capped panel notes it. The `5000` ceiling
+  exists because the per-minute charts melt a second series (e.g. raw + 5-min
+  smoothed), so a larger cap could not render in Altair's per-chart row guard
+  anyway; and the window presets stop at `7d`, so no slice can blow past
+  marimo's output-size limit.
 - **Per-table filters** on top: Windows offers state / sleep-only / min valid
   ratio; Cleaned PPI offers "cleaned only" and "fresh only". RMSSD (night
   segments) and Hourly (per-hour status) reuse the shared window / Max rows

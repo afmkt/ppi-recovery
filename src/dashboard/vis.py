@@ -88,15 +88,18 @@ def controls(mo, pd):
     )
     # Global time window shared by *every* graph and data table — the Tables
     # sub-tabs and the Load & Energy figure alike. The range is always
-    # [now - window, now] (see metrics.window_bounds). Presets are finite: there
-    # is no "All" — the raw PPI table is ~1M rows/device, so an unbounded window
-    # can never reach the browser and the cap always binds instead.
+    # [now - window, now] (see metrics.window_bounds). Presets are finite and
+    # top out at 7d: the raw PPI table is ~1M rows/device, so a wider window
+    # would only pull the biggest per-minute series and the cap (LIMIT) always
+    # binds instead — a 30d slice blew past marimo's output size limit.
     window_dd = mo.ui.dropdown(
-        ["1h", "6h", "24h", "48h", "7d", "30d"], value="24h", label="Time window"
+        ["1h", "6h", "24h", "48h", "7d"], value="24h", label="Time window"
     )
-    # Hard row cap for every time-series table (server-side LIMIT).
+    # Hard row cap for every time-series table (server-side LIMIT). The top
+    # option is 5000 — the per-minute charts melt a second series, so more than
+    # this can't render in Altair's per-chart row guard anyway.
     row_cap = mo.ui.dropdown(
-        [1000, 2000, 5000, 10000], value=2000, label="Max rows"
+        [1000, 2000, 5000], value=2000, label="Max rows"
     )
     # Per-table controls.
     # Defaults are "show everything; filter on demand" so a browser never opens
@@ -584,9 +587,9 @@ def recovery_view(mo, query, get_device, m, now_picker, window_dd):
     else:
         _id = int(_dv["id"])
         _lower, _upper = m.window_bounds(now_picker.value, window_dd.value)
-        _cap = 50000
+        _cap = 5000
         _df = m.hr_load_energy_table(query, _id, cutoff=_lower, upper=_upper, cap=_cap)
-        _capped = "*capped — widen window or raise cap to see more*" if len(_df) >= _cap else ""
+        _capped = f"*capped at {_cap:,} rows — most recent*" if len(_df) >= _cap else ""
         _caption = mo.md(
             f"**{len(_df):,} rows** · "
             + m.window_range_md(

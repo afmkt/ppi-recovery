@@ -64,7 +64,6 @@ def test_window_cutoff_resolves_presets_relative_to_anchor():
     assert m.window_cutoff("24h", anchor=anchor) == anchor - pd.Timedelta(hours=24)
     assert m.window_cutoff("48h", anchor=anchor) == anchor - pd.Timedelta(hours=48)
     assert m.window_cutoff("7d", anchor=anchor) == anchor - pd.Timedelta(days=7)
-    assert m.window_cutoff("30d", anchor=anchor) == anchor - pd.Timedelta(days=30)
 
 
 def test_window_cutoff_unknown_or_legacy_preset_defaults_to_one_hour():
@@ -94,9 +93,10 @@ def test_window_bounds_is_now_minus_preset_to_now():
 
 def test_window_bounds_every_preset_is_finite_and_upper_is_now():
     # No "All": every preset yields a finite lower bound < upper == now, so the
-    # builder cap always binds instead of an unbounded scan.
+    # builder cap always binds instead of an unbounded scan. Iterate the real
+    # preset keys so this can't drift out of sync with the dropdown.
     now = pd.Timestamp("2026-11-08 20:35:07")
-    for preset in ["1h", "6h", "24h", "48h", "7d", "30d"]:
+    for preset in m._WINDOW_PRESETS:
         lower, upper = m.window_bounds(now, preset)
         assert lower < upper
         assert upper == now
@@ -420,10 +420,10 @@ def test_hr_load_energy_table_builds_bounded_sql():
 
 def test_hr_load_energy_table_no_clause_no_stray_and_default_cap():
     query, calls = fake_query(_make_hr_load_energy_chart_df())
-    m.hr_load_energy_table(query, 1)  # default: no cutoff, cap 50000
+    m.hr_load_energy_table(query, 1)  # default: no cutoff, cap 5000
     sql = calls[0]
-    # the no-filter case: only the device predicate, no trailing "and", big cap
-    assert "from minutemetric where device_id = 1 order by timestamp desc limit 50000" in sql
+    # the no-filter case: only the device predicate, no trailing "and", bounded cap
+    assert "from minutemetric where device_id = 1 order by timestamp desc limit 5000" in sql
     assert "timestamp >" not in sql
 
 

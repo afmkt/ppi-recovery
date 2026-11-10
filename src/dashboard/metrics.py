@@ -83,6 +83,26 @@ def _chart_df(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna()
 
 
+# Altair's default per-chart row guard: ``to_dict``/``to_json`` raise
+# ``MaxRowsError`` when a chart's data holds more than this many rows. The
+# melt charts draw *two* series off one time column (e.g. raw + a 5-min smoothed
+# heart rate), so a window of N rows becomes 2N plotted points; cap the series
+# handed to those charts at half the guard so the melted frame always fits.
+# The builders hand the charts a newest-first slice, so capping keeps the most
+# recent points.
+ALT_MAX_ROWS = 5000
+_MELT_SERIES_CAP = ALT_MAX_ROWS // 2
+
+
+def _recent_series(df: pd.DataFrame, n: int) -> pd.DataFrame:
+    """Keep the most recent ``n`` rows of a newest-first series.
+
+    A no-op when the series is already short (``iloc[:n]`` returns the whole
+    frame), so a small window is never over-capped.
+    """
+    return df.iloc[:n]
+
+
 # ===========================================================================
 # Feature 1 — ingestion health & pipeline throughput
 # ===========================================================================
@@ -653,17 +673,17 @@ def coverage_chart(daily: pd.DataFrame, full_day_s: float = FULL_DAY_S) -> alt.C
 # ===========================================================================
 
 # Time-window presets for every time-series table and chart. Values are in
-# seconds; each is a *finite* span. There is deliberately no "All" — the raw PPI
-# table is ~1M rows/device, so an unbounded window can never reach the browser;
-# the ``cap`` (``LIMIT``) always binds, and "All" would be both useless and
-# unbounded.
+# seconds; each is a *finite* span. There is deliberately no "All" and the
+# largest preset is 7d — the raw PPI table is ~1M rows/device, so a wide
+# unbounded window can never reach the browser (the ``cap`` / ``LIMIT`` binds
+# instead), and a 30d slice would only pull the biggest, most memory-hungry
+# per-minute series, so the preset list stops at 7d.
 _WINDOW_PRESETS = {
     "1h": 3600.0,
     "6h": 6 * 3600.0,
     "24h": 24 * 3600.0,
     "48h": 48 * 3600.0,
     "7d": 7 * 86400.0,
-    "30d": 30 * 86400.0,
 }
 
 
@@ -828,7 +848,7 @@ def minute_table(query, device_id, cutoff=None, upper=None, cap=5000) -> pd.Data
     return query(sql)
 
 
-def hr_load_energy_table(query, device_id, cutoff=None, upper=None, cap=50000) -> pd.DataFrame:
+def hr_load_energy_table(query, device_id, cutoff=None, upper=None, cap=5000) -> pd.DataFrame:
     """Most-recent per-minute heart rate, cumulative intraday load, and energy
     reserve for a device, newest first, capped.
 
@@ -836,8 +856,10 @@ def hr_load_energy_table(query, device_id, cutoff=None, upper=None, cap=50000) -
     ``heart_rate`` is the per-minute mean, ``total_load`` is the cumulative
     intraday load (S1 + tss, reset each night session), and ``total_energy`` is
     the 0-100 body-energy reserve. All three live in ``minutemetric``, so one
-    bounded query feeds the whole figure. Per-minute data is small, so the cap
-    is generous (``50000`` ≈ 34 days); rows are bounded by the window
+    bounded query feeds the whole figure. The cap (``5000`` ≈ 3.5 days of
+    per-minute rows) matches the other time-series builders: the window preset
+    tops out at 7d and the chart caps the plotted series, so a wide window never
+    ships a huge payload to the browser. Rows are bounded by the window
     ``(cutoff, upper]`` on ``timestamp``.
     """
     clauses: list[str] = []
@@ -951,7 +973,9 @@ def ppi_clean_chart(df: pd.DataFrame) -> alt.Chart:
     other (each is drawn from its own non-null subset)."""
     if df is None or df.empty:
         return _empty(line=True, title="Cleaned PPI — no rows")
-    d = df.copy()
+    # This chart melts two series (raw + cleaned), doubling the rows, so cap the
+    # plotted series to half of Altair's row guard (keeps the most recent).
+    d = _recent_series(df, _MELT_SERIES_CAP).copy()
     d["time"] = pd.to_datetime(d["time"], errors="coerce")
     d = d.dropna(subset=["time"])
     series = [c for c in ("ppi", "ppi_clean") if c in d.columns and d[c].notna().any()]
@@ -1142,7 +1166,10 @@ def hr_load_energy_chart(
     """
     if df is None or df.empty:
         return _empty(line=True, title="HR · load · energy — no rows")
-    d = df.copy()
+    # The HR panel melts two series (raw + 5-min smoothed), doubling the rows, so
+    # cap the plotted series to half of Altair's row guard *before* the sort
+    # (keeps the most recent, since the builders hand us a newest-first slice).
+    d = _recent_series(df, _MELT_SERIES_CAP).copy()
     d["timestamp"] = pd.to_datetime(d["timestamp"], errors="coerce")
     # ``night_date`` drives the per-session load break; the query always selects
     # it, but guard for a partial frame (e.g. an energy-only slice).
