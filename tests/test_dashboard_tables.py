@@ -459,6 +459,73 @@ def test_hr_load_energy_chart_energy_only_partial_frame_no_night_date():
     assert "NaN" not in chart.to_json(allow_nan=False)
 
 
+def _hr_load_energy_rows(n: int) -> pd.DataFrame:
+    """``n`` per-minute rows, newest-first, ending at a fixed minute — enough to
+    overflow the chart's plot cap (``_MELT_SERIES_CAP``) so the window-spanning
+    downsample is exercised. A single ``night_date`` keeps the load panel one
+    continuous session; the tests only care about the plotted time *span*."""
+    end = pd.Timestamp("2026-11-07 12:00:00")
+    stamps = [end - pd.Timedelta(minutes=i) for i in range(n)]
+    return pd.DataFrame(
+        {
+            "timestamp": stamps,
+            "night_date": [end.normalize()] * n,
+            "heart_rate": [70.0] * n,
+            "total_load": [float(i) for i in range(n)],
+            "total_energy": [50.0] * n,
+        }
+    )
+
+
+def test_window_sample_noop_when_series_fits():
+    # A slice within the budget is returned untouched, so a narrow window keeps
+    # full per-minute detail.
+    df = _hr_load_energy_rows(10)
+    out = m._window_sample(df, m.ALT_MAX_ROWS)
+    assert len(out) == 10
+    assert list(out.index) == list(df.index)
+
+
+def test_window_sample_spans_full_window_not_tail():
+    # The regression behind the reported "changing the time window leaves the
+    # chart unchanged": a slice longer than the budget must be downsampled across
+    # the *whole* window, not truncated to the most-recent tail. A tail cap would
+    # keep only the last ``cap`` rows and drop the oldest end.
+    df = _hr_load_energy_rows(3000)
+    cap = m._MELT_SERIES_CAP
+    assert len(df) > cap  # precondition: the slice actually overflows the budget
+    out = m._window_sample(df, cap)
+    # Bounded by the budget (a most-recent tail cap would satisfy this too) ...
+    assert len(out) <= cap
+    # ... but the downsample reaches the oldest end of the window. A pure tail
+    # cap stops at the cap-th newest row (iloc[cap-1]); reaching back past it is
+    # exactly what distinguishes the window-spanning fix from the old tail bug.
+    kept_min = min(pd.Timestamp(t) for t in out["timestamp"])
+    tail_stop = pd.Timestamp(df["timestamp"].iloc[cap - 1])
+    assert kept_min < tail_stop
+
+
+def test_hr_load_energy_chart_wider_window_plots_wider_span():
+    # Two windows that share the same recent end must plot *different* spans: the
+    # wider window reaches back further. Before the fix both were truncated to the
+    # same most-recent tail, so their charts were byte-identical and the time
+    # window control appeared to do nothing.
+    def plotted_span(chart):
+        ts = []
+        for rows in (chart.to_dict().get("datasets") or {}).values():
+            for v in rows:
+                if isinstance(v, dict) and v.get("timestamp"):
+                    ts.append(pd.Timestamp(v["timestamp"]))
+        return min(ts), max(ts)
+
+    narrow = m.hr_load_energy_chart(_hr_load_energy_rows(1000))
+    wide = m.hr_load_energy_chart(_hr_load_energy_rows(3000))
+    s_narrow = plotted_span(narrow)
+    s_wide = plotted_span(wide)
+    assert s_narrow[1] == s_wide[1]  # both end at the same newest minute
+    assert s_wide[0] < s_narrow[0]   # ...but the wider window reaches back further
+
+
 # --- chart helpers render to JSON (no NaN crashes) --------------------------
 
 

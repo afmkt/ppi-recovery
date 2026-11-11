@@ -94,19 +94,31 @@ def _chart_df(df: pd.DataFrame) -> pd.DataFrame:
 # melt charts draw *two* series off one time column (e.g. raw + a 5-min smoothed
 # heart rate), so a window of N rows becomes 2N plotted points; cap the series
 # handed to *those* charts at half the guard so the melted frame always fits.
-# The builders hand the charts a newest-first slice, so capping keeps the most
-# recent points.
+#
+# The cap spans the *whole* window (evenly sampled), not the most-recent tail:
+# the builders hand the charts a newest-first slice, so a plain tail cap would
+# freeze every window wider than the budget on the same recent points — the time
+# window control then had no effect on the chart (wide windows looked identical).
 ALT_MAX_ROWS = 1500
 _MELT_SERIES_CAP = ALT_MAX_ROWS // 2
 
 
-def _recent_series(df: pd.DataFrame, n: int) -> pd.DataFrame:
-    """Keep the most recent ``n`` rows of a newest-first series.
+def _window_sample(df: pd.DataFrame, n: int) -> pd.DataFrame:
+    """Bound a newest-first series to ``n`` rows spanning the *whole* window.
 
-    A no-op when the series is already short (``iloc[:n]`` returns the whole
-    frame), so a small window is never over-capped.
+    A no-op when the series already fits (``len(df) <= n``), so a narrow window
+    keeps full per-minute detail. When it overflows the budget, keep every
+    ``stride``-th row across the full range (``stride = ceil(len / n)``) so a
+    wider time window still renders its whole span at coarser resolution — not
+    the same most-recent tail, which is what made wide windows look identical and
+    made the time-window control appear to do nothing. Newest-first order is
+    preserved, so the melt charts that follow still draw their raw + smoothed
+    series off the same downsampled rows.
     """
-    return df.iloc[:n]
+    if len(df) <= n:
+        return df
+    stride = math.ceil(len(df) / n)
+    return df.iloc[::stride]
 
 
 # ===========================================================================
@@ -980,8 +992,9 @@ def ppi_clean_chart(df: pd.DataFrame) -> alt.Chart:
     if df is None or df.empty:
         return _empty(line=True, title="Cleaned PPI — no rows")
     # This chart melts two series (raw + cleaned), doubling the rows, so cap the
-    # plotted series to half of Altair's row guard (keeps the most recent).
-    d = _recent_series(df, _MELT_SERIES_CAP).copy()
+    # plotted series to half of Altair's row guard; the cap spans the whole window
+    # (evenly sampled), so a wider window still shows its full span.
+    d = _window_sample(df, _MELT_SERIES_CAP).copy()
     d["time"] = pd.to_datetime(d["time"], errors="coerce")
     d = d.dropna(subset=["time"])
     series = [c for c in ("ppi", "ppi_clean") if c in d.columns and d[c].notna().any()]
@@ -1009,8 +1022,9 @@ def window_ribbon_chart(df: pd.DataFrame) -> alt.Chart:
     if df is None or df.empty:
         return _empty(line=True, title="Window ribbon — no LF/HF rows")
     # Cap the plotted points (see ALT_MAX_ROWS): a wide window holds thousands of
-    # LF/HF windows; the full slice stays in the panel's paginated table.
-    d = _recent_series(df, ALT_MAX_ROWS).copy()
+    # LF/HF windows; the full slice stays in the panel's paginated table. The cap
+    # spans the whole window, so a wider preset shows its full span, not a frozen tail.
+    d = _window_sample(df, ALT_MAX_ROWS).copy()
     d["window_mid_h"] = pd.to_numeric(d.get("window_mid_h"), errors="coerce")
     d = d.dropna(subset=["window_mid_h"])
     if "lf_hf" not in d.columns or not d["lf_hf"].notna().any():
@@ -1091,8 +1105,9 @@ def minute_hr_chart(df: pd.DataFrame) -> alt.Chart:
     if df is None or df.empty:
         return _empty(line=True, title="Per-minute heart rate — no rows")
     # Cap the plotted points (see ALT_MAX_ROWS): a 7d window is ~10k minutes; the
-    # full slice stays in the panel's paginated table.
-    d = _recent_series(df, ALT_MAX_ROWS).copy()
+    # full slice stays in the panel's paginated table. The cap spans the whole
+    # window, so a wider preset shows its full span, not a frozen tail.
+    d = _window_sample(df, ALT_MAX_ROWS).copy()
     d["timestamp"] = pd.to_datetime(d["timestamp"], errors="coerce")
     d = d.dropna(subset=["timestamp"])
     if not d["heart_rate"].notna().any():
@@ -1177,9 +1192,10 @@ def hr_load_energy_chart(
     if df is None or df.empty:
         return _empty(line=True, title="HR · load · energy — no rows")
     # The HR panel melts two series (raw + 5-min smoothed), doubling the rows, so
-    # cap the plotted series to half of Altair's row guard *before* the sort
-    # (keeps the most recent, since the builders hand us a newest-first slice).
-    d = _recent_series(df, _MELT_SERIES_CAP).copy()
+    # cap the plotted series to half of Altair's row guard *before* the sort. The
+    # cap spans the whole window (evenly sampled, not a recent tail), so a wider
+    # window still shows its full span instead of the same recent points.
+    d = _window_sample(df, _MELT_SERIES_CAP).copy()
     d["timestamp"] = pd.to_datetime(d["timestamp"], errors="coerce")
     # ``night_date`` drives the per-session load break; the query always selects
     # it, but guard for a partial frame (e.g. an energy-only slice).
