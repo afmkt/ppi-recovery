@@ -83,14 +83,20 @@ def _chart_df(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna()
 
 
-# Altair's default per-chart row guard: ``to_dict``/``to_json`` raise
-# ``MaxRowsError`` when a chart's data holds more than this many rows. The
+# Per-chart cap on the number of *plotted* points. The tables keep the full
+# (window-bounded, ``cap``-limited) slice — the "returned data" — but a wide
+# window (up to 7d of per-second / per-minute rows) yields thousands of points,
+# and every panel's chart is embedded into the single top-level cell's output.
+# Six panels + the recovery figure each shipping ~5000 points of Vega JSON puts
+# that one output at ~8 MB, over marimo's ~5 MB ``output_max_bytes`` (the
+# "output too large" wall). Capping the plotted points keeps the nested output
+# well under the limit while the paginated table still shows every row. The
 # melt charts draw *two* series off one time column (e.g. raw + a 5-min smoothed
 # heart rate), so a window of N rows becomes 2N plotted points; cap the series
-# handed to those charts at half the guard so the melted frame always fits.
+# handed to *those* charts at half the guard so the melted frame always fits.
 # The builders hand the charts a newest-first slice, so capping keeps the most
 # recent points.
-ALT_MAX_ROWS = 5000
+ALT_MAX_ROWS = 1500
 _MELT_SERIES_CAP = ALT_MAX_ROWS // 2
 
 
@@ -1002,7 +1008,9 @@ def window_ribbon_chart(df: pd.DataFrame) -> alt.Chart:
     """Autonomic ribbon: LF/HF vs hour-from-night-start, colored by state."""
     if df is None or df.empty:
         return _empty(line=True, title="Window ribbon — no LF/HF rows")
-    d = df.copy()
+    # Cap the plotted points (see ALT_MAX_ROWS): a wide window holds thousands of
+    # LF/HF windows; the full slice stays in the panel's paginated table.
+    d = _recent_series(df, ALT_MAX_ROWS).copy()
     d["window_mid_h"] = pd.to_numeric(d.get("window_mid_h"), errors="coerce")
     d = d.dropna(subset=["window_mid_h"])
     if "lf_hf" not in d.columns or not d["lf_hf"].notna().any():
@@ -1082,7 +1090,9 @@ def minute_hr_chart(df: pd.DataFrame) -> alt.Chart:
     """Per-minute heart rate over time, colored by HR zone."""
     if df is None or df.empty:
         return _empty(line=True, title="Per-minute heart rate — no rows")
-    d = df.copy()
+    # Cap the plotted points (see ALT_MAX_ROWS): a 7d window is ~10k minutes; the
+    # full slice stays in the panel's paginated table.
+    d = _recent_series(df, ALT_MAX_ROWS).copy()
     d["timestamp"] = pd.to_datetime(d["timestamp"], errors="coerce")
     d = d.dropna(subset=["timestamp"])
     if not d["heart_rate"].notna().any():
