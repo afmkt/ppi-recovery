@@ -242,7 +242,6 @@ def _load_status_data(
     if summary is None:
         return None
 
-    total_load = summary.load_score or 0
     rhr = (
         round(summary.rest_heart_rate_val)
         if summary.rest_heart_rate_val is not None
@@ -254,6 +253,20 @@ def _load_status_data(
 
     steps = sum((m.steps or 0) for m in minutes)
     calories = round(sum((m.calories or 0.0) for m in minutes))
+
+    # totalLoad / loadProgress: the day's *actual* accumulated total load
+    # (spec §7: totalLoad = S1 + tss — the same value the realtime curve and
+    # /load_trend carry), NOT load_score. load_score is a status/recovery
+    # percentage (0-100) that is a fixed STATUS_LOAD_DEFAULT=65 in the
+    # first-7-days temporary mode, which is why the card read 65 while the
+    # curve showed the real load. Prefer the finalized day total (== /load_trend's
+    # value for that day); the current, in-progress day has no finalized total
+    # yet, so fall back to the last minute's cumulative load — the live value the
+    # realtime curve ends on.
+    total_load = summary.total_load
+    if total_load is None and minutes:
+        total_load = minutes[-1].total_load
+    total_load = round(total_load) if total_load is not None else 0
 
     # avgLoad: the day's mean HR, excluding the sleep phase (spec "除去睡眠阶段").
     hr_values = [
@@ -289,7 +302,10 @@ async def get_load_status(
     """5.1 获取负荷页面基础数据.
 
     Reads the day's ``DailySummary`` for the scalars: ``totalLoad`` /
-    ``loadProgress`` = ``load_score``; ``restingHeartRate`` = ``rest_heart_rate_val``.
+    ``loadProgress`` the day's actual accumulated total load (``total_load``,
+    spec §7 = S1 + tss; the in-progress day falls back to the last minute's
+    cumulative load) — *not* ``load_score``, which is a status percentage;
+    ``restingHeartRate`` = ``rest_heart_rate_val``.
     ``steps`` / ``calories`` sum the day's ``MinuteMetric``. The per-minute
     curves and zone breakdowns come from ``MinuteMetric``: ``realtimeLoadData``
     is the cumulative total load, ``heartRateZoneData`` the per-hour HR trend,
