@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlmodel import Session, col, select
 
+from newboom.boom.load import day_total_load
 from newboom.boom.schemas import BoomResponse, StaleFields
 from newboom.boom.staleness import mark_stale
 from newboom.database import get_session
@@ -17,7 +18,7 @@ router = APIRouter(tags=["首页"])
 class HealthStatus(BaseModel):
     status: int = Field(default=0, description="综合状态百分比 0-100")
     sleep: int = Field(default=0, description="睡眠状态百分比 0-100")
-    load: int = Field(default=0, description="负荷状态百分比 0-100")
+    load: int = Field(default=0, description="当日累计总负荷（= 负荷页 totalLoad）")
 
 
 class HealthCardValues(BaseModel):
@@ -102,7 +103,10 @@ async def get_home(
       latest hourly-adjusted value), else the frozen ``status_score`` — the same
       source as status §2.1 ``totalStatus``.
     * ``healthStatus.sleep`` — ``sleep_quality`` (= sleep §3.1 ``totalSleep``).
-    * ``healthStatus.load`` — ``load_score`` (= load §5.1 ``totalLoad``).
+    * ``healthStatus.load`` — the day's actual accumulated total load
+      (= load §5.1 ``totalLoad``; the finalized day total, or the last
+      minute's cumulative load for the in-progress day — *not* ``load_score``,
+      a fixed 65 status default in the first-7-days temporary mode).
     * ``boomGoText`` — the day's coaching text (``boom_go_text``).
     * ``energyPercentage`` — day-end energy ``F_d`` as a 0-100 ring
       (= energy §4.1 ``totalEnergy``; :func:`_energy_percentage`).
@@ -153,7 +157,7 @@ async def get_home(
             healthStatus=HealthStatus(
                 status=status,
                 sleep=summary.sleep_quality or 0,
-                load=summary.load_score or 0,
+                load=day_total_load(session, device_id, summary),
             ),
             boomGoText=summary.boom_go_text or "",
             asOf=as_of,

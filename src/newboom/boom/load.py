@@ -228,6 +228,33 @@ def _load_zones(minutes: list[MinuteMetric], summary: DailySummary) -> LoadZones
     )
 
 
+def day_total_load(
+    session: Session, device_id: int, summary: DailySummary
+) -> int:
+    """The day's *actual* accumulated total load (spec §7: totalLoad = S1 + tss) —
+    the value §5.1 ``/load_status`` reports as ``totalLoad`` and §1.1 ``/go``
+    reports as ``healthStatus.load``; the two MUST agree.
+
+    Prefers the finalized day total (``summary.total_load``); when the day is
+    still in progress (no finalized total yet) it falls back to the last
+    minute's cumulative load — the live value the realtime curve ends on. This is
+    *not* ``load_score``, a status/recovery percentage (0-100) that is a fixed
+    ``STATUS_LOAD_DEFAULT`` (65) in the first-7-days temporary mode, which is why
+    the home card once read 65 while the load page showed the real load.
+    """
+    total_load = summary.total_load
+    if total_load is None:
+        last = session.exec(
+            select(MinuteMetric)
+            .where(MinuteMetric.device_id == device_id)
+            .where(MinuteMetric.night_date == summary.summary_date)
+            .order_by(col(MinuteMetric.timestamp).desc())
+        ).first()
+        if last is not None:
+            total_load = last.total_load
+    return round(total_load) if total_load is not None else 0
+
+
 def _load_status_data(
     session: Session, device: Device, day: date
 ) -> LoadStatusData | None:
@@ -254,19 +281,11 @@ def _load_status_data(
     steps = sum((m.steps or 0) for m in minutes)
     calories = round(sum((m.calories or 0.0) for m in minutes))
 
-    # totalLoad / loadProgress: the day's *actual* accumulated total load
-    # (spec §7: totalLoad = S1 + tss — the same value the realtime curve and
-    # /load_trend carry), NOT load_score. load_score is a status/recovery
-    # percentage (0-100) that is a fixed STATUS_LOAD_DEFAULT=65 in the
-    # first-7-days temporary mode, which is why the card read 65 while the
-    # curve showed the real load. Prefer the finalized day total (== /load_trend's
-    # value for that day); the current, in-progress day has no finalized total
-    # yet, so fall back to the last minute's cumulative load — the live value the
-    # realtime curve ends on.
-    total_load = summary.total_load
-    if total_load is None and minutes:
-        total_load = minutes[-1].total_load
-    total_load = round(total_load) if total_load is not None else 0
+    # totalLoad / loadProgress: the day's actual accumulated total load (spec §7:
+    # S1 + tss — the same value the realtime curve and /load_trend carry, and the
+    # value §1.1 /go reports as healthStatus.load). NOT load_score — a fixed 65
+    # status default in temporary mode. See :func:`day_total_load`.
+    total_load = day_total_load(session, device.id if device.id is not None else -1, summary)
 
     # avgLoad: the day's mean HR, excluding the sleep phase (spec "除去睡眠阶段").
     hr_values = [

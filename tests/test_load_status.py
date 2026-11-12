@@ -122,3 +122,45 @@ def test_total_load_zero_when_no_summary():
     assert data["totalLoad"] == 0
     assert data["asOf"] is None
     assert data["stale"] is True
+
+
+# --- §1.1 /go consistency: healthStatus.load == §5.1 totalLoad --------------
+
+
+def test_go_load_matches_load_status_total_load_finalized():
+    # §1.1 /go healthStatus.load and §5.1 /load_status totalLoad must be the
+    # same value: the day's actual accumulated total load, NOT load_score (65).
+    did = _seed_device("LS:00:00:00:00:05")
+    d = date(2026, 11, 11)
+    _seed_summary(did, d, load_score=65, total_load=150.4)
+    _seed_minute(did, datetime(2026, 11, 11, 8, 0), d, total_load=150.4)
+
+    go = client.get("/devices/LS:00:00:00:00:05/go")
+    ls = client.get(
+        "/devices/LS:00:00:00:00:05/load_status", params={"date": "2026-11-11"}
+    )
+    assert go.status_code == 200
+    assert ls.status_code == 200
+    go_load = go.json()["data"]["healthStatus"]["load"]
+    ls_load = ls.json()["data"]["totalLoad"]
+    assert go_load == ls_load == 150
+    assert go_load != 65  # the "stuck at 65" bug: load_score is not the total
+
+
+def test_go_load_matches_load_status_total_load_in_progress():
+    # Current, in-progress day: total_load not finalized -> both fall back to the
+    # last minute's cumulative load (the live value the curve ends on), not 65.
+    did = _seed_device("LS:00:00:00:00:06")
+    d = date(2026, 11, 12)
+    _seed_summary(did, d, load_score=65, total_load=None)
+    _seed_minute(did, datetime(2026, 11, 12, 10, 36), d, total_load=108.0)
+    _seed_minute(did, datetime(2026, 11, 12, 11, 19), d, total_load=127.18)
+
+    go = client.get("/devices/LS:00:00:00:00:06/go")
+    ls = client.get("/devices/LS:00:00:00:00:06/load_status")  # no date -> latest day
+    assert go.status_code == 200
+    assert ls.status_code == 200
+    go_load = go.json()["data"]["healthStatus"]["load"]
+    ls_load = ls.json()["data"]["totalLoad"]
+    assert go_load == ls_load == 127
+    assert go_load != 65
