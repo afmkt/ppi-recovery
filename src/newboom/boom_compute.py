@@ -24,6 +24,7 @@ from newboom.config import (
     S1_COEF,
     SIGMOID_M,
     SIGMOID_S,
+    STALE_WINDOW_DAYS,
     STATUS_BASE,
     STATUS_LOAD_DEFAULT,
     STATUS_SLEEP_DEFAULT,
@@ -549,12 +550,64 @@ def _calculate_status_score(
     )
 
 
-def _compute_energy_parameters(
+def recover_start_energy(session: Session, device_id: int, target_date: date) -> float:
+    """Morning start energy E_d for ``target_date`` (spec §8 energy recovery).
+
+    Recovers one overnight step off the most recent *valid* day-end energy
+    ``F_d`` (``DailySummary.energy_end_f``, ``None`` when a day is incomplete)
+    within ``STALE_WINDOW_DAYS``:
+
+        E_d = clamp(1 - (1 - F_d) * exp(-1 / tau), 0, 1)
+
+    ``tau`` is ``TAU_LOW`` (3.0) once >= 7 valid ``F_d`` exist and the latest
+    ``F_d`` falls below the 7-day ``mean - std`` band (a low-recovery state),
+    else ``TAU_BASE`` (1.5). The gap length does not change the amount: a 1-day
+    and a 6-day gap both recover the same single step off the last valid
+    ``F_d`` — recovery is per-day, not time-scaled (the spec is day-indexed).
+
+    This is the single source of E_d: the summary stage stores it on
+    ``energy_start_e`` and the on-the-fly minute path (a night whose summary is
+    not yet written) calls the same function, so the first minutes of a night
+    recover off the prior ``F_d`` instead of defaulting to a full tank. With no
+    valid ``F_d`` within the window — first enablement, or a data gap wider than
+    ``STALE_WINDOW_DAYS`` — E_d falls back to ``FIRST_ENERGY`` (E_1 = 1.0).
+    """
+    valid = session.exec(
+        select(DailySummary)
+        .where(DailySummary.device_id == device_id)
+        .where(col(DailySummary.summary_date) < target_date)
+        .where(col(DailySummary.energy_end_f).isnot(None))
+        .order_by(col(DailySummary.summary_date).desc())
+        .limit(7)
+    ).all()
+    if not valid:
+        return FIRST_ENERGY
+
+    # Rows are desc by summary_date, so the most recent valid F_d is the seed.
+    latest = valid[0]
+    prev_f = float(latest.energy_end_f)
+    # A seed older than the staleness window is untrustworthy: resume from a full
+    # tank rather than chaining off a F_d from before a wide data gap.
+    if (target_date - latest.summary_date).days > STALE_WINDOW_DAYS:
+        return FIRST_ENERGY
+
+    past_f = [float(r.energy_end_f) for r in valid]
+    tau = TAU_BASE
+    if len(past_f) >= 7:
+        f_avg = float(np.mean(past_f))
+        f_std = float(np.std(past_f))
+        if prev_f < (f_avg - f_std):
+            tau = TAU_LOW
+    return float(np.clip(1.0 - (1.0 - prev_f) * np.exp(-1.0 / tau), 0.0, 1.0))
+
+
+def _compute_body_state_modifier_t(
     metrics: dict[str, Any],
     baselines: dict[str, Any],
-    past_summaries: list[DailySummary],
-) -> tuple[float, float]:
-    """Computes Body State Modifier T_d and Starting Energy E_d for the energy model."""
+) -> float:
+    """Body State Modifier T_d (spec §8 §3.2): 1.0 normally, or >1 when the
+    morning HRV is significantly below the 7-day baseline. E_d is recovered
+    separately by :func:`recover_start_energy`."""
     t_d = 1.0
     hrv_m_val = metrics["hrv_morning_val"]
     hrv_m_avg = baselines["hrv_morning_avg"]
@@ -568,22 +621,7 @@ def _compute_energy_parameters(
         and hrv_m_val < (hrv_m_avg - hrv_m_std)
     ):
         t_d = max(1.0, (hrv_m_avg - hrv_m_val) / hrv_m_std)
-
-    start_e = FIRST_ENERGY
-    past_f = [s.energy_end_f for s in past_summaries if s.energy_end_f is not None]
-    if past_f:
-        prev_f = past_f[0]
-        # Spec §8: the low-recovery branch (τ=TAU_LOW) applies only once 7 prior
-        # valid F exist; with fewer, recover at the base rate (τ=TAU_BASE).
-        tau = TAU_BASE
-        if len(past_f) >= 7:
-            f_avg = float(np.mean(past_f))
-            f_std = float(np.std(past_f))
-            if prev_f < (f_avg - f_std):
-                tau = TAU_LOW
-        start_e = float(np.clip(1.0 - (1.0 - prev_f) * np.exp(-1.0 / tau), 0.0, 1.0))
-
-    return t_d, start_e
+    return t_d
 
 
 def _aggregate_night_spo2(
@@ -757,7 +795,8 @@ def process_daily_summary(device_id: int, target_date: date) -> DailySummary | N
             deduction_points,
             bonus_points,
         ) = _calculate_status_score(metrics, baselines, past_summaries)
-        t_d, start_e = _compute_energy_parameters(metrics, baselines, past_summaries)
+        t_d = _compute_body_state_modifier_t(metrics, baselines)
+        start_e = recover_start_energy(session, device_id, target_date)
 
         coaching_text = "前几天连续训练负荷较大, HRV较低但储能情况良好, 预计明天HRV上升达到超量恢复黄金窗口。建议降低训练, 注意恢复调整。"
 
@@ -1082,6 +1121,9 @@ def process_minute_metric(device_id: int) -> int:
         cur_night: date | None = None
         cur_s1 = 0.0
         cur_tss = 0.0
+        # A night whose summary is not yet written recovers E_d on the fly; cache
+        # it per night so the query runs once, not once per minute of the night.
+        recovered_e_d: dict[date, float] = {}
         for night, minute_start in buckets:
             if night != cur_night:
                 last = last_by_night.get(night)
@@ -1108,7 +1150,13 @@ def process_minute_metric(device_id: int) -> int:
                 )
             else:
                 _, hr_max = _hr_params(device, [])
-                e_d = FIRST_ENERGY
+                # Night's summary isn't written yet: recover E_d off the last
+                # valid F_d (same helper the summary stage uses) instead of a
+                # full-tank FIRST_ENERGY, so the first minutes of the night read
+                # the recovered value, not 100.
+                if night not in recovered_e_d:
+                    recovered_e_d[night] = recover_start_energy(session, device_id, night)
+                e_d = recovered_e_d[night]
                 t_d = 1.0
 
             metric, cur_s1, cur_tss = _build_minute_metric(
