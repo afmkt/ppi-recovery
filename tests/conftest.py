@@ -33,6 +33,18 @@ from newboom.model import (  # noqa: E402
     WindowMetric,
 )
 
+# Keep the LLM paths hermetic: the LLM short-circuits (static fallback /
+# placeholder) when ``DASHSCOPE_API_KEY`` is absent. ``.env`` may carry a real
+# key, and ``newboom.database`` loads it above, so strip the LLM keys here to
+# keep the suite off the network.
+for _llm_var in (
+    "DASHSCOPE_API_KEY",
+    "BAILIAN_API_KEY",
+    "BAILIAN_APP_ID",
+    "BAILIAN_WORKSPACE",
+):
+    os.environ.pop(_llm_var, None)
+
 create_db_and_tables()
 
 # FK enforcement is ON (database._configure_sqlite runs PRAGMA foreign_keys=ON),

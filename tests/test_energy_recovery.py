@@ -11,8 +11,8 @@ is now the single source of E_d, called both by the summary stage (stored on
 recent valid ``F_d`` within ``STALE_WINDOW_DAYS``.
 """
 
-from datetime import date, datetime
 import math
+from datetime import date, datetime
 
 import pytest
 from sqlmodel import Session, select
@@ -21,11 +21,11 @@ from newboom.boom_compute import process_minute_metric, recover_start_energy
 from newboom.config import FIRST_ENERGY, TAU_BASE
 from newboom.database import engine
 from newboom.model import (
+    PPI,
     ActivityState,
     DailySummary,
     Device,
     MinuteMetric,
-    PPI,
 )
 
 
@@ -83,9 +83,7 @@ def test_recover_stale_gap_beyond_window_falls_back():
     with Session(engine) as s:
         did = _make_device(s, "ER:00:00:00:00:04")
         _seed_summary(s, did, date(2026, 11, 4), f_d=0.2)  # 9 days before target
-        assert (
-            recover_start_energy(s, did, date(2026, 11, 13)) == FIRST_ENERGY
-        )
+        assert recover_start_energy(s, did, date(2026, 11, 13)) == FIRST_ENERGY
 
 
 def test_incomplete_day_is_skipped_to_last_valid_f_d():

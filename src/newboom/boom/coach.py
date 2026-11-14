@@ -17,6 +17,7 @@ an in-flight stream by conversation id.
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -147,6 +148,47 @@ class DefaultCoachProvider(CoachProvider):
             yield text[i : i + 6]
 
 
+class DashScopeCoachProvider(CoachProvider):
+    """LLM-backed coach reply via the DashScope Bailian application.
+
+    ``reply`` (§11.3) uses the LLM, falling back to the placeholder when it is
+    unavailable or returns nothing. ``stream`` (§11.4) stays on the placeholder
+    by design (the LLM path is reply-only) — it is taken from
+    :class:`DefaultCoachProvider` rather than the overridden (LLM) ``reply``.
+    """
+
+    def reply(self, ctx: CoachContext) -> str:
+        from newboom.llm import Chat
+
+        try:
+            reply = Chat().ask(self._build_prompt(ctx))
+        except Exception:
+            reply = None
+        if not (reply and reply.strip()):
+            return DefaultCoachProvider().reply(ctx)
+        return reply.strip()
+
+    async def stream(self, ctx: CoachContext) -> AsyncGenerator[str, None]:
+        # §11.4 stays on the placeholder; the LLM is reply-only, so delegate to
+        # a fresh placeholder provider instead of the overridden LLM ``reply``.
+        async for chunk in DefaultCoachProvider().stream(ctx):
+            yield chunk
+
+    @staticmethod
+    def _build_prompt(ctx: CoachContext) -> str:
+        turns = ctx.history or []
+        if not turns:
+            turns = [("user", ctx.user_message)]
+        body = "\n".join(
+            f"[{role}]: {content}" for role, content in turns if content
+        )
+        return (
+            "你是一位专业的健身教练BOOM Coach。请结合下面的对话历史，"
+            "针对用户的最新问题给出简洁、专业、友好的中文训练或休息建议，"
+            "并适当引用用户的实际数据。\n\n" + body
+        )
+
+
 _provider: CoachProvider = DefaultCoachProvider()
 
 
@@ -159,6 +201,13 @@ def set_provider(provider: CoachProvider) -> None:
     """Install a coach provider (a real LLM backend, or a test double)."""
     global _provider
     _provider = provider
+
+
+# Install the DashScope-backed coach reply when a key is configured; otherwise
+# keep the placeholder (hermetic for tests / key-less dev). The LLM path is
+# reply-only by design: §11.4 streaming stays on the inherited placeholder.
+if os.getenv("DASHSCOPE_API_KEY"):
+    set_provider(DashScopeCoachProvider())
 
 
 # --- stream registry (§11.4 / §11.10) --------------------------------------
@@ -361,7 +410,7 @@ async def send_message(
         user_type=body.type,
         history=_history(session, conv.id if conv.id else -1),
     )
-    reply = get_provider().reply(ctx)
+    reply = await asyncio.to_thread(get_provider().reply, ctx)
     ai_msg = Message(
         conversation_id=conv.id if conv.id else -1,
         role="ai",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -722,6 +723,59 @@ def _autonomic_summary(night_windows: list[WindowMetric]) -> dict[str, float | N
     }
 
 
+# Static ``boom_go_text`` used when the LLM is unavailable or not configured.
+# Preserves the pre-LLM behaviour (the value previously hardcoded here).
+_DEFAULT_BOOM_GO_TEXT = (
+    "前几天连续训练负荷较大, HRV较低但储能情况良好, "
+    "预计明天HRV上升达到超量恢复黄金窗口。建议降低训练, 注意恢复调整。"
+)
+
+
+def _generate_boom_go_text(
+    energy_pct: int,
+    status_score: int,
+    sleep_score: int,
+    load_score: int,
+    resting_hr: float | None,
+    hrv: float | None,
+    spo2: float | None,
+) -> str:
+    """LLM-generated ``boom_go_text`` (DashScope Bailian), with a static fallback.
+
+    Mirrors boom_api's ``_generate_boom_go_text``: build a context from the day's
+    health metrics, ask for a 15–30 char motivational line, and fall back to
+    :data:`_DEFAULT_BOOM_GO_TEXT` when the LLM is unavailable, returns nothing,
+    or is not configured. The no-key short-circuit keeps this path hermetic for
+    tests and key-less dev (no network call).
+    """
+    if not os.getenv("DASHSCOPE_API_KEY"):
+        return _DEFAULT_BOOM_GO_TEXT
+
+    ctx_lines = [
+        f"储能百分比: {energy_pct}%",
+        f"综合状态分: {status_score}/100 | 睡眠分: {sleep_score} | 负荷分: {load_score}",
+        f"静息心率: {resting_hr if resting_hr is not None else '?'}bpm | 血氧: {spo2 if spo2 is not None else '?'}%",
+        f"HRV(RMSSD): {hrv if hrv is not None else '?'}ms",
+    ]
+    prompt = (
+        "你是一位专业的运动健康教练。根据以下用户的身体状态数据，"
+        "用一句简短的中文鼓励文案回复用户（15~30个字），鼓励他/她去训练。\n\n"
+        "当前身体状态：\n" + "\n".join(ctx_lines) + "\n\n"
+        "判断规则：储能≥80→强烈鼓励去练；60-79→稳态训练建议；<60→建议休息恢复。\n"
+        "要求：简洁有力，口语化，有鼓动性。不要使用英文，不要带标点符号列表符。"
+    )
+
+    from newboom.llm import Chat
+
+    try:
+        reply = Chat().ask(prompt)
+    except Exception:
+        reply = None
+    if not (reply and reply.strip()):
+        return _DEFAULT_BOOM_GO_TEXT
+    return reply.strip()
+
+
 # --- MAIN ORCHESTRATOR FUNCTION ---
 
 
@@ -798,7 +852,16 @@ def process_daily_summary(device_id: int, target_date: date) -> DailySummary | N
         t_d = _compute_body_state_modifier_t(metrics, baselines)
         start_e = recover_start_energy(session, device_id, target_date)
 
-        coaching_text = "前几天连续训练负荷较大, HRV较低但储能情况良好, 预计明天HRV上升达到超量恢复黄金窗口。建议降低训练, 注意恢复调整。"
+        energy_pct = round(100 * max(0.0, min(1.0, start_e)))
+        coaching_text = _generate_boom_go_text(
+            energy_pct,
+            status_score,
+            sleep_score,
+            load_score,
+            baselines.get("rhr_avg"),
+            baselines.get("hrv_night_avg"),
+            metrics.get("spo2_night_avg"),
+        )
 
         # 4. Upsert DailySummary
         existing = session.exec(
