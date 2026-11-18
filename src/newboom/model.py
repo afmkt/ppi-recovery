@@ -104,11 +104,24 @@ class Sleep(SQLModel, table=True):
         return night_key(self.time)
 
     @property
-    def duration_hours(self) -> int:
-        return int(
-            (self.light_sleep_period + self.deep_sleep_period + self.other_sleep_period)
-            / 3600
+    def total_sleep_seconds(self) -> int:
+        """Night's total in-bed sleep (light + deep + other), in seconds.
+
+        This is the canonical "total sleep" the sleep endpoints and the daily
+        summary use; when a night has several ``Sleep`` records (e.g. a main
+        overnight plus a daytime nap that ``night_key`` folds into the same
+        date), the record with the largest value is treated as the night's
+        sleep.
+        """
+        return (
+            self.light_sleep_period
+            + self.deep_sleep_period
+            + self.other_sleep_period
         )
+
+    @property
+    def duration_hours(self) -> int:
+        return int(self.total_sleep_seconds / 3600)
 
 
 class Task(StrEnum):

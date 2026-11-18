@@ -115,13 +115,16 @@ def _format_pct(value: float) -> str:
 def _night_sleep_records(
     session: Session, device_id: int, start: date, end: date
 ) -> dict[date, Sleep]:
-    """Latest ``Sleep`` record per night keyed to its ``night_date`` in
-    ``[start, end]``.
+    """One ``Sleep`` record per night keyed to its ``night_date`` in
+    ``[start, end]`` — the night's *main* sleep, i.e. the record with the
+    longest total sleep (light + deep + other).
 
     ``Sleep.night_date`` is a property (``night_key`` of its timestamp), not a
     column, so the night window ``[start 08:00, end+1 08:00)`` is matched on the
-    ``time`` column and re-keyed in Python; the most recent record per night
-    (largest ``time``) wins when several were uploaded for one night.
+    ``time`` column and re-keyed in Python. A night can hold several records —
+    e.g. a main overnight plus a daytime nap that ``night_key`` folds into the
+    same date — so the longest-sleep record wins, not the most recent one
+    (a later nap or partial capture would otherwise shadow the real night).
     """
     start_dt = datetime.combine(start, time(NIGHT_START_HOUR))
     end_dt = datetime.combine(end, time(NIGHT_START_HOUR)) + timedelta(days=1)
@@ -136,7 +139,9 @@ def _night_sleep_records(
     for r in rows:
         night = r.night_date
         if start <= night <= end:
-            by_night[night] = r
+            cur = by_night.get(night)
+            if cur is None or r.total_sleep_seconds > cur.total_sleep_seconds:
+                by_night[night] = r
     return by_night
 
 
@@ -148,19 +153,22 @@ def _sleep_window(
     ``Sleep.time`` is the settlement moment; bedtime = ``time - sleep_onset_time``
     seconds, waketime = ``time - awake_time`` seconds (boom §3.2; the example
     night settles at 07:30 with onset 25200s / awake 1800s -> 00:30 -> 07:00).
+    A night can hold several records, so the one with the longest total sleep is
+    used (the main overnight, not a later nap or partial capture).
     ``None`` when the night has no ``Sleep`` record.
     """
     night_start = datetime(night.year, night.month, night.day, NIGHT_START_HOUR)
     night_end = night_start + timedelta(days=1)
-    rec = session.exec(
+    rows = session.exec(
         select(Sleep)
         .where(Sleep.device_id == device_id)
         .where(col(Sleep.time) >= night_start)
         .where(col(Sleep.time) < night_end)
-        .order_by(col(Sleep.time).desc())
-    ).first()
-    if rec is None:
+        .order_by(col(Sleep.time).asc())
+    ).all()
+    if not rows:
         return None
+    rec = max(rows, key=lambda r: r.total_sleep_seconds)
     bed = rec.time - timedelta(seconds=rec.sleep_onset_time)
     wake = rec.time - timedelta(seconds=rec.awake_time)
     return bed, wake

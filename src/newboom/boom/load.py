@@ -102,18 +102,21 @@ def _sleep_window(
     session: Session, device_id: int, day: date
 ) -> tuple[datetime, datetime] | None:
     """``[bedtime, waketime]`` for the night of ``day`` (mirrors sleep §3.2);
-    ``None`` when there is no ``Sleep`` record."""
+    ``None`` when there is no ``Sleep`` record. A night can hold several
+    records (a main overnight plus a nap that folds into the same date), so the
+    longest-sleep one is used — not the latest, which a nap would shadow."""
     night_start = datetime(day.year, day.month, day.day, NIGHT_START_HOUR)
     night_end = night_start + timedelta(days=1)
-    rec = session.exec(
+    rows = session.exec(
         select(Sleep)
         .where(Sleep.device_id == device_id)
         .where(col(Sleep.time) >= night_start)
         .where(col(Sleep.time) < night_end)
-        .order_by(col(Sleep.time).desc())
-    ).first()
-    if rec is None:
+        .order_by(col(Sleep.time).asc())
+    ).all()
+    if not rows:
         return None
+    rec = max(rows, key=lambda r: r.total_sleep_seconds)
     return (
         rec.time - timedelta(seconds=rec.sleep_onset_time),
         rec.time - timedelta(seconds=rec.awake_time),

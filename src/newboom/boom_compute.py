@@ -784,17 +784,23 @@ def process_daily_summary(device_id: int, target_date: date) -> DailySummary | N
     with Session(engine) as session:
         # 1. Fetch Sleep and Window Metric records. Sleep.night_date is a
         # property (night_key of its timestamp), not a column, so the night is
-        # matched by the time window [target 08:00, +1 day).
+        # matched by the time window [target 08:00, +1 day). A night can hold
+        # several Sleep records (a main overnight plus a nap/partial folded into
+        # the same date), so use the longest-sleep one — the night's main sleep —
+        # which is what the sleep endpoints surface too.
         night_start_dt = datetime(
             target_date.year, target_date.month, target_date.day, NIGHT_START_HOUR
         )
         night_end_dt = night_start_dt + timedelta(days=1)
-        sleep_record = session.exec(
+        sleep_rows = session.exec(
             select(Sleep)
             .where(Sleep.device_id == device_id)
             .where(col(Sleep.time) >= night_start_dt)
             .where(col(Sleep.time) < night_end_dt)
-        ).first()
+        ).all()
+        sleep_record = max(
+            sleep_rows, key=lambda r: r.total_sleep_seconds
+        ) if sleep_rows else None
 
         night_windows = session.exec(
             select(WindowMetric)
@@ -1155,15 +1161,21 @@ def process_minute_metric(device_id: int) -> int:
             .limit(1)
         ).first()
         sleep_by_night: dict[date, float] = {}
+        best_seconds: dict[date, int] = {}
         for s in session.exec(
             select(Sleep)
             .where(Sleep.device_id == device_id)
             .order_by(col(Sleep.time).asc())
         ).all():
-            if s.heart_rate_rest:
-                sleep_by_night[night_key(s.time, NIGHT_START_HOUR)] = float(
-                    s.heart_rate_rest
-                )
+            # A night can hold several Sleep records (a main overnight plus a
+            # nap); use the main night's rest HR — the longest-sleep record that
+            # carries one — so a later nap does not shadow it.
+            if not s.heart_rate_rest:
+                continue
+            night = night_key(s.time, NIGHT_START_HOUR)
+            if s.total_sleep_seconds > best_seconds.get(night, -1):
+                best_seconds[night] = s.total_sleep_seconds
+                sleep_by_night[night] = float(s.heart_rate_rest)
 
         # 3. Existing MinuteMetrics per night: seed the cumulative S1/tss from the
         #    last stored bucket and map by timestamp for upsert.
