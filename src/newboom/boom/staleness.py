@@ -23,11 +23,12 @@ from datetime import date, datetime, timedelta
 
 from newboom.boom.schemas import AtlCtlPoint, DatePoint
 from newboom.config import STALE_WINDOW_DAYS
-from newboom.model import Device
+from newboom.model import DailySummary, Device
 
 __all__ = [
     "local_today",
     "mark_stale",
+    "current_resting_hr",
     "locf",
     "locf_atlctl",
 ]
@@ -62,6 +63,26 @@ def mark_stale(
         now = local_today(device)
     stale = (now - as_of).days > window_days
     return as_of.isoformat(), stale
+
+
+def current_resting_hr(summary: DailySummary) -> int:
+    """The resting-HR value a *current card* displays: today's
+    ``rest_heart_rate_val`` when present, else the 7-day baseline
+    ``rest_heart_rate_avg``, else ``0``.
+
+    The per-day ``val`` is only written on days that have a sleep record
+    (``boom_compute``: ``rest_hr_val = sleep_record.heart_rate_rest if
+    sleep_record else None``), so the *latest* day is null whenever the device
+    has not slept since. Showing that ``0`` is the spec's forbidden
+    "用0替代"; the 7-day baseline (the same field :func:`newboom.boom.load._hr_rest`
+    falls back to for the load math) is the value to show instead. The final
+    ``0`` is only reached when the device has no resting-HR data at all — the
+    card's no-data sentinel, not a substitution for a real value."""
+    if summary.rest_heart_rate_val is not None:
+        return round(summary.rest_heart_rate_val)
+    if summary.rest_heart_rate_avg is not None:
+        return round(summary.rest_heart_rate_avg)
+    return 0
 
 
 def _pdate(value: str) -> date:

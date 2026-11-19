@@ -10,7 +10,7 @@ from pydantic import Field
 from sqlmodel import Session, col, select
 
 from newboom.boom.schemas import BoomResponse, DatePoint, StaleFields, TimePoint
-from newboom.boom.staleness import locf, mark_stale
+from newboom.boom.staleness import current_resting_hr, locf, mark_stale
 from newboom.config import READINESS_GRANULARITY, STALE_WINDOW_DAYS
 from newboom.database import get_session
 from newboom.model import DailySummary, Device, HourlyStatus, WindowMetric
@@ -69,8 +69,10 @@ async def get_status(
     status (``status_current`` — the latest hourly-adjusted value, frozen
     to ``status_score`` for a closed day) drives ``totalStatus`` /
     ``statusProgress``; ``hrv`` is the night RMSSD mean
-    (``hrv_night_val``) and ``restingHeartRate`` the sleep-derived resting
-    HR (``rest_heart_rate_val``). ``hrvData`` is that night's 5-min RMSSD
+    (``hrv_night_val``) and ``restingHeartRate`` the current resting HR via
+    :func:`newboom.boom.staleness.current_resting_hr` (today's
+    ``rest_heart_rate_val``, else the 7-day ``rest_heart_rate_avg`` baseline,
+    else the no-data ``0``). ``hrvData`` is that night's 5-min RMSSD
     windows. When ``date`` is omitted the device's most recent day is
     used; a missing device / day yields a zeroed payload
     (``BoomResponse`` carries no error field).
@@ -102,11 +104,7 @@ async def get_status(
         else (summary.status_score or 0)
     )
     hrv = round(summary.hrv_night_val) if summary.hrv_night_val is not None else 0
-    rhr = (
-        round(summary.rest_heart_rate_val)
-        if summary.rest_heart_rate_val is not None
-        else 0
-    )
+    rhr = current_resting_hr(summary)
     hrv_data = _hrv_data_for_day(
         session, device.id if device.id is not None else -1, summary.summary_date
     )

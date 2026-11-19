@@ -8,7 +8,7 @@ from sqlmodel import Session, col, select
 
 from newboom.boom.load import day_total_load
 from newboom.boom.schemas import BoomResponse, StaleFields
-from newboom.boom.staleness import mark_stale
+from newboom.boom.staleness import current_resting_hr, mark_stale
 from newboom.database import get_session
 from newboom.model import DailySummary, Device, MinuteMetric
 
@@ -111,7 +111,10 @@ async def get_home(
     * ``energyPercentage`` — day-end energy ``F_d`` as a 0-100 ring
       (= energy §4.1 ``totalEnergy``; :func:`_energy_percentage`).
     * ``healthCardValues`` — ``heartRate`` the most recent 1-min HR
-      (``MinuteMetric``), ``restingHeartRate`` ``rest_heart_rate_val``,
+      (``MinuteMetric``), ``restingHeartRate`` the current resting HR via
+      :func:`newboom.boom.staleness.current_resting_hr` (today's
+      ``rest_heart_rate_val``, else the 7-day ``rest_heart_rate_avg`` baseline,
+      else the no-data ``0`` — never a stale ``0`` when a value exists),
       ``oxygen`` the night SpO2 mean ``spo2_night_avg`` ÷10 (device-raw ×10,
       same as body_metrics §7.1 ``bloodOxygen``), ``hrv`` the night RMSSD mean
       ``hrv_night_val``.
@@ -141,11 +144,7 @@ async def get_home(
         if summary.status_current is not None
         else (summary.status_score or 0)
     )
-    rhr = (
-        round(summary.rest_heart_rate_val)
-        if summary.rest_heart_rate_val is not None
-        else 0
-    )
+    rhr = current_resting_hr(summary)
     oxygen = (
         round(summary.spo2_night_avg / 10) if summary.spo2_night_avg is not None else 0
     )

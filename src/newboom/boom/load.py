@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from sqlmodel import Session, col, select
 
 from newboom.boom.schemas import BoomResponse, DatePoint, StaleFields, TimePoint
-from newboom.boom.staleness import locf, mark_stale
+from newboom.boom.staleness import current_resting_hr, locf, mark_stale
 from newboom.config import (
     DEFAULT_HR_MAX,
     DEFAULT_HR_REST,
@@ -272,11 +272,7 @@ def _load_status_data(
     if summary is None:
         return None
 
-    rhr = (
-        round(summary.rest_heart_rate_val)
-        if summary.rest_heart_rate_val is not None
-        else 0
-    )
+    rhr = current_resting_hr(summary)
 
     minutes = _minutes(session, device.id if device.id is not None else -1, day)
     window = _sleep_window(session, device.id if device.id is not None else -1, day)
@@ -327,7 +323,10 @@ async def get_load_status(
     ``loadProgress`` the day's actual accumulated total load (``total_load``,
     spec §7 = S1 + tss; the in-progress day falls back to the last minute's
     cumulative load) — *not* ``load_score``, which is a status percentage;
-    ``restingHeartRate`` = ``rest_heart_rate_val``.
+    ``restingHeartRate`` the current resting HR via
+    :func:`newboom.boom.staleness.current_resting_hr` (today's
+    ``rest_heart_rate_val``, else the 7-day ``rest_heart_rate_avg`` baseline —
+    the display value; the load *math* still uses :func:`_hr_rest`).
     ``steps`` / ``calories`` sum the day's ``MinuteMetric``. The per-minute
     curves and zone breakdowns come from ``MinuteMetric``: ``realtimeLoadData``
     is the cumulative total load, ``heartRateZoneData`` the per-hour HR trend,
